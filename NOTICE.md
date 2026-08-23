@@ -10,5 +10,6 @@ the reconstructed implementation safe to redistribute. Anyone publishing or
 distributing this repository should independently review copyright, trademark,
 third-party dependency, and service-terms obligations.
 
-The build downloads or consumes the pinned Grok Bot 0.18.0 release separately;
-that artifact remains subject to its own terms.
+The repository preserves pinned Grok Bot 0.18.0 macOS and Windows installers
+through Git LFS for research continuity. Those artifacts remain subject to their
+own terms and are not covered by any license applied to reconstructed code.

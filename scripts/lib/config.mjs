@@ -8,6 +8,7 @@ export const sourceAppDir = path.join(repoRoot, "src", "app");
 export const cacheDir = path.join(repoRoot, ".cache");
 export const cachedRuntimeApp = path.join(cacheDir, "runtime", "Grok Bot.app");
 export const cachedDmg = path.join(cacheDir, "downloads", "Grok_Bot_0.18.0.dmg");
+export const archivedDmg = path.join(repoRoot, "research-archives", "original", "0.18.0", "macos-arm64", "Grok_Bot_0.18.0.dmg");
 export const buildDir = path.join(repoRoot, ".build");
 export const stagedAppDir = path.join(buildDir, "app");
 export const builtAsar = path.join(buildDir, "app.asar");

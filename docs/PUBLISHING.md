@@ -14,6 +14,21 @@ git add .
 git commit -m "Initial reconstructed source import"
 ```
 
+The preserved installers use Git LFS. Install LFS before the initial `git add`,
+then push the objects after adding the remote:
+
+```sh
+git lfs install
+git add .
+git commit -m "Initial reconstructed source import"
+git push -u origin main
+git lfs push --all origin
+```
+
+If the hosting service offers downloadable source archives, enable its option
+to include Git LFS objects in those archives; otherwise generated ZIP/tarball
+downloads may contain only LFS pointer files.
+
 Before adding a public remote:
 
 1. Run `npm run publication:check` on the committed clean branch. It performs
@@ -22,9 +37,10 @@ Before adding a public remote:
 2. Run `npm ci`, `npm run bootstrap`, `npm run check`, `npm run package`, and
    `npm run verify` from a fresh clone/export.
 3. Confirm `git status --ignored` shows no generated payload selected for Git.
-4. Scan the exported tree and full new history for credentials and absolute
+4. Run `git lfs ls-files` and verify both preserved 0.18.0 installers appear.
+5. Scan the exported tree and full new history for credentials and absolute
    machine paths.
-5. Review `NOTICE.md` and obtain an independent rights review. No upstream
+6. Review `NOTICE.md` and obtain an independent rights review. No upstream
    license is supplied by this repository.
-6. Decide on a license only for material you have authority to license; do not
+7. Decide on a license only for material you have authority to license; do not
    imply that license covers the upstream application or trademarks.
