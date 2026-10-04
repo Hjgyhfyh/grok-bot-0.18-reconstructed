@@ -14,11 +14,13 @@ import {
   buildDir,
   builtAsar,
   builtAsarUnpacked,
+  isWindowsRuntimeHost,
   repoRoot,
+  sourceAppDir,
   stagedAppDir,
+  upstreamAsarSha256,
 } from "./config.mjs";
 import { packStagedAppWithIntegrity, verifyStagedPackageIntegrity } from "./asar-integrity.mjs";
-import { officialMacReleaseAsarHash } from "./macos-shell-invariant.mjs";
 import { stageNodeTreeSitterRuntime } from "../build-tree-sitter-node.mjs";
 import { run } from "./process.mjs";
 
@@ -69,7 +71,7 @@ export const runtimeComposition = Object.freeze([
   { runtime: "electron-runtime-resolution-closure", path: "dist/deps/node_modules", mode: "generated-runtime", provenance: "dist/deps/runtime-deps-manifest.json", reason: "Byte-exact copies of checksum-pinned sibling packages provide standard Node package resolution for Electron utility-process native dependencies." },
   { runtime: "node-runtime-dependencies", path: "dist/node-deps", mode: "generated-runtime", reason: "Native parser packages are rebuilt for the local-exec daemon Node ABI at clean-build time; binaries are never source-controlled." },
   { runtime: "native-runtime-tools", path: "dist/native", mode: "artifact-runtime", reason: "ABI-matched native executables are copied from the checksum-pinned 0.18 runtime." },
-  { runtime: "electron-shell", path: "Contents/Frameworks/Electron Framework.framework", mode: "artifact-runtime", reason: "The macOS package reuses the checksum-pinned, ABI-matched Electron 0.18 application shell and helper executables." },
+  { runtime: "electron-shell", path: isWindowsRuntimeHost ? "Grok Bot.exe" : "Contents/Frameworks/Electron Framework.framework", mode: "artifact-runtime", reason: "The package reuses the checksum-pinned, ABI-matched Electron 0.18 application shell and helper executables." },
 ]);
 
 export const fidelityRuntimeComposition = Object.freeze(runtimeComposition.map(runtime => (
@@ -77,9 +79,11 @@ export const fidelityRuntimeComposition = Object.freeze(runtimeComposition.map(r
     runtime: "renderer",
     path: "dist/renderer",
     mode: "checksum-pinned-artifact-runtime",
-    artifactRoot: "src/app/dist/renderer",
+    // The pinned renderer lives in whichever payload this platform hydrated,
+    // so the macOS and Windows renderers are never mixed.
+    artifactRoot: `${path.relative(repoRoot, sourceAppDir).split(path.sep).join("/")}/dist/renderer`,
     provenance: rendererArtifactProvenance,
-    reason: "The exact shipped 0.18 Mac renderer bundle is preserved byte-for-byte and accepted only against its complete embedded SHA-256 inventory.",
+    reason: "The exact shipped 0.18 renderer bundle is preserved byte-for-byte and accepted only against its complete embedded SHA-256 inventory.",
   }) : runtime
 )));
 
@@ -180,7 +184,7 @@ export async function createRendererArtifactProvenance({
   return {
     schemaVersion: 1,
     upstreamVersion: "0.18.0",
-    upstreamAppAsarSha256: officialMacReleaseAsarHash,
+    upstreamAppAsarSha256: upstreamAsarSha256,
     mode: "checksum-pinned-artifact-runtime",
     artifactRoot: relativeRoot,
     hashAlgorithm: "sha256",

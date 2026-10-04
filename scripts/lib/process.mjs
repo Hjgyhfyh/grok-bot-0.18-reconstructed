@@ -16,11 +16,19 @@ export function spawnProcess(command, args, options = {}) {
   });
 }
 
+// Both helpers settle on `close`, not `exit`. `close` fires after the process
+// has exited AND every stdio stream has ended, so a pipe with data still in the
+// kernel buffer is drained before the promise settles. Resolving on `exit` let a
+// large capture — `scripts/verify.mjs` reads a whole `Info.plist` through a pipe
+// that holds far less — return a truncated string and compare a prefix of the
+// real answer. `close` reports the same `(code, signal)` pair, so the exit-code
+// semantics are unchanged.
+
 export async function run(command, args, options = {}) {
   await new Promise((resolve, reject) => {
     const child = spawnProcess(command, args, options);
     child.once("error", reject);
-    child.once("exit", (code, signal) => {
+    child.once("close", (code, signal) => {
       if (code === 0) {
         resolve();
         return;
@@ -47,7 +55,7 @@ export async function capture(command, args, options = {}) {
       stderr += chunk;
     });
     child.once("error", reject);
-    child.once("exit", (code, signal) => {
+    child.once("close", (code, signal) => {
       if (code === 0) {
         resolve(stdout.trim());
         return;

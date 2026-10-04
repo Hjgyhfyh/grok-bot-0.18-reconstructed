@@ -35,6 +35,8 @@ export interface ProductionCoordinatorAuxiliaryPorts {
     | "detectTimeZone"
     | "getUserTimeZoneOverride"
     | "getComputerUseModel"
+    | "getInferenceProvider"
+    | "getInferenceCustomEndpoint"
     | "getAutoReviewInstructions"
     | "getLocalToolPermission"
     | "getWebauthnProxyEnabled"
@@ -122,6 +124,11 @@ export function createProductionCoordinatorAuxiliaryPorts(
       },
       getUserTimeZoneOverride: () => settings.getUserTimeZoneOverride(),
       getComputerUseModel: () => computerUseModel(context),
+      // A recreated box starts from `parseSettings` defaults, where the provider
+      // is "cursor". Without this the panel kept showing "Custom" while the host
+      // routed back to Cursor after every box recreation.
+      getInferenceProvider: () => settings.getInferenceProvider(),
+      getInferenceCustomEndpoint: () => settings.getInferenceCustomEndpoint() ?? null,
       getAutoReviewInstructions: () => settings.getAutoReviewInstructions(),
       getLocalToolPermission: () => settings.getLocalToolPermission(),
       getWebauthnProxyEnabled: () => settings.getWebauthnProxyEnabled(),

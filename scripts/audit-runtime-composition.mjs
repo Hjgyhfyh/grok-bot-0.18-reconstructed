@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { extractFile, listPackage } from "@electron/asar";
 import { build as esbuild } from "esbuild";
 
+import { listArchiveFiles, toArchiveRelative } from "./lib/asar-paths.mjs";
 import { runtimeComposition } from "./lib/clean-build.mjs";
 import { repoRoot, sourceAppDir } from "./lib/config.mjs";
 import { requiredElectronMainProductionBindings } from "./electron-main-production-activation.mjs";
@@ -583,14 +584,18 @@ async function auditImmutableRendererAssets({ outputRoot, outputPath, outputFile
   }
   let asar = { path: asarPath, status: "not-present", assets: [] };
   if (asarPath != null) {
-    const listing = new Set(listPackage(asarPath));
+    // `listPackage` reports separator-native entries with a leading separator, so
+    // the listing is canonicalised once and every membership test below uses the
+    // same forward-slash spelling as `packagedPath`. Comparing raw entries would
+    // report every asset as missing on Windows instead of failing loudly.
+    const listing = new Set(listArchiveFiles(asarPath, listPackage));
     const packagedAssets = [];
     for (const [relativePath, record] of Object.entries(IMMUTABLE_RENDERER_ASSET_ALLOWLIST)) {
       const packagedPath = `dist/renderer/${relativePath}`;
-      const listed = listing.has(`/${packagedPath}`) && !listing.has(`/${packagedPath}.unpacked`);
+      const listed = listing.has(packagedPath) && !listing.has(`${packagedPath}.unpacked`);
       let packaged = null;
       if (listed) {
-        packaged = extractFile(asarPath, packagedPath);
+        packaged = extractFile(asarPath, toArchiveRelative(packagedPath));
         if (!isAllowlistedImmutableRendererAsset(relativePath, packaged)) {
           blockers.push(`immutable-renderer-asset-asar-drift:${relativePath}`);
         }

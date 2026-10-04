@@ -1,6 +1,7 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  COORDINATOR_RELAUNCH_MAX_ATTEMPTS,
   HEALTHY_COORDINATOR_UPTIME_MS,
   classifyCoordinatorExitCode,
 } from "./coordinator-telemetry.js";
@@ -67,6 +68,12 @@ export interface CoordinatorRuntimeDependencies
   readonly relaunchBackoff: {
     schedule(attempt: number): CoordinatorRelaunchDelay;
   };
+  /**
+   * Consecutive fast exits tolerated before relaunching stops. Defaults to
+   * `COORDINATOR_RELAUNCH_MAX_ATTEMPTS`; the bound is enforced here, at the
+   * scheduling site, because `RetryPolicy.schedule()` only computes a delay.
+   */
+  readonly relaunchMaxAttempts?: number;
   readonly launch?: (
     dependencies: LaunchCoordinatorDependencies,
   ) => CoordinatorLaunchHandle;
@@ -82,6 +89,17 @@ export type CoordinatorLifecycleEvent =
   | {
       readonly outcome: "relaunched";
       readonly delayMs: number;
+      readonly relaunchSeq: number;
+    }
+  | {
+      /**
+       * The relaunch loop hit its bound and stopped on purpose. Reported as its
+       * own outcome so that giving up is distinguishable from the event stream
+       * simply ending.
+       */
+      readonly outcome: "relaunch_abandoned";
+      readonly exitCodeClass: ReturnType<typeof classifyCoordinatorExitCode>;
+      readonly attempts: number;
       readonly relaunchSeq: number;
     };
 
@@ -103,6 +121,7 @@ export function createCoordinatorRuntime(
   let relaunchSeq = 0;
   let fastExitAttempt = 0;
   let pendingRelaunch: CoordinatorRelaunchDelay | undefined;
+  const relaunchMaxAttempts = dependencies.relaunchMaxAttempts ?? COORDINATOR_RELAUNCH_MAX_ATTEMPTS;
 
   const cancelPendingRelaunch = (): void => {
     pendingRelaunch?.dispose();
@@ -153,12 +172,27 @@ export function createCoordinatorRuntime(
       relaunchSeq += 1;
       fastExitAttempt =
         uptimeMs < HEALTHY_COORDINATOR_UPTIME_MS ? fastExitAttempt + 1 : 1;
+      const exitCodeClass = classifyCoordinatorExitCode(code);
       dependencies.onLifecycle({
         outcome: "exited",
-        exitCodeClass: classifyCoordinatorExitCode(code),
+        exitCodeClass,
         uptimeMs,
         relaunchSeq,
       });
+
+      if (fastExitAttempt > relaunchMaxAttempts) {
+        dependencies.onLifecycle({
+          outcome: "relaunch_abandoned",
+          exitCodeClass,
+          attempts: fastExitAttempt - 1,
+          relaunchSeq,
+        });
+        dependencies.onProblem(
+          `coordinator exited (code ${String(code)}); giving up after ${String(relaunchMaxAttempts)} consecutive fast relaunches`,
+        );
+        return;
+      }
+
       dependencies.onProblem(
         `coordinator exited (code ${String(code)}); relaunching`,
       );

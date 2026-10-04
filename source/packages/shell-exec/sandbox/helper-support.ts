@@ -128,22 +128,29 @@ function recordPreflightFailure(ctx: Context, failure: PreflightFailure): false 
   return false;
 }
 
+export const WINDOWS_SANDBOX_UNSUPPORTED_REASON =
+  "The Windows sandbox helper provides a network proxy only; it does not isolate the filesystem, so no filesystem sandbox policy can be enforced on this platform.";
+
 export function isSandboxHelperSupported(ctx?: Context): boolean {
   if (cachedSandboxHelperSupported !== null) {
     return cachedSandboxHelperSupported;
   }
   const effectiveCtx = ctx ?? createContext();
+  // The platform verdict is decided before the binary probe. Probing first let
+  // "binary path was not configured" overwrite the real answer on Windows, so
+  // every Windows user was told to install a helper that can never sandbox the
+  // filesystem here.
+  if (process.platform === "win32") {
+    lastSandboxFailureReason = WINDOWS_SANDBOX_UNSUPPORTED_REASON;
+    logger.info(effectiveCtx, "[isSandboxHelperSupported] win32: returning false (proxy-only, no filesystem sandbox)");
+    cachedSandboxHelperSupported = false;
+    return cachedSandboxHelperSupported;
+  }
   logger.info(effectiveCtx, "[isSandboxHelperSupported] Starting sandbox support check...");
   if (!checkBinaryAvailable(effectiveCtx)) {
     const reason = getErrorMessage(binaryCheckError) ?? "Binary check failed";
     lastSandboxFailureReason = reason;
     logger.info(effectiveCtx, `[isSandboxHelperSupported] Binary not available, returning false. Reason: ${reason}`);
-    cachedSandboxHelperSupported = false;
-    return cachedSandboxHelperSupported;
-  }
-  if (process.platform === "win32") {
-    lastSandboxFailureReason = "Windows sandbox helper only provides network proxy, not filesystem isolation";
-    logger.info(effectiveCtx, "[isSandboxHelperSupported] win32: returning false (proxy-only, no filesystem sandbox)");
     cachedSandboxHelperSupported = false;
     return cachedSandboxHelperSupported;
   }

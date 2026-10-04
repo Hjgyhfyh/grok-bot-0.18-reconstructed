@@ -11,9 +11,9 @@ import { attachShellOutputStreams } from "./output-limiter.js";
 import { getPowerShellExecutable } from "./platform-shell.js";
 import { resolveSandboxPolicyForWorkspace } from "./sandbox/policy-merge.js";
 import { shouldEnableSudoAskpass, transformSudoCommand } from "./sudo.js";
-import { SHELL_ENV_OVERRIDES } from "./types.js";
 import { splitPwdAndState, createShellExitEvent } from "./core.js";
 import { spawnWithSignal } from "./core.js";
+import { buildShellEnv } from "./shell-env.js";
 import type { SandboxExecutionPolicy } from "./sandbox/sandbox.js";
 import {
   type TerminalEvent,
@@ -68,11 +68,8 @@ class PowerShellState {
     const pipeStdin = options?.pipeStdin ?? false;
     const cwd = options?.workingDirectory ?? this.cwd;
     const iterable = createWritableIterable<TerminalEvent>();
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      ...SHELL_ENV_OVERRIDES,
-      ...options?.env,
-    };
+    const pwsh = getPowerShellExecutable();
+    const env = buildShellEnv({ overrides: options?.env, shell: pwsh });
     const transformedCommand = shouldEnableSudoAskpass(env) ? transformSudoCommand(command) : command;
     const tempDir = tmpdir();
     const stateOutFile = join(tempDir, `ps-state-out-${randomUUID()}.txt`);
@@ -82,7 +79,6 @@ class PowerShellState {
     const args = ["-ExecutionPolicy", "Bypass"];
     if (!pipeStdin) args.push("-NonInteractive");
     args.push("-File", scriptFile);
-    const pwsh = getPowerShellExecutable();
     const isWindows = process.platform === "win32";
     const sandboxWorkspaceRoot = options?.sandboxWorkspaceRoot ?? cwd;
     const resolvedPolicy = (await resolveSandboxPolicyForWorkspace(sandboxWorkspaceRoot, options?.sandboxPolicy)).policy;

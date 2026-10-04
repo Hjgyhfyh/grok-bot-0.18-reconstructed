@@ -26,6 +26,7 @@ type ExistingMainRpcCoreDeps = Pick<MainEdgeWiringDeps,
   | "cursorAccount"
   | "ensureTranscriptionManager"
   | "fetchAvailableModels"
+  | "readCustomEndpointApiKey"
   | "recordLocalToolApproval"
   | "clearLocalToolApprovals"
   | "experiments"
@@ -208,6 +209,9 @@ function createExistingMainRpcCoreDeps(
     cursorAccount: cursorAccount as MainEdgeWiringDeps["cursorAccount"],
     ensureTranscriptionManager: ensureTranscriptionManager as MainEdgeWiringDeps["ensureTranscriptionManager"],
     fetchAvailableModels,
+    // Read-only probe support for the Router model list: the key is revealed
+    // here and handed straight to the lister, never to the renderer.
+    readCustomEndpointApiKey: async (key: string) => await context.secretsStores.userSecretsStore.reveal(key),
     recordLocalToolApproval,
     clearLocalToolApprovals,
     experiments,

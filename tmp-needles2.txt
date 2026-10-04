@@ -1,0 +1,6 @@
+Sand coordinator main-data leg
+has no live coordinator session
+coordinator not launched
+onAgentsRosterSeed
+sand:coordinator-port-request
+createAgent

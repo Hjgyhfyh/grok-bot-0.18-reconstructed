@@ -464,11 +464,15 @@ export function createElectronProductionNotificationsBinding(): NotificationsBin
 export function createProductionStartupBinding(
   ports: ElectronStartupProviderPorts,
 ): ElectronProductionStartupBindings {
+  // `isInApplicationsFolder` and `moveToApplicationsFolder` are deliberately NOT
+  // asserted here. They are macOS-only and absent from the Windows Electron API
+  // surface, so requiring them on every platform aborted startup before a window
+  // was ever created. Upstream guards their single use with an explicit
+  // `platform !== "darwin"` short-circuit in `moveToApplicationsFolderIfNeeded`
+  // instead of asserting existence; that is the behaviour restored here.
   for (const [value, label] of [
     [ports?.app?.setPath, "electron.app.setPath()."],
     [ports?.app?.getPath, "electron.app.getPath()."],
-    [ports?.app?.isInApplicationsFolder, "electron.app.isInApplicationsFolder()."],
-    [ports?.app?.moveToApplicationsFolder, "electron.app.moveToApplicationsFolder()."],
     [ports?.app?.relaunch, "electron.app.relaunch()."],
     [ports?.app?.exit, "electron.app.exit()."],
     [ports?.dialog?.showMessageBox, "electron.dialog.showMessageBox()."],

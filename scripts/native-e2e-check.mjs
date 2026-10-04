@@ -7,6 +7,7 @@ import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 import { extractFile, listPackage } from "@electron/asar";
+import { fromArchiveEntry, listArchiveFiles, toArchiveRelative } from "./lib/asar-paths.mjs";
 import {
   NATIVE_OBSERVATION_CLASSES,
   NATIVE_OBSERVATION_ENV_DENYLIST,
@@ -96,7 +97,6 @@ export const PRODUCTION_NATIVE_ENV_DENYLIST = Object.freeze([
 const MOCK_KEYCHAIN_CAPABILITY = Buffer.from("use-mock-keychain", "utf8");
 const SYSTEM_APPLICATIONS_ROOT = "/Applications";
 
-const normalizeArchivePath = (value) => value.replace(/^\/+/, "").replaceAll("\\", "/");
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const exists = async (target) => access(target).then(() => true, () => false);
 
@@ -354,7 +354,7 @@ export async function verifyEntrypointGraph({ readArtifact, immutableRoot, sourc
         diagnostics.push({ check: "entrypoint:renderer", status: "fail", detail: "Renderer index has no script entrypoint" });
         continue;
       }
-      const rendererArtifact = normalizeArchivePath(path.posix.join(path.posix.dirname(artifact), script.split(/[?#]/, 1)[0]));
+      const rendererArtifact = fromArchiveEntry(path.posix.join(path.posix.dirname(artifact), script.split(/[?#]/, 1)[0]));
       if (script.startsWith("/") || rendererArtifact.startsWith("../")) {
         diagnostics.push({ check: "entrypoint:renderer", status: "fail", detail: `Renderer entrypoint escapes packaged payload: ${script}` });
         continue;
@@ -451,6 +451,14 @@ export async function verifyEntrypointGraph({ readArtifact, immutableRoot, sourc
   return diagnostics;
 }
 
+// A payload exposes one canonical key space: forward-slash relative paths, which
+// is what `REQUIRED_PACKAGED_ARTIFACTS` and the renderer provenance records are
+// written in. Both branches convert at their own boundary, because the two
+// directions are opposites: a directory walk and `listPackage` produce
+// separator-native keys that are canonicalised with `fromArchiveEntry`, while
+// `extractFile` demands the platform separator and is fed through
+// `toArchiveRelative`. Normalising both directions with one function made every
+// artifact look missing on Windows and made every read throw.
 export async function openPackagedPayload(input) {
   const stats = await stat(input);
   if (stats.isDirectory()) {
@@ -462,17 +470,17 @@ export async function openPackagedPayload(input) {
       location: root,
       list: async () => {
         const result = [];
-        async function walk(directory, prefix = "") { for (const entry of await readdir(directory, { withFileTypes: true })) { const relative = normalizeArchivePath(path.join(prefix, entry.name)); if (entry.isDirectory()) await walk(path.join(directory, entry.name), relative); else result.push(relative); } }
+        async function walk(directory, prefix = "") { for (const entry of await readdir(directory, { withFileTypes: true })) { const relative = fromArchiveEntry(path.join(prefix, entry.name)); if (entry.isDirectory()) await walk(path.join(directory, entry.name), relative); else result.push(relative); } }
         await walk(root); return result;
       },
-      read: (relative) => readFile(path.join(root, normalizeArchivePath(relative)))
+      read: (relative) => readFile(path.join(root, fromArchiveEntry(relative)))
     };
   }
   return {
     kind: "asar",
     location: input,
-    list: async () => listPackage(input).map(normalizeArchivePath),
-    read: async (relative) => Buffer.from(extractFile(input, normalizeArchivePath(relative)))
+    list: async () => listArchiveFiles(input, listPackage),
+    read: async (relative) => Buffer.from(extractFile(input, toArchiveRelative(relative)))
   };
 }
 

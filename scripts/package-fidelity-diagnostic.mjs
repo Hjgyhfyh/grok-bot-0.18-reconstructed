@@ -7,6 +7,7 @@ import path from "node:path";
 import { extractFile } from "@electron/asar";
 
 import { buildFidelityReconstructedAsar } from "./clean-build.mjs";
+import { toArchiveRelative } from "./lib/asar-paths.mjs";
 import { signAppBundleAdHoc } from "./lib/codesign.mjs";
 import { outputDir, repoRoot, sourceAppDir } from "./lib/config.mjs";
 import {
@@ -88,10 +89,13 @@ await run(SYSTEM_TOOLS.codesign, ["--verify", "--deep", "--strict", installedApp
 const installedAsar = path.join(installedApp, "Contents", "Resources", "app.asar");
 if (sha256(await readFile(installedAsar)) !== asarSha256) throw new Error("Installed diagnostic ASAR drifted");
 
-const reconstructionManifest = JSON.parse(extractFile(archivePath, "dist/reconstruction-build.json").toString("utf8"));
+// `@electron/asar` addresses members with the platform separator, so every
+// lookup is converted at the boundary. The canonical `relative` spelling stays
+// untouched because it is also the key into the reconstruction manifest.
+const reconstructionManifest = JSON.parse(extractFile(archivePath, toArchiveRelative("dist/reconstruction-build.json")).toString("utf8"));
 const outputs = new Map(reconstructionManifest.outputs.map(row => [row.path, row]));
 const hashFor = relative => {
-  const bytes = extractFile(archivePath, relative);
+  const bytes = extractFile(archivePath, toArchiveRelative(relative));
   const digest = sha256(bytes);
   const declared = outputs.get(relative);
   if (declared?.sha256 !== digest || declared.bytes !== bytes.length) throw new Error(`Diagnostic runtime identity drifted: ${relative}`);

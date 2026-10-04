@@ -4,30 +4,69 @@ import path from "node:path";
 
 import { extractFile, listPackage } from "@electron/asar";
 
+import { listArchiveFiles, toArchiveRelative } from "./lib/asar-paths.mjs";
 import {
+  isWindowsRuntimeHost,
   outputApp,
   reconstructedBundleId,
   reconstructedName,
   repoRoot,
+  runtimeExecutablePath,
   sourceAppDir,
   upstreamAsarSha256,
 } from "./lib/config.mjs";
 import { prepareReconstructedElectronMainArtifactFallback } from "./lib/build-asar.mjs";
+import { readRendererExtensionChunks } from "./lib/macos-package-verification.mjs";
 import { resolvePackagedAppArtifacts } from "./lib/packaged-app.mjs";
+import { resolveRuntimeApp } from "./lib/runtime.mjs";
 import { capture, run } from "./lib/process.mjs";
-import { SYSTEM_TOOLS } from "./lib/system-tools.mjs";
+import { systemTool } from "./lib/system-tools.mjs";
 
 function readAppArgument(argv) {
   const index = argv.indexOf("--app");
   if (index === -1) return outputApp;
   if (index !== argv.length - 2 || argv[index + 1]?.startsWith("--")) {
-    throw new Error("Usage: node scripts/verify.mjs [--app /absolute/path/to/App.app]");
+    throw new Error("Usage: node scripts/verify.mjs [--app /absolute/path/to/packaged/application]");
   }
   return path.resolve(argv[index + 1]);
 }
 
-const verifiedApp = readAppArgument(process.argv.slice(2));
-const { asarPath: builtAsar, unpackedPath: builtAsarUnpacked } = resolvePackagedAppArtifacts(verifiedApp);
+const isMacosHost = process.platform === "darwin";
+// A flat Windows directory and a macOS `.app` bundle both resolve to the same
+// artifact names; only the root differs, so verification keys on the resolved
+// pair instead of re-deriving the layout per platform.
+const { appPath: verifiedApp, asarPath: builtAsar, unpackedPath: builtAsarUnpacked } = resolvePackagedAppArtifacts(readAppArgument(process.argv.slice(2)));
+
+// node-gyp-build resolves a node-gyp `build/Release` object and a prebuildify
+// `prebuilds/<platform>-<arch>` archive alike, so either spelling satisfies a
+// package. The pinned Windows runtime ships tree-sitter-bash as a prebuild that
+// is copied instead of compiled, while the macOS source build produces a
+// `build/Release` object for both packages.
+const nativeBinarySpellings = new Map([
+  ["dist/node-deps/tree-sitter", ["build/Release/tree_sitter_runtime_binding.node"]],
+  ["dist/node-deps/tree-sitter-bash", [
+    "build/Release/tree_sitter_bash_binding.node",
+    `prebuilds/${process.platform}-${process.arch}/tree-sitter-bash.node`,
+  ]],
+]);
+// The security-key helper is a native executable, so Windows ships `.exe`.
+const signerBinary = `sand-webauthn-signer${isWindowsRuntimeHost ? ".exe" : ""}`;
+
+// The immutable artifact renderer root for this host. Its entry chunk and its
+// opaque mermaid core carry platform-specific content hashes, so the forbidden
+// chunk names are derived from this tree instead of being hard-coded.
+const artifactRendererRoot = path.join(sourceAppDir, "dist", "renderer");
+const ARTIFACT_OPAQUE_ASSET_PATTERNS = [/^mermaid\.core-[^/\\]+\.js$/];
+const RENDERER_ASSET_PREFIX = "dist/renderer/assets/";
+
+// `@electron/asar` addresses archive members with the platform separator:
+// `listPackage` reports backslash-separated entries on Windows, and
+// `extractFile` rejects the POSIX spelling there. Both directions go through
+// `scripts/lib/asar-paths.mjs`, so every lookup below stays separator-native
+// while the comparisons themselves keep one canonical spelling.
+const archiveEntries = listArchiveFiles(builtAsar, listPackage);
+const listing = new Set(archiveEntries);
+const readArchiveEntry = relative => extractFile(builtAsar, toArchiveRelative(relative));
 
 async function requirePath(target) {
   await access(target);
@@ -38,14 +77,23 @@ function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
-async function walkFiles(root, current = root) {
-  const files = [];
-  for (const entry of await readdir(current, { withFileTypes: true })) {
-    const target = path.join(current, entry.name);
-    if (entry.isDirectory()) files.push(...await walkFiles(root, target));
-    else if (entry.isFile()) files.push(path.relative(root, target).split(path.sep).join("/"));
+/**
+ * Names of the immutable artifact chunks that a clean-source renderer must not
+ * package or activate. The entry chunk is whatever the artifact renderer's own
+ * file-relative `index.html` loads, and the opaque cores are matched by pattern
+ * against the artifact inventory, so the answer follows whichever 0.18 payload
+ * this host hydrated instead of one platform's content hashes.
+ */
+async function immutableRendererChunkNames() {
+  const artifactIndexPath = path.join(artifactRendererRoot, "index.html");
+  const artifactIndex = await readFile(artifactIndexPath, "utf8");
+  const entry = artifactIndex.match(/src="\.\/assets\/([^"]+)"/)?.[1];
+  if (entry == null) throw new Error(`Artifact renderer index has no file-relative entry chunk: ${artifactIndexPath}`);
+  const names = new Set([entry]);
+  for (const asset of await readdir(path.join(artifactRendererRoot, "assets"))) {
+    if (ARTIFACT_OPAQUE_ASSET_PATTERNS.some(pattern => pattern.test(asset))) names.add(asset);
   }
-  return files.sort();
+  return names;
 }
 
 const electronMain = await readFile(path.join(sourceAppDir, "dist", "electron-main", "main.cjs"), "utf8");
@@ -55,28 +103,27 @@ if (sourceMarkers < 1_000) throw new Error(`Expected at least 1,000 surviving ev
 
 await requirePath(builtAsar);
 await requirePath(path.join(builtAsarUnpacked, "dist", "deps", "better-sqlite3", "build", "Release", "better_sqlite3.node"));
-await requirePath(path.join(builtAsarUnpacked, "dist", "native", "sand-webauthn-signer"));
+await requirePath(path.join(builtAsarUnpacked, "dist", "native", signerBinary));
 await requirePath(verifiedApp);
 
-const listing = new Set(listPackage(builtAsar));
 for (const required of [
-  "/dist/electron-main/main.cjs",
-  "/dist/electron-dev-controls/main.cjs",
-  "/dist/electron-preload/preload.cjs",
-  "/dist/electron-preload/preload-dev-controls.cjs",
-  "/dist/electron-preload/preload-webview.cjs",
-  "/dist/electron-preload/preload-vnc.cjs",
-  "/dist/node-agent-coordinator/main.cjs",
-  "/dist/host/host-main.cjs",
-  "/dist/host/agent-isolation/agent-store-worker.cjs",
-  "/dist/host/agent-isolation/transcript-mirror-worker.cjs",
-  "/dist/host/extensions/box-store-sync/box-store-vacuum-worker.cjs",
-  "/dist/host/extensions/content-search/search-index-worker.cjs",
-  "/dist/local-exec-daemon/main.cjs",
-  "/dist/renderer/index.html",
-  "/dist/reconstruction-build.json",
-  "/dist/runtime-composition-audit.json",
-  "/package.json",
+  "dist/electron-main/main.cjs",
+  "dist/electron-dev-controls/main.cjs",
+  "dist/electron-preload/preload.cjs",
+  "dist/electron-preload/preload-dev-controls.cjs",
+  "dist/electron-preload/preload-webview.cjs",
+  "dist/electron-preload/preload-vnc.cjs",
+  "dist/node-agent-coordinator/main.cjs",
+  "dist/host/host-main.cjs",
+  "dist/host/agent-isolation/agent-store-worker.cjs",
+  "dist/host/agent-isolation/transcript-mirror-worker.cjs",
+  "dist/host/extensions/box-store-sync/box-store-vacuum-worker.cjs",
+  "dist/host/extensions/content-search/search-index-worker.cjs",
+  "dist/local-exec-daemon/main.cjs",
+  "dist/renderer/index.html",
+  "dist/reconstruction-build.json",
+  "dist/runtime-composition-audit.json",
+  "package.json",
 ]) {
   if (!listing.has(required)) throw new Error(`ASAR is missing ${required}`);
 }
@@ -85,25 +132,28 @@ const rendererRuntimeManifest = JSON.parse(await readFile(path.join(repoRoot, "f
 const rendererAssets = [...(rendererRuntimeManifest.assets ?? []), ...(rendererRuntimeManifest.immutableAssets ?? [])];
 const icon = rendererAssets.find(asset => asset.file === "app-icon-C7NKj2u7.png");
 if (icon == null || typeof icon.sha256 !== "string") throw new Error("Renderer runtime manifest has no exact app icon record");
-const iconPath = `dist/renderer/assets/${icon.file}`;
-if (!listing.has(`/${iconPath}`)) throw new Error(`ASAR is missing ${iconPath}`);
-const packagedIcon = extractFile(builtAsar, iconPath);
+const iconPath = `${RENDERER_ASSET_PREFIX}${icon.file}`;
+if (!listing.has(iconPath)) throw new Error(`ASAR is missing ${iconPath}`);
+const packagedIcon = readArchiveEntry(iconPath);
 if ((icon.bytes != null && packagedIcon.byteLength !== icon.bytes) || sha256(packagedIcon) !== icon.sha256) throw new Error("Packaged app icon differs from its renderer runtime manifest");
 
-const rendererListing = [...listing].map(entry => entry.replace(/^\/+/, ""));
-const rendererMaps = rendererListing.filter(entry => entry.startsWith("dist/renderer/") && entry.endsWith(".map"));
+const rendererMaps = archiveEntries.filter(entry => entry.startsWith("dist/renderer/") && entry.endsWith(".map"));
 if (rendererMaps.length > 0) throw new Error(`Packaged renderer contains source maps: ${rendererMaps.join(", ")}`);
+for (const [packageRoot, spellings] of nativeBinarySpellings) {
+  const candidates = spellings.map(spelling => `${packageRoot}/${spelling}`);
+  const present = candidates.filter(relative => listing.has(relative));
+  if (present.length === 0) throw new Error(`ASAR is missing generated Node runtime entry; expected one of ${candidates.join(", ")}`);
+  await requirePath(path.join(builtAsarUnpacked, present[0]));
+}
 for (const relative of [
-  "dist/node-deps/tree-sitter/build/Release/tree_sitter_runtime_binding.node",
-  "dist/node-deps/tree-sitter-bash/build/Release/tree_sitter_bash_binding.node",
   "dist/node-deps/node_modules/node-addon-api/package.json",
   "dist/node-deps/node_modules/node-gyp-build/package.json",
 ]) {
-  if (!listing.has(`/${relative}`)) throw new Error(`ASAR is missing generated Node runtime entry ${relative}`);
+  if (!listing.has(relative)) throw new Error(`ASAR is missing generated Node runtime entry ${relative}`);
   await requirePath(path.join(builtAsarUnpacked, relative));
 }
 
-const buildManifest = JSON.parse(extractFile(builtAsar, "dist/reconstruction-build.json").toString("utf8"));
+const buildManifest = JSON.parse(readArchiveEntry("dist/reconstruction-build.json").toString("utf8"));
 const runtimeComposition = buildManifest.runtimeComposition;
 if (!Array.isArray(runtimeComposition)) throw new Error("Packaged build manifest has no runtime composition.");
 const fallbackPaths = new Map([
@@ -112,14 +162,14 @@ const fallbackPaths = new Map([
 ]);
 for (const runtime of runtimeComposition.filter(({ runtime: name }) => fallbackPaths.has(name))) {
   const fallbackPath = fallbackPaths.get(runtime.runtime);
-  if (runtime.mode === "artifact-fallback" && !listing.has(`/${fallbackPath}`)) {
+  if (runtime.mode === "artifact-fallback" && !listing.has(fallbackPath)) {
     throw new Error(`Artifact fallback has no packaged recovered-source entry: ${runtime.runtime}`);
   }
-  if (runtime.mode === "clean-source" && listing.has(`/${fallbackPath}`)) {
+  if (runtime.mode === "clean-source" && listing.has(fallbackPath)) {
     throw new Error(`Clean runtime still packages recovered-source fallback: ${runtime.runtime}`);
   }
 }
-const compositionAuditBytes = extractFile(builtAsar, "dist/runtime-composition-audit.json");
+const compositionAuditBytes = readArchiveEntry("dist/runtime-composition-audit.json");
 const compositionAudit = JSON.parse(compositionAuditBytes.toString("utf8"));
 if (JSON.stringify(compositionAudit.runtimeComposition) !== JSON.stringify(runtimeComposition)) {
   throw new Error("Packaged runtime composition does not match the clean build contract.");
@@ -145,19 +195,20 @@ if (compositionAudit.replacementClosures.host?.verdict !== expectedHostVerdict) 
 }
 const rendererComposition = runtimeComposition.find(runtime => runtime.runtime === "renderer");
 for (const output of buildManifest.outputs) {
-  const bytes = extractFile(builtAsar, output.path);
+  const bytes = readArchiveEntry(output.path);
   if (bytes.byteLength !== output.bytes || sha256(bytes) !== output.sha256) {
     throw new Error(`Packaged clean output differs from its deterministic manifest: ${output.path}`);
   }
 }
 
 const rendererProvenancePath = rendererComposition.provenance;
-if (typeof rendererProvenancePath !== "string" || !listing.has(`/${rendererProvenancePath}`)) throw new Error("Packaged renderer has no provenance record.");
-const rendererProvenance = JSON.parse(extractFile(builtAsar, rendererProvenancePath).toString("utf8"));
-const packagedRendererIndex = extractFile(builtAsar, "dist/renderer/index.html").toString("utf8");
+if (typeof rendererProvenancePath !== "string" || !listing.has(rendererProvenancePath)) throw new Error("Packaged renderer has no provenance record.");
+const rendererProvenance = JSON.parse(readArchiveEntry(rendererProvenancePath).toString("utf8"));
+const packagedRendererIndex = readArchiveEntry("dist/renderer/index.html").toString("utf8");
 if (!/src="\.\/assets\//.test(packagedRendererIndex)) throw new Error("Packaged renderer index is not file-relative.");
 if (rendererComposition?.mode === "clean-source") {
-  const forbiddenRendererAssets = rendererListing.filter(entry => entry === "dist/renderer/assets/index-UbX-y3il.js" || entry === "dist/renderer/assets/mermaid.core-CYC_FcEu.js");
+  const immutableChunks = await immutableRendererChunkNames();
+  const forbiddenRendererAssets = archiveEntries.filter(entry => entry.startsWith(RENDERER_ASSET_PREFIX) && immutableChunks.has(entry.slice(RENDERER_ASSET_PREFIX.length)));
   if (forbiddenRendererAssets.length > 0) throw new Error(`Packaged clean renderer contains forbidden opaque assets: ${forbiddenRendererAssets.join(", ")}`);
   if (compositionAudit.rendererComposition?.productionActivation?.verified !== true) throw new Error("Renderer composition audit did not verify the clean production entry graph.");
   if (rendererProvenance.mode !== "clean-source" || rendererProvenance.entrypoint !== "frontend/src/main.tsx") throw new Error("Packaged clean renderer provenance has the wrong root.");
@@ -166,10 +217,14 @@ if (rendererComposition?.mode === "clean-source") {
   const expectedRendererRoutes = JSON.parse(await readFile(path.join(repoRoot, "manifests/reconstruction/renderer-closure.json"), "utf8")).routes.map(({ route, family, kind, reviewed, cleanComposition }) => ({ route, family, kind, reviewed, cleanComposition }));
   if (JSON.stringify(rendererProvenance.evidence?.routeContracts) !== JSON.stringify(expectedRendererRoutes) || expectedRendererRoutes.length !== 11 || expectedRendererRoutes.some(route => route.reviewed !== true || route.cleanComposition !== "present")) throw new Error("Packaged renderer provenance does not preserve the exact 11 shipped route contracts.");
   if (rendererProvenance.evidence?.uiSummary?.findings !== 0 || rendererProvenance.evidence?.emittedLazyEntries?.length !== 5) throw new Error("Packaged renderer provenance or lazy boundaries are incomplete.");
-  if (packagedRendererIndex.includes("index-UbX-y3il.js")) throw new Error("Packaged clean renderer still activates the immutable artifact entry chunk.");
+  // The clean entry chunk is whatever this platform's clean build emitted, so
+  // the activation check asks "is the loaded chunk an immutable artifact chunk?"
+  // instead of naming one platform's hashed file.
+  const packagedEntryChunk = packagedRendererIndex.match(/src="\.\/assets\/([^"]+)"/)?.[1];
+  if (immutableChunks.has(packagedEntryChunk)) throw new Error(`Packaged clean renderer still activates the immutable artifact entry chunk: ${packagedEntryChunk}`);
   const rendererRuntimeAssetPaths = new Set(rendererAssets.map(asset => `dist/renderer/assets/${asset.file}`));
   for (const output of rendererProvenance.outputs.filter(output => output.path.endsWith(".js") && !rendererRuntimeAssetPaths.has(output.path))) {
-    const contents = extractFile(builtAsar, output.path).toString("utf8");
+    const contents = readArchiveEntry(output.path).toString("utf8");
     if (!contents.includes('"Deterministic clean-source renderer: frontend/src/main.tsx";')) throw new Error(`Renderer chunk did not come from the clean production root: ${output.path}`);
   }
 } else if (rendererComposition?.mode === "checksum-pinned-artifact-runtime") {
@@ -178,13 +233,22 @@ if (rendererComposition?.mode === "clean-source") {
   if (acceptance?.verdict !== "verified" || acceptance.provenance !== rendererProvenancePath || acceptance.fileCount !== rendererProvenance.fileCount || acceptance.inventorySha256 !== rendererProvenance.inventorySha256) throw new Error("Packaged artifact renderer acceptance does not match its provenance.");
   if (!Array.isArray(rendererProvenance.files) || rendererProvenance.files.length !== rendererProvenance.fileCount) throw new Error("Packaged artifact renderer provenance has an invalid file inventory.");
   const declaredPaths = new Set();
+  const declaredFiles = new Map(rendererProvenance.files.map(file => [file.path, file]));
+  // The clean router settings extension rewrites the two shipped chunks it finds
+  // by anchor, so those files are packaged as their recorded patched bytes while
+  // every other chunk must stay byte-identical to the shipped inventory. The
+  // extension record itself pins the pre-patch identity, so honouring it cannot
+  // smuggle an unreviewed chunk past this loop.
+  const rendererExtension = readRendererExtensionChunks({ archivePath: builtAsar, expectedFiles: declaredFiles });
   for (const file of rendererProvenance.files) {
     if (typeof file.path !== "string" || declaredPaths.has(file.path)) throw new Error("Packaged artifact renderer provenance contains a missing or duplicate path.");
     declaredPaths.add(file.path);
-    const bytes = extractFile(builtAsar, `dist/renderer/${file.path}`);
-    if (bytes.byteLength !== file.bytes || sha256(bytes) !== file.sha256) throw new Error(`Packaged artifact renderer differs from its checksum inventory: ${file.path}`);
+    const bytes = readArchiveEntry(`dist/renderer/${file.path}`);
+    const extension = rendererExtension?.chunks.get(file.path);
+    const wanted = extension?.patched ?? file;
+    if (bytes.byteLength !== wanted.bytes || sha256(bytes) !== wanted.sha256) throw new Error(`Packaged artifact renderer differs from its checksum inventory: ${file.path}`);
   }
-  const packagedPaths = rendererListing.filter(entry => entry.startsWith("dist/renderer/")).map(entry => entry.slice("dist/renderer/".length)).filter(Boolean);
+  const packagedPaths = archiveEntries.filter(entry => entry.startsWith("dist/renderer/")).map(entry => entry.slice("dist/renderer/".length)).filter(Boolean);
   const undeclaredFiles = packagedPaths.filter(candidate => !declaredPaths.has(candidate) && ![...declaredPaths].some(file => file.startsWith(`${candidate}/`)));
   if (undeclaredFiles.length > 0 || [...declaredPaths].some(file => !packagedPaths.includes(file))) throw new Error("Packaged artifact renderer contains undeclared or missing files.");
 } else {
@@ -196,7 +260,7 @@ for (const relative of [
   ...(hostComposition?.mode === "clean-source" ? [] : ["dist/host/host-main.cjs"]),
 ]) {
   const evidence = await readFile(path.join(sourceAppDir, relative));
-  const packaged = extractFile(builtAsar, relative);
+  const packaged = readArchiveEntry(relative);
   const expected = relative === "dist/electron-main/main.cjs"
     ? Buffer.from(prepareReconstructedElectronMainArtifactFallback(evidence.toString("utf8")))
     : evidence;
@@ -218,13 +282,13 @@ for (const relative of [
   ...(electronMainComposition?.mode === "clean-source" ? ["dist/electron-main/main.cjs"] : []),
   ...(hostComposition?.mode === "clean-source" ? ["dist/host/host-main.cjs"] : []),
 ]) {
-  const contents = extractFile(builtAsar, relative).toString("utf8");
+  const contents = readArchiveEntry(relative).toString("utf8");
   if (!contents.includes("// Deterministic clean-source")) throw new Error(`Runtime did not come from clean source: ${relative}`);
 }
 
 if (hostComposition?.mode === "clean-source") {
-  if (!listing.has("/dist/host-production-bindings.json")) throw new Error("Clean host has no packaged binding provenance manifest.");
-  const provenance = JSON.parse(extractFile(builtAsar, "dist/host-production-bindings.json").toString("utf8"));
+  if (!listing.has("dist/host-production-bindings.json")) throw new Error("Clean host has no packaged binding provenance manifest.");
+  const provenance = JSON.parse(readArchiveEntry("dist/host-production-bindings.json").toString("utf8"));
   if (provenance.status !== "validated-clean-source" || provenance.executableGraph.forbiddenInputs.length > 0 || provenance.executableGraph.forbiddenOutputReferences.length > 0) {
     throw new Error("Clean host binding provenance is not fail-closed.");
   }
@@ -236,8 +300,8 @@ if (hostComposition?.mode === "clean-source") {
 }
 
 if (electronMainComposition?.mode === "clean-source") {
-  if (!listing.has("/dist/electron-main-production-bindings.json")) throw new Error("Clean Electron main has no packaged binding provenance manifest.");
-  const provenance = JSON.parse(extractFile(builtAsar, "dist/electron-main-production-bindings.json").toString("utf8"));
+  if (!listing.has("dist/electron-main-production-bindings.json")) throw new Error("Clean Electron main has no packaged binding provenance manifest.");
+  const provenance = JSON.parse(readArchiveEntry("dist/electron-main-production-bindings.json").toString("utf8"));
   if (provenance.status !== "validated-clean-source" || provenance.executableGraph.forbiddenInputs.length > 0 || provenance.executableGraph.forbiddenOutputReferences.length > 0) throw new Error("Clean Electron-main binding provenance is not fail-closed.");
   for (const binding of provenance.bindings) {
     if (binding.module.includes("src/app") || binding.module.includes("dist/deps") || binding.module.includes("recovered/source-capsules")) throw new Error(`Clean Electron-main binding smuggles first-party artifact code: ${binding.path}`);
@@ -246,24 +310,53 @@ if (electronMainComposition?.mode === "clean-source") {
 
 const sourceFallbacks = runtimeComposition.filter(({ mode, sourceBundle }) => mode === "artifact-fallback" && sourceBundle != null);
 for (const fallback of sourceFallbacks) {
-  if (!fallback.sourceBundle || !listing.has(`/${fallback.sourceBundle}`)) {
+  if (!fallback.sourceBundle || !listing.has(fallback.sourceBundle)) {
     throw new Error(`Artifact fallback has no packaged clean source bundle: ${fallback.runtime}`);
   }
 }
 
-const infoPlist = path.join(verifiedApp, "Contents", "Info.plist");
-const bundleId = await capture(SYSTEM_TOOLS.plutil, ["-extract", "CFBundleIdentifier", "raw", infoPlist]);
-if (bundleId !== reconstructedBundleId) throw new Error(`Unexpected reconstructed bundle ID: ${bundleId}`);
-const displayName = await capture(SYSTEM_TOOLS.plutil, ["-extract", "CFBundleDisplayName", "raw", infoPlist]);
-if (displayName !== reconstructedName) throw new Error(`Unexpected reconstructed display name: ${displayName}`);
-const plistText = await capture(SYSTEM_TOOLS.plutil, ["-convert", "xml1", "-o", "-", infoPlist]);
-if (plistText.includes("ElectronAsarIntegrity")) throw new Error("Stale ElectronAsarIntegrity metadata remains in the reconstructed application");
-const urlTypes = await capture(SYSTEM_TOOLS.plutil, ["-extract", "CFBundleURLTypes", "xml1", "-o", "-", infoPlist]);
-if (!/<key>CFBundleURLSchemes<\/key>[\s\S]*<string>sand<\/string>/.test(urlTypes)) throw new Error("Reconstructed application has no sand URL registration");
+// Payload identity is platform-shaped. A macOS bundle restates its identity in
+// Info.plist and carries a code signature; a flat Windows payload has neither
+// bundle metadata nor a signature to verify, so the equivalent guarantee is
+// that `resources\app.asar` is the reconstructed archive and that the inherited
+// Electron shell is still byte-identical to the checksum-pinned runtime.
+if (isMacosHost) {
+  const plutil = systemTool("plutil");
+  const infoPlist = path.join(verifiedApp, "Contents", "Info.plist");
+  const bundleId = await capture(plutil, ["-extract", "CFBundleIdentifier", "raw", infoPlist]);
+  if (bundleId !== reconstructedBundleId) throw new Error(`Unexpected reconstructed bundle ID: ${bundleId}`);
+  const displayName = await capture(plutil, ["-extract", "CFBundleDisplayName", "raw", infoPlist]);
+  if (displayName !== reconstructedName) throw new Error(`Unexpected reconstructed display name: ${displayName}`);
+  const plistText = await capture(plutil, ["-convert", "xml1", "-o", "-", infoPlist]);
+  if (plistText.includes("ElectronAsarIntegrity")) throw new Error("Stale ElectronAsarIntegrity metadata remains in the reconstructed application");
+  const urlTypes = await capture(plutil, ["-extract", "CFBundleURLTypes", "xml1", "-o", "-", infoPlist]);
+  if (!/<key>CFBundleURLSchemes<\/key>[\s\S]*<string>sand<\/string>/.test(urlTypes)) throw new Error("Reconstructed application has no sand URL registration");
+  await run(systemTool("codesign"), ["--verify", "--deep", "--strict", verifiedApp]);
+} else if (isWindowsRuntimeHost) {
+  // `resources\app.asar` was already required above; the shell is what replaces
+  // the code signature as the payload's integrity anchor, so it is compared
+  // against the pinned runtime rather than merely being present.
+  const executable = await requirePath(runtimeExecutablePath(verifiedApp));
+  const runtimeApp = await resolveRuntimeApp();
+  const [packagedShell, runtimeShell] = await Promise.all([
+    readFile(executable),
+    readFile(runtimeExecutablePath(runtimeApp)),
+  ]);
+  if (packagedShell.byteLength !== runtimeShell.byteLength || sha256(packagedShell) !== sha256(runtimeShell)) {
+    throw new Error(`Packaged shell executable is not the checksum-pinned runtime shell: ${executable}`);
+  }
+  if (sha256(await readFile(builtAsar)) === upstreamAsarSha256) {
+    throw new Error("Packaged application still ships the upstream 0.18.0 app.asar");
+  }
+} else {
+  throw new Error(`Packaged verification does not support ${process.platform}.`);
+}
 
-await run(SYSTEM_TOOLS.codesign, ["--verify", "--deep", "--strict", verifiedApp]);
 const cleanCount = runtimeComposition.filter(({ mode }) => mode === "clean-source").length;
 const fallbackNames = runtimeComposition.filter(({ mode }) => mode !== "clean-source").map(({ runtime }) => runtime).join(", ");
+const verifiedIdentity = isMacosHost
+  ? "bundle identity, and code signature"
+  : "resources\\app.asar, and the unchanged pinned Electron shell";
 console.log(`Verified packaged ASAR ${builtAsar}.`);
-console.log(`Verified ${cleanCount} executable clean-source runtimes, deterministic ASAR hashes, native dependencies, bundle identity, and code signature.`);
+console.log(`Verified ${cleanCount} executable clean-source runtimes, deterministic ASAR hashes, native dependencies, ${verifiedIdentity}.`);
 console.log(`Documented non-clean runtime boundaries: ${fallbackNames}. Evidence markers checked: ${sourceMarkers}. Repository: ${repoRoot}`);

@@ -5,6 +5,7 @@ import path from "node:path";
 import { listPackage, statFile } from "@electron/asar";
 
 import { repoRoot } from "./config.mjs";
+import { fromArchiveEntry, toArchiveRelative } from "./asar-paths.mjs";
 import { run } from "./process.mjs";
 
 const unpackedPrefixes = ["dist/deps/", "dist/native/", "dist/node-deps/"];
@@ -49,9 +50,11 @@ function snapshotDiff(before, after) {
 async function archiveFileEntries(archivePath) {
   const entries = new Map();
   for (const raw of listPackage(archivePath)) {
-    const relative = raw.replace(/^\//, "");
+    // Archive listings are platform-separated; the map is keyed by the same
+    // canonical relative paths the staged snapshot uses.
+    const relative = fromArchiveEntry(raw);
     try {
-      const entry = statFile(archivePath, relative);
+      const entry = statFile(archivePath, toArchiveRelative(relative));
       if (typeof entry.size === "number") entries.set(relative, entry);
     } catch {
       // listPackage includes directories; statFile is the file boundary.

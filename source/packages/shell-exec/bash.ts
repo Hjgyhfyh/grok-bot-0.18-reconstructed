@@ -8,8 +8,8 @@ import type { Context } from "../context/core.js";
 import { createWritableIterable } from "../utils/writable-iterable.js";
 import { attachShellOutputStreams } from "./output-limiter.js";
 import { getBashPath, windowsPathToGitBash } from "./platform-shell.js";
+import { buildShellEnv } from "./shell-env.js";
 import { getSudoAliasInjection } from "./sudo.js";
-import { SHELL_ENV_OVERRIDES } from "./types.js";
 import { resolveSandboxPolicyForWorkspace } from "./sandbox/policy-merge.js";
 import { captureSandboxDenies } from "./sandbox/macos/seatbelt.js";
 import { BASH_STATE_END_MARKER, BASH_STATE_START_MARKER, default as dumpBashState } from "./dump_bash_state.js";
@@ -57,11 +57,7 @@ async function captureSandboxDenies2(child: ChildProcess): Promise<readonly unkn
 }
 
 export async function initBashState(options?: BashInitOptions): Promise<BashState> {
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    ...SHELL_ENV_OVERRIDES,
-    ...options?.env,
-  };
+  const env = buildShellEnv({ overrides: options?.env, shell: options?.userTerminalHint ?? getBashPath(options?.userTerminalHint) ?? undefined });
   const stateMarker = "__CURSOR_STATE_MARKER__";
   const args = [
     "-O",
@@ -123,11 +119,7 @@ class BashState {
     const pipeStdin = options.pipeStdin ?? false;
     const iterable = createWritableIterable<TerminalEvent>();
     const cwd = options.workingDirectory ?? this.cwd;
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      ...SHELL_ENV_OVERRIDES,
-      ...options.env,
-    };
+    const env = buildShellEnv({ overrides: options.env, shell: this.userTerminalHint ?? getBashPath(this.userTerminalHint) ?? undefined });
     let core = "builtin eval \"$1\"";
     if (!pipeStdin) core += " < /dev/null";
     const sudoAliasInjection = getSudoAliasInjection(env);

@@ -79,7 +79,16 @@ function loadDeveloperDependency<T>(name: string): T {
 
 function loadRuntimeDependency<T>(name: string): T {
   const roots = runtimeDependencyRoots();
-  if (process.env.SAND_PACKAGED !== "1" && roots.length === 0) return loadDeveloperDependency<T>(name);
+  if (process.env.SAND_PACKAGED !== "1" && roots.length === 0) {
+    try {
+      return loadDeveloperDependency<T>(name);
+    } catch (cause: unknown) {
+      // `createRequire().resolve` raises a bare MODULE_NOT_FOUND here, which
+      // hides the runtime domain from the reader. Normalise it to the same
+      // fail-closed error every other path produces.
+      throw runtimeDependencyError(name, roots, cause);
+    }
+  }
 
   for (const root of roots) {
     const packageDirectory = path.join(root, name);
@@ -95,8 +104,47 @@ function loadRuntimeDependency<T>(name: string): T {
   throw runtimeDependencyError(name, roots);
 }
 
-const Parser = loadRuntimeDependency<ParserConstructor>("tree-sitter");
-const bashLanguage = loadRuntimeDependency<unknown>("tree-sitter-bash");
+type ShellParserRuntime = {
+  readonly Parser: ParserConstructor;
+  readonly bashLanguage: unknown;
+};
+
+let cachedRuntime: ShellParserRuntime | null | undefined;
+let runtimeLoadError: unknown;
+
+/**
+ * The last failure raised while resolving the tree-sitter runtime, or
+ * `undefined` when the runtime loaded. Exported so a degraded shell tool can be
+ * diagnosed instead of silently answering `parsingFailed` forever.
+ */
+export function getShellParserRuntimeError(): unknown {
+  return runtimeLoadError;
+}
+
+function loadShellParserRuntime(): ShellParserRuntime | null {
+  if (cachedRuntime !== undefined) return cachedRuntime;
+  try {
+    cachedRuntime = {
+      Parser: loadRuntimeDependency<ParserConstructor>("tree-sitter"),
+      bashLanguage: loadRuntimeDependency<unknown>("tree-sitter-bash"),
+    };
+    runtimeLoadError = undefined;
+  } catch (error: unknown) {
+    // Resolving the parser is best-effort. The alternative — raising at module
+    // scope — took the whole shell tool with it: `shell-stream.ts`,
+    // `background-shell.ts` and `create-shell-tool.ts` all import
+    // `analyzeShellCommand` from this module, so one unreachable native
+    // dependency disabled every shell command. Degrade to `parsingFailed`
+    // instead, which is the outcome the rest of this file already models.
+    cachedRuntime = null;
+    runtimeLoadError = error;
+    const detail = error instanceof Error ? error.message : String(error);
+    console.warn(
+      `shell-parser: tree-sitter could not be loaded; shell command analysis degrades to parsingFailed. ${detail}`,
+    );
+  }
+  return cachedRuntime;
+}
 
 export interface ShellCommandArgument {
   readonly type: string;
@@ -146,9 +194,14 @@ function isStubbedTreeSitterError(error: unknown): boolean {
 
 function getParser(): ParserType | null {
   if (cachedParser !== undefined) return cachedParser;
+  const runtime = loadShellParserRuntime();
+  if (runtime === null) {
+    cachedParser = null;
+    return cachedParser;
+  }
   try {
-    const parser = new Parser();
-    parser.setLanguage(bashLanguage);
+    const parser = new runtime.Parser();
+    parser.setLanguage(runtime.bashLanguage);
     cachedParser = parser;
   } catch (error: unknown) {
     if (!isStubbedTreeSitterError(error)) throw error;

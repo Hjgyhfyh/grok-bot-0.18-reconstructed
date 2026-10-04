@@ -5,6 +5,11 @@ import path from "node:path";
 import { extractFile, listPackage, statFile } from "@electron/asar";
 
 import {
+  fromArchiveEntry,
+  listArchiveFiles,
+  toArchiveRelative,
+} from "./asar-paths.mjs";
+import {
   expectedSignatureExcludedMachOHash,
   inspectReconstructedMacShell,
   officialMacReleaseAsarHash,
@@ -18,7 +23,88 @@ const RUNTIME_ROOTS = ["dist/deps", "dist/native", "dist/node-deps"];
 const MANIFEST_RELATIVE = "dist/deps/runtime-deps-manifest.json";
 const CSNAPS_RELATIVE = "dist/host/extensions/codebase-telemetry/csnaps";
 
+// `@electron/asar` signals a missing member with a plain `Error` whose message
+// quotes the requested path, so absence has to be recognised by text. The
+// optional "this " covers the `Error: "..." was not found in this archive`
+// shape emitted by current releases alongside the older `Cannot find` wording.
+const ARCHIVE_MEMBER_MISSING = /not found in (?:this )?archive|Cannot find/;
+
 const sha256 = bytes => createHash("sha256").update(bytes).digest("hex");
+
+// `@electron/asar` addresses archive members with the platform separator, so
+// every canonical forward-slash relative path is converted at this boundary.
+// Provenance JSON keeps the portable spelling; only the archive calls need it.
+const readArchiveEntry = (archivePath, relative) => extractFile(archivePath, toArchiveRelative(relative));
+
+// Collect the packaged file inventory under a renderer prefix. `listPackage`
+// reports separator-native entries and includes directories, so each candidate
+// is converted to its canonical spelling and confirmed to be a real member.
+function archiveFilesUnder(archivePath, prefix) {
+  const files = [];
+  for (const raw of listPackage(archivePath)) {
+    const relative = fromArchiveEntry(raw);
+    if (!relative.startsWith(prefix)) continue;
+    try {
+      const entry = statFile(archivePath, toArchiveRelative(relative));
+      if (typeof entry.size === "number") files.push(relative.slice(prefix.length));
+    } catch {
+      // Directory entries are intentionally excluded from the byte inventory.
+    }
+  }
+  return files.sort();
+}
+
+/**
+ * Read `dist/renderer-router-extension.json` from a packaged archive.
+ *
+ * The clean router settings extension rewrites exactly the two shipped renderer
+ * chunks it can find by anchor, so those chunks are legitimately packaged as
+ * their *patched* bytes while every other chunk stays byte-identical to the
+ * shipped inventory. A checksum-pinned renderer therefore cannot be validated
+ * against the artifact inventory alone; this returns the per-chunk patched
+ * identity so callers compare each chunk against the right expected bytes.
+ *
+ * Returns `null` when the archive ships no extension record, which is the
+ * unpatched-renderer case. Anything present but malformed fails closed.
+ */
+export function readRendererExtensionChunks({
+  archivePath,
+  expectedFiles,
+  rendererExtensionPath = "dist/renderer-router-extension.json",
+} = {}) {
+  if (typeof archivePath !== "string" || archivePath.length === 0 || !(expectedFiles instanceof Map)) {
+    throw new TypeError("Explicit archivePath and expectedFiles are required");
+  }
+  let bytes;
+  try {
+    bytes = readArchiveEntry(archivePath, rendererExtensionPath);
+  } catch (error) {
+    if (error instanceof Error && ARCHIVE_MEMBER_MISSING.test(error.message)) return null;
+    throw error;
+  }
+  const parsed = JSON.parse(bytes.toString("utf8"));
+  if (parsed?.schemaVersion !== 1 || parsed?.mode !== "original-renderer-settings-extension" || !Array.isArray(parsed.chunks)) {
+    throw new Error("Renderer extension provenance contract is invalid");
+  }
+  const allowedKeys = ["schemaVersion", "mode", "chunks", "features", "transformations"];
+  if (Object.keys(parsed).sort().join("\0") !== allowedKeys.sort().join("\0")) throw new Error("Renderer extension provenance has unknown fields");
+  const chunks = new Map();
+  for (const row of parsed.chunks) {
+    const relative = typeof row?.path === "string" && row.path.startsWith("dist/renderer/") ? row.path.slice("dist/renderer/".length) : null;
+    if (relative == null || !expectedFiles.has(relative) || chunks.has(relative) || !["registry", "panel"].includes(row.role)
+      || !Number.isInteger(row.original?.bytes) || !/^[0-9a-f]{64}$/.test(row.original?.sha256)
+      || !Number.isInteger(row.patched?.bytes) || !/^[0-9a-f]{64}$/.test(row.patched?.sha256)) {
+      throw new Error("Renderer extension chunk provenance is invalid");
+    }
+    // The record's own `original` identity must be the shipped identity, so an
+    // extension can never quietly re-baseline a chunk it did not come from.
+    const expected = expectedFiles.get(relative);
+    if (row.original.bytes !== expected.bytes || row.original.sha256 !== expected.sha256) throw new Error(`Renderer extension source identity drift at ${relative}`);
+    chunks.set(relative, row);
+  }
+  if (chunks.size < 1 || chunks.size > 2) throw new Error("Renderer extension chunk cardinality is invalid");
+  return { bytes, parsed, chunks };
+}
 
 export async function verifyChecksumPinnedRendererPackage({
   archivePath,
@@ -31,12 +117,12 @@ export async function verifyChecksumPinnedRendererPackage({
   if ([archivePath, sourceRendererRoot].some(value => typeof value !== "string" || value.length === 0)) {
     throw new TypeError("Explicit archivePath and sourceRendererRoot paths are required");
   }
-  const buildManifest = JSON.parse(extractFile(archivePath, buildManifestPath).toString("utf8"));
+  const buildManifest = JSON.parse(readArchiveEntry(archivePath, buildManifestPath).toString("utf8"));
   const renderer = buildManifest.runtimeComposition?.find(runtime => runtime.runtime === "renderer");
   if (renderer?.mode !== "checksum-pinned-artifact-runtime" || renderer.provenance !== provenancePath) {
     throw new Error(`Fidelity renderer has an invalid runtime classification: ${renderer?.mode}`);
   }
-  const provenanceBytes = extractFile(archivePath, provenancePath);
+  const provenanceBytes = readArchiveEntry(archivePath, provenancePath);
   const provenance = JSON.parse(provenanceBytes.toString("utf8"));
   if (provenance.mode !== renderer.mode || provenance.hashAlgorithm !== "sha256" || !Array.isArray(provenance.files)) {
     throw new Error("Fidelity renderer provenance contract is invalid");
@@ -68,71 +154,28 @@ export async function verifyChecksumPinnedRendererPackage({
     if (sha256(await readFile(officialArchivePath)) !== officialMacReleaseAsarHash) {
       throw new Error("Renderer verification received a non-canonical official Mac ASAR");
     }
-    const officialFiles = [];
-    for (const raw of listPackage(officialArchivePath)) {
-      const relative = raw.replace(/^\/+/, "");
-      if (!relative.startsWith("dist/renderer/")) continue;
-      try {
-        const entry = statFile(officialArchivePath, relative);
-        if (typeof entry.size === "number") officialFiles.push(relative.slice("dist/renderer/".length));
-      } catch {
-        // Directory entries are intentionally excluded from the byte inventory.
-      }
-    }
-    officialFiles.sort();
+    const officialFiles = archiveFilesUnder(officialArchivePath, "dist/renderer/");
     if (JSON.stringify(officialFiles) !== JSON.stringify([...expectedFiles.keys()])) {
       throw new Error("Renderer provenance inventory differs from the canonical shipped 0.18 Mac ASAR");
     }
     for (const [relative, expected] of expectedFiles) {
-      const official = extractFile(officialArchivePath, `dist/renderer/${relative}`);
+      const official = readArchiveEntry(officialArchivePath, `dist/renderer/${relative}`);
       if (official.byteLength !== expected.bytes || sha256(official) !== expected.sha256) {
         throw new Error(`Renderer provenance differs from the canonical shipped Mac ASAR at ${relative}`);
       }
     }
   }
-  let rendererExtension = null;
-  try {
-    const bytes = extractFile(archivePath, rendererExtensionPath);
-    const parsed = JSON.parse(bytes.toString("utf8"));
-    if (parsed?.schemaVersion !== 1 || parsed?.mode !== "original-renderer-settings-extension" || !Array.isArray(parsed.chunks)) {
-      throw new Error("Renderer extension provenance contract is invalid");
-    }
-    const allowedKeys = ["schemaVersion", "mode", "chunks", "features", "transformations"];
-    if (Object.keys(parsed).sort().join("\0") !== allowedKeys.sort().join("\0")) throw new Error("Renderer extension provenance has unknown fields");
-    const chunks = new Map();
-    for (const row of parsed.chunks) {
-      const relative = typeof row?.path === "string" && row.path.startsWith("dist/renderer/") ? row.path.slice("dist/renderer/".length) : null;
-      if (relative == null || !expectedFiles.has(relative) || chunks.has(relative) || !["registry", "panel"].includes(row.role)
-        || !Number.isInteger(row.original?.bytes) || !/^[0-9a-f]{64}$/.test(row.original?.sha256)
-        || !Number.isInteger(row.patched?.bytes) || !/^[0-9a-f]{64}$/.test(row.patched?.sha256)) {
-        throw new Error("Renderer extension chunk provenance is invalid");
-      }
-      const expected = expectedFiles.get(relative);
-      if (row.original.bytes !== expected.bytes || row.original.sha256 !== expected.sha256) throw new Error(`Renderer extension source identity drift at ${relative}`);
-      chunks.set(relative, row);
-    }
-    if (chunks.size < 1 || chunks.size > 2) throw new Error("Renderer extension chunk cardinality is invalid");
-    rendererExtension = { bytes, parsed, chunks };
-  } catch (error) {
-    if (!(error instanceof Error) || !/not found in archive|Cannot find/.test(error.message)) throw error;
-  }
-  const packagedFiles = [];
-  for (const raw of listPackage(archivePath)) {
-    const relative = raw.replace(/^\/+/, "");
-    if (!relative.startsWith("dist/renderer/")) continue;
-    try {
-      const entry = statFile(archivePath, relative);
-      if (typeof entry.size === "number") packagedFiles.push(relative.slice("dist/renderer/".length));
-    } catch {
-      // Directory entries are intentionally excluded from the byte inventory.
-    }
-  }
-  packagedFiles.sort();
+  const rendererExtension = readRendererExtensionChunks({
+    archivePath,
+    expectedFiles,
+    rendererExtensionPath,
+  });
+  const packagedFiles = archiveFilesUnder(archivePath, "dist/renderer/");
   if (JSON.stringify(packagedFiles) !== JSON.stringify([...expectedFiles.keys()])) {
     throw new Error("Packaged renderer file inventory differs from the exact shipped renderer");
   }
   for (const [relative, expected] of expectedFiles) {
-    const packaged = extractFile(archivePath, `dist/renderer/${relative}`);
+    const packaged = readArchiveEntry(archivePath, `dist/renderer/${relative}`);
     const extension = rendererExtension?.chunks.get(relative);
     const wanted = extension?.patched ?? expected;
     if (packaged.byteLength !== wanted.bytes || sha256(packaged) !== wanted.sha256) {
@@ -179,7 +222,7 @@ export function verifyFidelityActivationPayloads({ archivePath } = {}) {
     },
   ];
   return contracts.map(contract => {
-    const bytes = extractFile(archivePath, contract.path);
+    const bytes = readArchiveEntry(archivePath, contract.path);
     const source = bytes.toString("utf8");
     const missingMarkers = contract.markers.filter(marker => !source.includes(marker));
     if (missingMarkers.length > 0) {
@@ -200,17 +243,17 @@ export async function verifyCsnapsCarrierClassification({ archivePath, unpackedR
   if ([archivePath, unpackedRoot].some(value => typeof value !== "string" || value.length === 0)) {
     throw new TypeError("Explicit archivePath and unpackedRoot paths are required");
   }
-  const listing = new Set(listPackage(archivePath).map(entry => entry.replace(/^\/+/, "")));
+  const listing = new Set(listArchiveFiles(archivePath, listPackage));
   if (listing.has(CSNAPS_RELATIVE)) {
     throw new Error("A csnaps carrier was packaged even though no shipped carrier is recoverable");
   }
   try {
-    await stat(path.join(unpackedRoot, CSNAPS_RELATIVE));
+    await stat(path.join(unpackedRoot, toArchiveRelative(CSNAPS_RELATIVE)));
     throw new Error("A physical csnaps carrier was staged outside the ASAR without shipped provenance");
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
-  const host = extractFile(archivePath, "dist/host/host-main.cjs").toString("utf8");
+  const host = readArchiveEntry(archivePath, "dist/host/host-main.cjs").toString("utf8");
   const markers = [
     "resolveCsnapsCapability",
     "Codebase Telemetry unavailable: csnaps",

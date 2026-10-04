@@ -93,10 +93,37 @@ function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-function cursorAccountSlot(status: CoordinatorAuthStatus): string | null {
-  if (status.kind !== "logged-in") return null;
+/**
+ * Slot used when nobody is signed in. It is a real, stable slot rather than
+ * `null`, and that single fact is what lets the whole app run without an
+ * account: `applyClaim` only launches the coordinator for a non-null slot, and
+ * `production-provider.requestRendererPort` only hands the renderer its
+ * MessagePort while the coordinator is active. With `null` the coordinator never
+ * started, the port was never granted, and all ~140 COORDINATOR_METHOD_TABLE
+ * methods were unreachable — including listAgents, createAgent and
+ * getOnboardingSeen, which is the renderer's very first call.
+ *
+ * Everything downstream already works locally: createDesktopAccountAuthorizer
+ * returns true without a descriptor binding, and scopeToAccount leaves settings
+ * alone when no previous scope was recorded.
+ */
+export const LOCAL_ACCOUNT_SLOT = "local";
+
+function localAccountSlotEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.SAND_LOCAL_ACCOUNT_SLOT?.trim() !== "0";
+}
+
+function cursorAccountSlot(status: CoordinatorAuthStatus, env?: NodeJS.ProcessEnv): string | null {
+  if (status.kind !== "logged-in") {
+    // Signed out. Run as a local account rather than refusing to start, so the
+    // app is usable on this machine with no Cursor account. Set
+    // SAND_LOCAL_ACCOUNT_SLOT=0 to restore the previous refuse-to-start rule.
+    return localAccountSlotEnabled(env) ? LOCAL_ACCOUNT_SLOT : null;
+  }
   const slot = status.authId ?? status.email;
-  return slot == null || slot.length === 0 ? null : slot;
+  return slot == null || slot.length === 0
+    ? (localAccountSlotEnabled(env) ? LOCAL_ACCOUNT_SLOT : null)
+    : slot;
 }
 
 /**

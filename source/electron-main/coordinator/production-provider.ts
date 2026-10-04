@@ -164,6 +164,8 @@ export interface ProductionCoordinatorPorts<Status extends ProductionCoordinator
     detectTimeZone(): string | null | undefined;
     getUserTimeZoneOverride(): string | null | undefined;
     getComputerUseModel(): unknown;
+    getInferenceProvider(): string;
+    getInferenceCustomEndpoint(): unknown;
     getAutoReviewInstructions(): unknown;
     getLocalToolPermission(): unknown;
     getWebauthnProxyEnabled(): unknown;

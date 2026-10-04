@@ -6,6 +6,7 @@ import {
   formatMcpAccountLabelForPrompt,
 } from "../../../shared/mcp.js";
 import { isMcpServerId } from "../../../shared/node/mcp/mcp-server-id.js";
+import { searchPluginsWithJev, type PluginSearchClassifierSkip, type PluginSearchOutcome } from "../decisions/plugin-search-jev.js";
 import { defineCommunicateTool } from "./communicate-tool.js";
 import {
   readMcpInstalledListing,
@@ -107,26 +108,51 @@ export const addMcpServerParameters = z.object({
 
 export const PLUGIN_QUERY_MIN_TOKEN_LENGTH = 3;
 
+// `[^\p{L}\p{N}]` keeps every Unicode letter and digit, not just a-z0-9. The previous
+// ASCII-only class DELETED every Cyrillic character, so a fully Russian query produced zero
+// tokens, the classifier branch returned "no-query-tokens" before the client was even
+// resolved, and the search silently degraded to the whole catalog in alphabetical order.
+// That is the user's primary language, so the ASCII-only form was not a limitation.
 export function tokenizePluginQuery(query: string): string[] {
-  return [...new Set(query.toLowerCase().split(/[^a-z0-9]+/).filter(
+  return [...new Set(query.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(
     (token) => token.length >= PLUGIN_QUERY_MIN_TOKEN_LENGTH,
   ))];
 }
 
+/**
+ * A text field of a catalog record, as an empty string when the remote catalog
+ * omitted it.
+ *
+ * `listPlugins` is fed by `toPluginSummary` (../../extensions/mcp/mcp-service.ts),
+ * which types its result `Record<string, unknown>` and copies `name`,
+ * `displayName`, `description` and `category` straight off the REMOTE marketplace
+ * catalog. It already defends `connectors` and `skills` on that same record with
+ * `??`. So a missing text field is a wire-format surprise, not a type error, and
+ * the honest reading of one is "this rung of the ladder does not match" (0)
+ * rather than "throw away the entire search".
+ */
+function catalogText(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
 export function scorePluginForToken(plugin: McpPluginSummary, token: string): number {
-  const name = plugin.name.toLowerCase();
-  const displayName = plugin.displayName.toLowerCase();
+  const name = catalogText(plugin.name).toLowerCase();
+  const displayName = catalogText(plugin.displayName).toLowerCase();
   if (name === token || displayName === token) return 8;
   if (name.includes(token) || displayName.includes(token)) return 5;
-  if (plugin.skills.some((skill) => skill.name.toLowerCase().includes(token))) return 3;
-  if (plugin.category.toLowerCase().includes(token)) return 2;
-  if (plugin.description.toLowerCase().includes(token)) return 1;
+  const skills = Array.isArray(plugin.skills) ? plugin.skills : [];
+  if (skills.some((skill) => catalogText(skill?.name).toLowerCase().includes(token))) return 3;
+  if (catalogText(plugin.category).toLowerCase().includes(token)) return 2;
+  if (catalogText(plugin.description).toLowerCase().includes(token)) return 1;
   return 0;
 }
 
 export function rankPluginsLexically<T extends McpPluginSummary>(plugins: readonly T[], query: string): T[] {
   const tokens = tokenizePluginQuery(query);
-  const byName = (left: T, right: T): number => left.displayName.localeCompare(right.displayName);
+  // Same reason as `catalogText`: the comparator runs on EVERY entry, including the
+  // no-token browse path, so one record without a display name would crash the
+  // search the same way a missing `name` does.
+  const byName = (left: T, right: T): number => catalogText(left.displayName).localeCompare(catalogText(right.displayName));
   if (tokens.length === 0) return [...plugins].sort(byName);
   return plugins.map((plugin) => ({
     plugin,
@@ -134,6 +160,116 @@ export function rankPluginsLexically<T extends McpPluginSummary>(plugins: readon
   })).filter((entry) => entry.score > 0)
     .sort((left, right) => right.score - left.score || byName(left.plugin, right.plugin))
     .map((entry) => entry.plugin);
+}
+
+/**
+ * Why the classifier did not change the answer, as one sentence the calling agent
+ * can act on. `promoted` is absent on purpose: when it happens there is nothing to
+ * explain, and the provenance line already says the classifier contributed.
+ *
+ * `no-client` deliberately names TWO possibilities rather than one. `resolvePluginSearchDecisionClient`
+ * returns `null` both when `TYPESAFE_API_KEY` is unset (normal, nothing to fix)
+ * and when the client refuses to construct from a key that IS set (bad URL,
+ * floating model alias, bad key shape). Collapsing those into a single claim here
+ * would recreate, one level up, exactly the ambiguity this exists to remove.
+ */
+const PLUGIN_SEARCH_SKIP_REASONS: Readonly<Record<PluginSearchClassifierSkip, string>> = {
+  promoted: "the classifier promoted one plugin to the front",
+  "lexical-confident": "the word match was already decisive, so no classifier request was made",
+  "no-query-tokens": "the request had no word of 3+ characters, so nothing was searched and the catalog is listed by name",
+  "no-client": "no classifier is configured, or the configured one refused to build: TYPESAFE_API_KEY is unset, or it is set and was rejected",
+  "client-unavailable": "a classifier call failed recently, so the classifier is paused for its cooldown and ranking stayed lexical",
+  "no-shortlist": "no catalog entry was a candidate, so no request was made",
+  abstained: "the classifier answered \"too vague to identify a plugin\" for every candidate, so ranking stayed lexical",
+  "no-decide": "every classifier answer landed in the uncertain band, so none could be acted on and ranking stayed lexical",
+  "no-relevant": "the classifier says none of the candidates is what was requested, so ranking stayed lexical",
+  failed: "the classifier request failed, so ranking stayed lexical",
+  deadline: "the classifier did not answer inside its deadline, so ranking stayed lexical",
+  error: "the re-rank threw and was contained, so ranking stayed lexical",
+};
+
+/**
+ * The diagnostic lines appended after the plugin list of a `SearchPlugins` result.
+ *
+ * `PluginSearchOutcome` carries `skip`, `coverage`, `classifierUsed`, `attempts`,
+ * `failures`, `decidedInMs` and `promotedPluginId`. Nothing reaches the calling
+ * agent, or an operator reading a bug report, without this function -- the call
+ * site used to keep `reranked.plugins` and drop the rest, which made a
+ * `DecisionClientConfigError` (bad URL, floating model alias, bad key shape) and
+ * "this feature is not configured" the same observable outcome, to the agent AND
+ * to whoever had to debug it.
+ *
+ * Prose, not a dump of the outcome object: the agent has to act on this in one
+ * read, and an operator has to read it without the TypeScript types beside them.
+ *
+ * `lexicalCount` is `rankPluginsLexically(...).length` BEFORE the rerank. It is
+ * what separates "these plugins matched the words" from "these plugins were
+ * inferred because nothing matched", which the outcome alone cannot express: an
+ * inferred single hit and a found single hit are the same `plugins` array.
+ */
+export function describePluginSearchProvenance(
+  outcome: PluginSearchOutcome<McpPluginSummary>,
+  lexicalCount: number,
+  tokenCount: number,
+): string[] {
+  const inferred = lexicalCount === 0 && outcome.plugins.length > 0;
+  const promoted = outcome.promotedPluginId != null;
+  const lines: string[] = [];
+
+  if (inferred) {
+    lines.push(
+      "Provenance: INFERRED, not matched. Nothing in the catalog contains the words in this request, so the result above was INFERRED from the catalog, not found by matching it. Do not present it as the plugin that matched: say nothing matched, name this one as the closest by meaning, and offer to browse the whole catalog or search again with a product name.",
+    );
+  } else if (promoted) {
+    lines.push(
+      `Provenance: RE-RANKED. The word matches above stand; the classifier judged plugin ${outcome.promotedPluginId} to be the one this request names and moved it to the front. Every other plugin keeps its word-match order.`,
+    );
+  } else {
+    lines.push("Provenance: LEXICAL. The order above is the word-match ranking alone, and the classifier did not change it.");
+  }
+
+  if (!promoted) {
+    const why = PLUGIN_SEARCH_SKIP_REASONS[outcome.skip];
+    lines.push(`Why no re-rank: ${why}${outcome.failures.length > 0 ? ` (${truncateOneLine(outcome.failures, 120)})` : ""}.`);
+  }
+
+  lines.push(
+    tokenCount === 0
+      ? "Query coverage: not measured — the request had no usable word, so this was a catalog browse."
+      : `Query coverage: ${Math.round(outcome.coverage * 100)}% (${Math.round(outcome.coverage * tokenCount)} of ${tokenCount} words appear somewhere in the catalog)${outcome.classifierUsed ? `; ${outcome.attempts} classifier question(s) answered in ${Math.round(outcome.decidedInMs)}ms` : ""}.`,
+  );
+  return lines;
+}
+
+/**
+ * The whole `SearchPlugins` result text: plugin list first, diagnostics after.
+ *
+ * The leading `${n} plugin(s)...` line and every `- ` line are byte-identical to
+ * what they were before the diagnostics existed, so anything already reading this
+ * output still reads the same thing off the top. The diagnostics go last because a
+ * reader that takes the first line, or the contiguous block of plugin lines, must
+ * not be handed a new shape by this change.
+ */
+export function describePluginSearchResult(
+  query: string,
+  lexical: readonly McpPluginSummary[],
+  outcome: PluginSearchOutcome<McpPluginSummary>,
+): string {
+  const plugins = outcome.plugins;
+  // Re-tokenized rather than passed in, so this cannot disagree with what
+  // `rankPluginsLexically` counted when it produced `lexical`.
+  const provenance = describePluginSearchProvenance(outcome, lexical.length, tokenizePluginQuery(query).length);
+  if (plugins.length === 0) {
+    return [
+      query.length > 0 ? `No plugins match "${query}".` : "The plugin catalog is empty or unavailable right now.",
+      ...provenance,
+    ].join("\n");
+  }
+  return [
+    `${plugins.length} plugin(s)${query.length > 0 ? ` matching "${query}" (best first)` : " available"}:`,
+    ...plugins.map(describePluginSummary),
+    ...provenance,
+  ].join("\n");
 }
 
 export function validateRemoteMcpUrl(rawUrl: string): string | null {
@@ -196,21 +332,28 @@ function describePluginInstallState(plugin: McpPluginSummary): string {
 
 function describePluginIncludes(plugin: McpPluginSummary): string {
   const parts: string[] = [];
+  const skills = Array.isArray(plugin.skills) ? plugin.skills : [];
   if (plugin.connectorCount > 0) parts.push(`${plugin.connectorCount} connector${plugin.connectorCount === 1 ? "" : "s"}`);
-  if (plugin.skills.length > 0) parts.push(`${plugin.skills.length} skill${plugin.skills.length === 1 ? "" : "s"}`);
+  if (skills.length > 0) parts.push(`${skills.length} skill${skills.length === 1 ? "" : "s"}`);
   return parts.length > 0 ? parts.join(", ") : "no primitives";
 }
 
 export function describePluginSummary(plugin: McpPluginSummary): string {
+  // Same `catalogText` reason as `scorePluginForToken`, and the same input: a record
+  // built from the remote marketplace catalog. Without it, one malformed record
+  // crashes this renderer too (`getDefaultMcpCustomInstruction(undefined)` throws on
+  // `.trim()`), so guarding the scorer alone would leave the same outage one line
+  // later -- on the no-token browse path, which renders the WHOLE catalog.
+  const displayName = catalogText(plugin.displayName);
   const result = [
-    `- ${plugin.pluginId}: ${plugin.displayName} \u2014 ${plugin.description}`,
+    `- ${plugin.pluginId}: ${displayName} \u2014 ${catalogText(plugin.description)}`,
     `  (${[
       describePluginInstallState(plugin),
       `includes: ${describePluginIncludes(plugin)}`,
-      `category=${plugin.category}`
+      `category=${catalogText(plugin.category)}`
     ].join("; ")})`,
   ];
-  const guidance = getDefaultMcpCustomInstruction(plugin.displayName);
+  const guidance = getDefaultMcpCustomInstruction(displayName);
   if (guidance.length > 0) result.push(`  usage guidance: ${guidance}`);
   return result.join("\n");
 }
@@ -315,9 +458,21 @@ export function createMcpManagementTools(
       id: "SEARCH_PLUGINS", name: "SearchPlugins", description: "Search the plugins the user could install (or already has): marketplace plugins bundling connectors and skills. Say what you're looking for in natural language and results come back ranked by relevance, each with its STABLE plugin id, install state, and what it includes. Use this to discover a capability (Linear, Notion, writing Word documents, …) or to check whether a plugin is installed. Inspect one result with GetPlugin; connector runtime statuses (connected/needsAuth) live in GetMcpServerStatus. This is read-only and never needs the user's permission.", parameters: searchPluginsParameters,
       execute: async (_ctx, args: z.infer<typeof searchPluginsParameters>, deps) => {
         const query = (args.query ?? "").trim();
-        const plugins = rankPluginsLexically(await deps.listPlugins(), query);
-        if (plugins.length === 0) return query.length > 0 ? `No plugins match "${query}".` : "The plugin catalog is empty or unavailable right now.";
-        return [`${plugins.length} plugin(s)${query.length > 0 ? ` matching "${query}" (best first)` : " available"}:`, ...plugins.map(describePluginSummary)].join("\n");
+        const catalog = await deps.listPlugins();
+        const tokens = tokenizePluginQuery(query);
+        // Lexical first (free, instant, offline). Jev reranks only when that ranking is weak,
+        // and every degradation path returns the same lexical list: see ../decisions/plugin-search-jev.js.
+        // `lexical` is kept, not inlined into the call, because `describePluginSearchResult` needs its
+        // length to tell "matched the words" from "inferred because nothing matched".
+        const lexical = rankPluginsLexically(catalog, query);
+        const reranked = await searchPluginsWithJev({
+          query,
+          tokens,
+          all: catalog,
+          lexical,
+          tokenScoreOf: (plugin, token) => scorePluginForToken(plugin, token),
+        });
+        return describePluginSearchResult(query, lexical, reranked);
       },
     }),
     defineCommunicateTool(management, {

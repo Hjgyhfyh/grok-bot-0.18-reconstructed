@@ -6,7 +6,8 @@ import { isSandUpdateTrack } from "../shared/update-track.js";
 import { isValidIanaTimeZone } from "../shared/timezone.js";
 import { sandWebauthnProxyMirroredEnablement } from "../shared/webauthn-proxy-availability.js";
 import { reportDesktopEdgeFailure } from "./desktop-edge-failures.js";
-import { isSandInferenceProvider } from "../shared/inference-router.js";
+import { isSandInferenceProvider, normalizeSandInferenceCustomEndpoint } from "../shared/inference-router.js";
+import { listSandEndpointModels } from "../shared/node/inference-endpoint-models.js";
 import { getLocalInferenceCliStatus } from "../shared/node/inference-router-local.js";
 import { isSandBoxRuntime } from "../shared/box-runtime.js";
 import { getLocalDockerStatus, startLocalDockerBox, stopLocalDockerBox } from "./box/local-docker-host-connector.js";
@@ -52,6 +53,8 @@ export interface MainEdgeDeps {
   readonly clearLocalToolApprovals: () => Promise<void>;
   readonly getComputerUseModelOverride: () => unknown;
   readonly fetchAvailableModels: () => unknown;
+  /** Reveals one stored secret for a read-only model probe. Optional: absent means "no list". */
+  readonly readCustomEndpointApiKey?: (key: string) => Promise<string | null | undefined>;
   readonly emitEgressTunnelChanged: (enabled: boolean) => void;
   readonly emitWebauthnProxyChanged: (enabled: boolean) => void;
   readonly ensureTranscriptionManager: () => Promise<UnknownRecord>;
@@ -72,6 +75,14 @@ function required(read: () => UnknownRecord | null, code: string, detail: string
 function updateService(deps: MainEdgeDeps) { return required(deps.readLiveUpdateService, MAIN_EDGE_UPDATE_UNAVAILABLE, "The update service is not running."); }
 function themeController(deps: MainEdgeDeps) { return required(deps.readThemeController, MAIN_EDGE_THEME_UNAVAILABLE, "The theme controller is not running."); }
 function egressController(deps: MainEdgeDeps) { return required(deps.readEgressTunnelController, MAIN_EDGE_EGRESS_TUNNEL_UNAVAILABLE, "The egress tunnel controller is not running."); }
+/** The custom provider keeps its credential in the OS secret store under this name; the renderer never sees it. */
+const CUSTOM_ENDPOINT_SECRET_KEY = "OPENAI_COMPATIBLE_API_KEY";
+async function storedCustomEndpointApiKey(deps: MainEdgeDeps): Promise<string | null> {
+  const read = deps.readCustomEndpointApiKey;
+  if (typeof read !== "function") return null;
+  try { const value = await read(CUSTOM_ENDPOINT_SECRET_KEY); return typeof value === "string" && value.trim().length > 0 ? value.trim() : null; }
+  catch (error) { reportDesktopEdgeFailure("inference-router", "endpoint-models", error); return null; }
+}
 async function echo(deps: MainEdgeDeps, field: string, value: unknown, label: string): Promise<unknown> { const result = await deps.syncHostSettingsToBox({ [field]: value }); if (result == null) throw new SandHostSettingsUnreachableError(`Couldn't reach the computer to save ${label}.`); return result[field] ?? null; }
 function computerUseModel(deps: MainEdgeDeps): unknown { const stored = invoke(deps.agentPrefsStore, "getComputerUseModel"); const override = deps.getComputerUseModelOverride(); return resolveComputerUseModelSelection({ ...(isSandAgentModelSelection(stored) ? { storedModel: stored } : {}), ...(isSandAgentModelSelection(override) ? { overrideModel: override } : {}) }) ?? null; }
 function parseAgentModel(value: unknown, requireNonWhitespaceId: boolean): { modelId: string; maxMode: boolean; parameters: { id: string; value: string }[] } | null {
@@ -112,8 +123,20 @@ export function createMainEdgeHandlers(deps: MainEdgeDeps): HandlerMap {
     getHostSidebarSections: async () => (await deps.readHostSettingsFromBox()).sidebarSections ?? null,
     setHostSidebarSections: (raw) => echo(deps, "sidebarSections", req(raw).sections, "sidebar sections"),
     getAvailableModels: () => deps.fetchAvailableModels(),
-    getInferenceRouter: async () => { const settings = await deps.readHostSettingsFromBox().catch(() => ({} as UnknownRecord)); const provider = invoke(deps.settingsStore, "getInferenceProvider"); return { provider: isSandInferenceProvider(provider) ? provider : "cursor", usage: settings.inferenceRouterUsage ?? invoke(deps.settingsStore, "getInferenceRouterUsage") ?? null, local: getLocalInferenceCliStatus() }; },
-    setInferenceRouter: async (raw) => { const provider = req(raw).provider; invariant(isSandInferenceProvider(provider), "Unknown inference provider."); invoke(deps.settingsStore, "setInferenceProvider", provider); const settings = await deps.syncHostSettingsToBox({ inferenceProvider: provider }).catch(() => null); return { provider, usage: settings?.inferenceRouterUsage ?? invoke(deps.settingsStore, "getInferenceRouterUsage") ?? null, local: getLocalInferenceCliStatus() }; },
+    getInferenceRouter: async () => { const settings = await deps.readHostSettingsFromBox().catch(() => ({} as UnknownRecord)); const provider = invoke(deps.settingsStore, "getInferenceProvider"); return { provider: isSandInferenceProvider(provider) ? provider : "cursor", usage: settings.inferenceRouterUsage ?? invoke(deps.settingsStore, "getInferenceRouterUsage") ?? null, endpoint: invoke(deps.settingsStore, "getInferenceCustomEndpoint") ?? null, local: getLocalInferenceCliStatus() }; },
+    listInferenceRouterModels: async (raw) => await listSandEndpointModels({ baseUrl: req(raw).baseUrl, apiKey: await storedCustomEndpointApiKey(deps) }),
+    // The routing decision is made from the BOX copy of the settings
+    // (`inference-router.ts` reads `getInferenceProvider()` on the host side),
+    // while the panel reads this desktop-local store. `syncHostSettingsToBox`
+    // resolves to `null` on failure instead of rejecting, so an unchecked result
+    // left the panel showing "Custom" while every message still went to Cursor.
+    // Treat an unreachable host as the failure it is, exactly like `echo` does.
+    setInferenceRouter: async (raw) => { const request = req(raw); const provider = request.provider; invariant(isSandInferenceProvider(provider), "Unknown inference provider."); const requestedEndpoint = request.endpoint; const endpoint = requestedEndpoint === null ? undefined : normalizeSandInferenceCustomEndpoint(requestedEndpoint); invariant(requestedEndpoint === undefined || requestedEndpoint === null || endpoint !== undefined, "Custom endpoint must be an https URL (or http on localhost) with a non-empty model id."); const effectiveEndpoint = requestedEndpoint === undefined ? invoke(deps.settingsStore, "getInferenceCustomEndpoint") : endpoint; invariant(provider !== "custom" || effectiveEndpoint !== undefined, "Set the custom endpoint's base URL and model before routing to it."); // Remember what the desktop store held so a failed sync can put it back. Writing the
+    // local store first and only then discovering the box is unreachable leaves the panel
+    // reading "Custom" locally while the host still routes to Cursor — and because
+    // `coordinator-resync` re-pushes the desktop copy on every reconnect, that divergence
+    // would then be made permanent.
+    const previousProvider = invoke(deps.settingsStore, "getInferenceProvider"); const previousEndpoint = invoke(deps.settingsStore, "getInferenceCustomEndpoint"); invoke(deps.settingsStore, "setInferenceProvider", provider); if (requestedEndpoint !== undefined) invoke(deps.settingsStore, "setInferenceCustomEndpoint", endpoint); const settings = await (requestedEndpoint === undefined ? deps.syncHostSettingsToBox({ inferenceProvider: provider }) : deps.syncHostSettingsToBox({ inferenceProvider: provider, inferenceCustomEndpoint: endpoint ?? null })).catch(() => null); if (settings === null) { invoke(deps.settingsStore, "setInferenceProvider", previousProvider); invoke(deps.settingsStore, "setInferenceCustomEndpoint", previousEndpoint); throw new SandHostSettingsUnreachableError("Couldn't reach the computer to save the inference route."); } return { provider, usage: settings.inferenceRouterUsage ?? invoke(deps.settingsStore, "getInferenceRouterUsage") ?? null, endpoint: requestedEndpoint === undefined ? invoke(deps.settingsStore, "getInferenceCustomEndpoint") ?? null : endpoint ?? null, local: getLocalInferenceCliStatus() }; },
     getBoxRuntime: async () => { const mode = invoke(deps.settingsStore, "getBoxRuntime"); invariant(isSandBoxRuntime(mode), "Unknown box runtime."); return { mode, status: await getLocalDockerStatus(String(Reflect.get(deps.settingsStore, "settingsPath"))) }; },
     setBoxRuntime: async (raw) => { const mode = req(raw).mode; invariant(isSandBoxRuntime(mode), "Unknown box runtime."); const settingsPath = String(Reflect.get(deps.settingsStore, "settingsPath")); invoke(deps.settingsStore, "setBoxRuntime", mode); try { if (mode === "local-docker") await startLocalDockerBox(settingsPath); else await stopLocalDockerBox(); } catch (error) { invoke(deps.settingsStore, "setBoxRuntime", mode === "local-docker" ? "remote" : "local-docker"); throw error; } invoke(deps.boxRecovery, "restartCoordinator"); return { mode, status: await getLocalDockerStatus(settingsPath) }; },
 

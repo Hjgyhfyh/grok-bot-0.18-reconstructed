@@ -6,7 +6,7 @@ import { createWritableIterable } from "../utils/writable-iterable.js";
 import { getZshPath } from "./platform-shell.js";
 import { attachShellOutputStreams } from "./output-limiter.js";
 import { getSudoAliasInjection } from "./sudo.js";
-import { SHELL_ENV_OVERRIDES } from "./types.js";
+import { buildShellEnv } from "./shell-env.js";
 import { resolveSandboxPolicyForWorkspace } from "./sandbox/policy-merge.js";
 import { captureSandboxDenies } from "./sandbox/macos/seatbelt.js";
 import { ZSH_STATE_LIGHT_MARKER, default as dumpZshStateLight } from "./dump_zsh_state_light.js";
@@ -54,11 +54,7 @@ function getZshPath2(): string {
 }
 
 export async function initZshLightState(options?: ZshLightExecuteOptions): Promise<ZshLightState> {
-  const env = {
-    ...process.env,
-    ...SHELL_ENV_OVERRIDES,
-    ...options?.env,
-  };
+  const env = buildShellEnv({ overrides: options?.env, shell: getZshPath() });
   const stateMarker = "__CURSOR_STATE_MARKER__";
   const args = [
     "-o",
@@ -108,11 +104,7 @@ class ZshLightState {
     const pipeStdin = options.pipeStdin ?? false;
     const iterable = createWritableIterable<TerminalEvent>();
     const cwd = options.workingDirectory ?? this.cwd;
-    const env = {
-      ...process.env,
-      ...SHELL_ENV_OVERRIDES,
-      ...options.env,
-    };
+    const env = buildShellEnv({ overrides: options.env, shell: getZshPath() });
     let core = "builtin eval \"$1\"";
     if (!pipeStdin) core += " < /dev/null";
     const sudoAliasInjection = getSudoAliasInjection(env);

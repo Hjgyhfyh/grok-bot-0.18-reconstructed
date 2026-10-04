@@ -6,6 +6,7 @@ import {
   builtAsar,
   builtAsarUnpacked,
   repoRoot,
+  runtimeResourcesDir,
   sourceAppDir,
   stagedAppDir
 } from "./config.mjs";
@@ -17,6 +18,19 @@ export const reconstructedUpdaterGuard = [
   "process.env.SAND_DISABLE_UPDATES ??= \"1\";",
   "process.env.SAND_DISABLE_SENTRY ??= \"1\";",
   "process.env.SAND_DISABLE_TELEMETRY ??= \"1\";",
+  "",
+  "// This reconstruction is a pinned static deployment: upstream updates are forbidden.",
+  "// The ??= above only fills an UNSET variable, so an ambient SAND_DISABLE_UPDATES=0",
+  "// in the launching environment would silently re-enable the updater and the feed it",
+  "// polls. The assignment below is unconditional for that reason, and it is what makes",
+  "// the suppression reach both update gates: the Statsig sand_min_client_version check",
+  "// and the backend-forced SAND_CLIENT_UPDATE_REQUIRED hint, which ignores the installed",
+  "// version entirely. The single opt-out is the explicit GROK_BOT_ALLOW_UPDATES=1.",
+  "if (process.env.GROK_BOT_ALLOW_UPDATES !== \"1\") {",
+  "  process.env.SAND_DISABLE_UPDATES = \"1\";",
+  "  process.env.SAND_DISABLE_SENTRY = \"1\";",
+  "  process.env.SAND_DISABLE_TELEMETRY = \"1\";",
+  "}",
   ""
 ].join("\n");
 
@@ -73,24 +87,43 @@ export async function stageElectronRuntimeDependencyResolution(depsRoot) {
   return manifest.resolutionClosure;
 }
 
+/**
+ * Apply one upstream anchor rewrite, refusing both a missing anchor and an
+ * ambiguous one. `String.replace` with a string pattern rewrites only the first
+ * match, so a vendor edit that duplicated a seam statement left every later
+ * copy untouched and the build still passed; `scripts/verify.mjs` re-derives
+ * from the same partially patched source and agrees with itself. Counting the
+ * occurrences turns both cases into a build failure. Every anchor below occurs
+ * exactly once in the pinned 0.18.0 payload.
+ */
+function replaceExactlyOnce(source, from, to, label) {
+  const first = source.indexOf(from);
+  if (first < 0) {
+    throw new Error(`Cannot ${label}; upstream anchor changed: ${from}`);
+  }
+  if (source.indexOf(from, first + from.length) >= 0) {
+    throw new Error(`Cannot ${label}; upstream anchor is ambiguous, it occurs more than once: ${from}`);
+  }
+  return `${source.slice(0, first)}${to}${source.slice(first + from.length)}`;
+}
+
 function enableReconstructedDevSeams(source) {
   const replacements = [
     {
       from: "var devToolsGate = createDevToolsGate({ isDevBuild: !import_electron51.app.isPackaged });",
-      to: "var devToolsGate = createDevToolsGate({ isDevBuild: process.env.GROK_BOT_RECONSTRUCTED_DEV === \"1\" || !import_electron51.app.isPackaged });"
+      to: "var devToolsGate = createDevToolsGate({ isDevBuild: process.env.GROK_BOT_RECONSTRUCTED_DEV === \"1\" || !import_electron51.app.isPackaged });",
+      label: "enable reconstructed dev seam"
     },
     {
       from: "registerDevWiring({\n    ipcMain: import_electron51.ipcMain,\n    isPackaged: import_electron51.app.isPackaged,",
-      to: "registerDevWiring({\n    ipcMain: import_electron51.ipcMain,\n    isPackaged: process.env.GROK_BOT_RECONSTRUCTED_DEV === \"1\" ? false : import_electron51.app.isPackaged,"
+      to: "registerDevWiring({\n    ipcMain: import_electron51.ipcMain,\n    isPackaged: process.env.GROK_BOT_RECONSTRUCTED_DEV === \"1\" ? false : import_electron51.app.isPackaged,",
+      label: "enable reconstructed dev seam"
     }
   ];
 
   let patched = source;
-  for (const { from, to } of replacements) {
-    if (!patched.includes(from)) {
-      throw new Error(`Cannot enable reconstructed dev seam; upstream anchor changed: ${from}`);
-    }
-    patched = patched.replace(from, to);
+  for (const { from, to, label } of replacements) {
+    patched = replaceExactlyOnce(patched, from, to, label);
   }
   return patched;
 }
@@ -99,19 +132,18 @@ function enableReconstructedRuntimeSeams(source) {
   const replacements = [
     {
       from: "var isSandLabBuild2 = appPackageJson.sandLab === true;",
-      to: "var isSandLabBuild2 = appPackageJson.sandLab === true || process.env.GROK_BOT_RECONSTRUCTED_DEV === \"1\";"
+      to: "var isSandLabBuild2 = appPackageJson.sandLab === true || process.env.GROK_BOT_RECONSTRUCTED_DEV === \"1\";",
+      label: "enable reconstructed runtime seam"
     },
     {
       from: "var isPrimaryInstance = !import_electron51.app.isPackaged || import_electron51.app.requestSingleInstanceLock();",
-      to: "var isPrimaryInstance = process.env.GROK_BOT_RECONSTRUCTED_DEV === \"1\" || !import_electron51.app.isPackaged || import_electron51.app.requestSingleInstanceLock();"
+      to: "var isPrimaryInstance = process.env.GROK_BOT_RECONSTRUCTED_DEV === \"1\" || !import_electron51.app.isPackaged || import_electron51.app.requestSingleInstanceLock();",
+      label: "enable reconstructed runtime seam"
     }
   ];
   let patched = source;
-  for (const { from, to } of replacements) {
-    if (!patched.includes(from)) {
-      throw new Error(`Cannot enable reconstructed runtime seam; upstream anchor changed: ${from}`);
-    }
-    patched = patched.replace(from, to);
+  for (const { from, to, label } of replacements) {
+    patched = replaceExactlyOnce(patched, from, to, label);
   }
   return patched;
 }
@@ -138,7 +170,7 @@ export async function buildAsar({
   unpackedRoot = builtAsarUnpacked,
 } = {}) {
   const runtimeApp = await resolveRuntimeApp();
-  const resources = path.join(runtimeApp, "Contents", "Resources");
+  const resources = runtimeResourcesDir(runtimeApp);
   const runtimeUnpacked = path.join(resources, "app.asar.unpacked", "dist");
 
   await rm(buildRoot, { recursive: true, force: true });

@@ -68,6 +68,15 @@ export const MAIN_METHOD_TABLE = {
   setInferenceRouter: { args: "object" },
   getBoxRuntime: { args: "none" },
   setBoxRuntime: { args: "object" },
+  // Required for this method to work at all. bridgeRpcEdge (rpc-edge-runtime.ts:68-72) only
+  // creates wrapper functions for keys present in this table, and serveEdge
+  // (generated/main-rpc.ts:72) only registers ipcMain.handle for keys in this table. Without
+  // the entry the preload wrapper exists but throws a TypeError when called, and the renderer's
+  // catch reports "network-error" rather than "unsupported" — so the hardcoded fallback model
+  // list then hides the break completely. serveEdge's check (generated/main-rpc.ts:73-84) is
+  // one-way: every table method must have a handler, but a handler missing from the table is
+  // silently never served.
+  listInferenceRouterModels: { args: "object" },
   transcribeAudio: { args: "object" },
   getCursorAuthStatus: { args: "none" },
   loginCursor: { args: "none" },

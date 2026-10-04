@@ -397,6 +397,14 @@ async function assembleRunnerActivationEvidence(inventory) {
     throw new Error("Runner activation audit has inconsistent module inventory");
   }
   const auditedModules = new Set(audit.modules.map(module => module.cleanSource));
+  // A duplicated `cleanSource` keeps `modules.length === summary.modulesAudited`
+  // true while silently shrinking the set, and every count derived from it
+  // (`auditedModules`, `hostGraph.totalRunnerModules`, `reachableModules`)
+  // shrinks with it. `validateLocalSourceAnchor` rejects the same class of
+  // ambiguity for a single anchor.
+  if (auditedModules.size !== audit.modules.length) {
+    throw new Error("Runner activation audit contains a duplicate clean module path");
+  }
   if ([...auditedModules].some(source => typeof source !== "string" || !source.startsWith("source/host/runner/"))) {
     throw new Error("Runner activation audit contains an invalid clean module path");
   }

@@ -221,7 +221,11 @@ export async function buildCleanDistribution(options = {}) {
     ...baseOptions
   } = options;
   const base = await buildBaseCleanDistribution(baseOptions);
-  return attachCompositionAudit(await prepareProductionActivations(base, hostBindingManifest, electronMainBindingManifest));
+  // Every composition entry point must ship the reconstructed updater lock
+  // (SAND_DISABLE_UPDATES / SAND_DISABLE_SENTRY / SAND_DISABLE_TELEMETRY), not
+  // just the packaging entry points, so no build route can emit a main process
+  // whose official updater, Sentry or telemetry legs are live.
+  return attachCompositionAudit(await prepareProductionActivations(base, hostBindingManifest, electronMainBindingManifest, runtimeComposition, { reconstructedPackage: true }));
 }
 
 export async function buildFidelityDistribution(options = {}) {
@@ -232,7 +236,7 @@ export async function buildFidelityDistribution(options = {}) {
     ...baseOptions
   } = options;
   const base = await buildBaseFidelityDistribution(baseOptions);
-  return attachCompositionAudit(await prepareProductionActivations(base, hostBindingManifest, electronMainBindingManifest, fidelityRuntimeComposition));
+  return attachCompositionAudit(await prepareProductionActivations(base, hostBindingManifest, electronMainBindingManifest, fidelityRuntimeComposition, { reconstructedPackage: true }));
 }
 
 export async function buildReconstructedAsar({

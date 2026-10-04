@@ -8,8 +8,9 @@ import { attachShellOutputStreams } from "./output-limiter.js";
 import { resolveSandboxPolicyForWorkspace } from "./sandbox/policy-merge.js";
 import { captureSandboxDenies } from "./sandbox/macos/seatbelt.js";
 import { spawnWithSignal } from "./core.js";
+import { buildShellCommandArgs, buildShellEnv, resolveSpawnShell } from "./shell-env.js";
 import { shouldEnableSudoAskpass, transformSudoCommand } from "./sudo.js";
-import { KnownShellExecutor, SHELL_ENV_OVERRIDES } from "./types.js";
+import { KnownShellExecutor } from "./types.js";
 import { initBashState } from "./bash.js";
 import { LazyTerminalExecutor } from "./lazy.js";
 import { initPowerShellState } from "./powershell.js";
@@ -59,11 +60,8 @@ export class NaiveTerminalExecutor implements TerminalExecutor {
     using span = createSpan(ctx.withName("NaiveTerminalExecutor.execute"));
     const iterable = createWritableIterable<TerminalEvent>();
     const pipeStdin = options.pipeStdin ?? false;
-    const env = {
-      ...process.env,
-      ...SHELL_ENV_OVERRIDES,
-      ...options.env,
-    };
+    const spawnShell = resolveSpawnShell(this.options.shell);
+    const env = buildShellEnv({ overrides: options.env, shell: spawnShell });
     const transformedCommand = shouldEnableSudoAskpass(env) ? transformSudoCommand(command) : command;
     const cwd = options.workingDirectory ?? this.cwd;
     const sandboxWorkspaceRoot = options.sandboxWorkspaceRoot ?? cwd;
@@ -71,7 +69,7 @@ export class NaiveTerminalExecutor implements TerminalExecutor {
     const sandboxPolicy = resolvedPolicy.policy.type !== "insecure_none"
       ? { ...resolvedPolicy.policy, sandboxWorkspaceRoot }
       : resolvedPolicy.policy;
-    const child = spawnWithSignal(this.options.shell || process.env.SHELL || "/bin/sh", [...this.options.shellArgs ?? [], "-c", transformedCommand], {
+    const child = spawnWithSignal(spawnShell, buildShellCommandArgs(spawnShell, this.options.shellArgs, transformedCommand), {
       env,
       // Use 'ignore' for stdin unless interactive, to prevent background processes from inheriting an open stdin pipe.
       stdio: [pipeStdin ? "pipe" : "ignore", "pipe", "pipe"],
@@ -126,23 +124,60 @@ export function createNaiveTerminalExecutor(options: DefaultTerminalExecutorOpti
   return new NaiveTerminalExecutor(process.cwd(), options);
 }
 
-function commandExists(command: string): boolean { return spawnSync(command, ["--version"], { stdio: "ignore" }).error === undefined; }
-function detectGitBashFromEnvironment(): string | undefined {
-  if (process.platform !== "win32" || !process.env.MSYSTEM) return undefined;
-  const executablePath = process.env.EXEPATH;
+const COMMAND_PROBE_TIMEOUT_MS = 2_000;
+const commandProbeCache = new Map<string, boolean>();
+
+function defaultCommandProbe(command: string): boolean {
+  return spawnSync(command, ["--version"], { stdio: "ignore", windowsHide: true, timeout: COMMAND_PROBE_TIMEOUT_MS }).error === undefined;
+}
+
+let commandProbe: (command: string) => boolean = defaultCommandProbe;
+
+/**
+ * Replaces the probe used by `getSuggestedShell`. Passing `null` restores the
+ * real probe. This seam exists so the Windows probe budget can be asserted in a
+ * test without spawning real `bash --version` processes.
+ */
+export function setShellCommandProbe(probe: ((command: string) => boolean) | null): void {
+  commandProbe = probe ?? defaultCommandProbe;
+  commandProbeCache.clear();
+}
+
+/**
+ * `getSuggestedShell` runs per shell-tool call and each call used to spawn up to
+ * four `--version` probes synchronously on the event loop. Results are cached per
+ * command, and the cache is cleared when the process-level probe is swapped.
+ */
+export function commandExists(command: string): boolean {
+  const cached = commandProbeCache.get(command);
+  if (cached !== undefined) return cached;
+  const result = commandProbe(command);
+  commandProbeCache.set(command, result);
+  return result;
+}
+
+function detectGitBashFromEnvironment(platform: NodeJS.Platform = process.platform, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (platform !== "win32" || !env.MSYSTEM) return undefined;
+  const executablePath = env.EXEPATH;
   if (executablePath) { const normalized = executablePath.replace(/[\\/]+$/, ""); const base = win32.basename(normalized).toLowerCase(); return base === "bash.exe" ? normalized : base === "bin" ? win32.join(normalized, "bash.exe") : win32.join(normalized, "bin", "bash.exe"); }
   return "C:\\Program Files\\Git\\bin\\bash.exe";
 }
 
-export function getSuggestedShell(userTerminalHint: string): KnownShellExecutor {
+export function getSuggestedShell(userTerminalHint: string, platform: NodeJS.Platform = process.platform, env: NodeJS.ProcessEnv = process.env): KnownShellExecutor {
   if (userTerminalHint === KnownShellExecutor.ZshLight) return KnownShellExecutor.ZshLight;
-  const shell = userTerminalHint || process.env.SHELL || ""; const windows = process.platform === "win32"; const gitBash = windows && !userTerminalHint ? detectGitBashFromEnvironment() : undefined;
+  const shell = userTerminalHint || env.SHELL || ""; const windows = platform === "win32"; const gitBash = windows && !userTerminalHint ? detectGitBashFromEnvironment(platform, env) : undefined;
   const isGitBash = gitBash !== undefined || /git.*bash\.exe$/i.test(shell) || /program.*git.*bin.*bash\.exe$/i.test(shell); const bashIsOkay = !windows || isGitBash;
   if (shell.includes("zsh")) return KnownShellExecutor.Zsh;
   if (shell.includes("bash") && bashIsOkay) return KnownShellExecutor.Bash;
   if (shell.includes("pwsh") || shell.includes("powershell")) return KnownShellExecutor.PowerShell;
   if (gitBash) return KnownShellExecutor.Bash;
-  if (windows && (commandExists("pwsh") || commandExists("powershell"))) return KnownShellExecutor.PowerShell;
+  if (windows) {
+    // Windows can host PowerShell and Git Bash. `zsh` has no supported Windows
+    // build, and a bare `bash` on Windows is usually WSL or a shim that hangs,
+    // so neither is probed here. That bounds the Windows probe budget at two.
+    if (commandExists("pwsh") || commandExists("powershell")) return KnownShellExecutor.PowerShell;
+    return KnownShellExecutor.Naive;
+  }
   if (commandExists("zsh")) return KnownShellExecutor.Zsh;
   if (commandExists("bash") && bashIsOkay) return KnownShellExecutor.Bash;
   if (commandExists("pwsh") || commandExists("powershell")) return KnownShellExecutor.PowerShell;

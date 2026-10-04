@@ -5,8 +5,8 @@ import type { Context } from "../context/core.js";
 import { createWritableIterable } from "../utils/writable-iterable.js";
 import { attachShellOutputStreams } from "./output-limiter.js";
 import { getZshPath } from "./platform-shell.js";
+import { buildShellEnv } from "./shell-env.js";
 import { getSudoAliasInjection } from "./sudo.js";
-import { SHELL_ENV_OVERRIDES } from "./types.js";
 import { resolveSandboxPolicyForWorkspace } from "./sandbox/policy-merge.js";
 import { captureSandboxDenies } from "./sandbox/macos/seatbelt.js";
 import { ZSH_STATE_END_MARKER, ZSH_STATE_START_MARKER, default as dumpZshState } from "./dump_zsh_state.js";
@@ -32,11 +32,7 @@ async function captureSandboxDenies2(child: ChildProcess): Promise<readonly unkn
 }
 
 export async function initZshState(options?: ZshInitOptions): Promise<ZshState> {
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    ...SHELL_ENV_OVERRIDES,
-    ...options?.env,
-  };
+  const env = buildShellEnv({ overrides: options?.env, shell: getZshPath() });
   const stateMarker = "__CURSOR_STATE_MARKER__";
   const args = [
     "-o",
@@ -93,11 +89,7 @@ export class ZshState {
     const pipeStdin = options.pipeStdin ?? false;
     const iterable = createWritableIterable<TerminalEvent>();
     const cwd = options.workingDirectory ?? this.cwd;
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      ...SHELL_ENV_OVERRIDES,
-      ...options.env,
-    };
+    const env = buildShellEnv({ overrides: options.env, shell: getZshPath() });
     let core = `builtin eval "$1"`;
     if (!pipeStdin) core += " < /dev/null";
     const sudoAliasInjection = getSudoAliasInjection(env);

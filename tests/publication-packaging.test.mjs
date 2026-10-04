@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -13,15 +15,38 @@ test("packaged verification authority is the selected app bundle", () => {
   const appPath = path.join(repoRoot, "dist", "Example.app");
   const artifacts = resolvePackagedAppArtifacts(appPath);
   assert.equal(artifacts.appPath, appPath);
+  assert.equal(artifacts.shape, "app-bundle");
   assert.equal(artifacts.asarPath, path.join(appPath, "Contents", "Resources", "app.asar"));
   assert.equal(artifacts.unpackedPath, `${artifacts.asarPath}.unpacked`);
   assert.notEqual(artifacts.asarPath, path.join(repoRoot, ".build", "app.asar"));
   assert.throws(() => resolvePackagedAppArtifacts(path.join(repoRoot, ".build", "app.asar")), /\.app bundle/);
 });
 
+// A `.app` bundle keeps its layout on every host, but only a Windows runtime
+// host resolves the flat payload directory that Electron loads directly, so this
+// assertion describes the Windows contract and is skipped elsewhere.
+test("packaged verification resolves the flat Windows payload beside its executable", { skip: process.platform !== "win32" }, () => {
+  const appPath = mkdtempSync(path.join(os.tmpdir(), "grok-bot-payload-"));
+  try {
+    const artifacts = resolvePackagedAppArtifacts(appPath);
+    assert.equal(artifacts.appPath, appPath);
+    assert.equal(artifacts.shape, "app-directory");
+    assert.equal(artifacts.asarPath, path.join(appPath, "resources", "app.asar"));
+    assert.equal(artifacts.unpackedPath, `${artifacts.asarPath}.unpacked`);
+    // A packed archive or installer is never a payload root, even by name.
+    assert.throws(() => resolvePackagedAppArtifacts(path.join(appPath, "app.asar")), /\.app bundle/);
+    assert.throws(() => resolvePackagedAppArtifacts(path.join(appPath, "Grok Bot 0.18 Reconstructed.exe")), /\.app bundle/);
+  } finally {
+    rmSync(appPath, { recursive: true, force: true });
+  }
+});
+
 test("publication ignore rules retain reconstructed frontend source", async () => {
   const ignoreRules = await readFile(path.join(repoRoot, ".gitignore"), "utf8");
   assert.match(ignoreRules, /^\/recovered\/$/m);
+  // An empty `.gitignore` satisfies `doesNotMatch` for free; the `ignores`
+  // assertions below are the ones that would notice.
+  assert.ok(ignoreRules.trim().length > 0, ".gitignore is empty, so the negative assertion below proves nothing");
   assert.doesNotMatch(ignoreRules, /^recovered\/$/m);
   const retained = "frontend/src/recovered/ui/sand-form-primitives.css";
   const matcher = createIgnore().add(ignoreRules);
@@ -49,6 +74,16 @@ test("Router settings use the trusted backend and display recorded inference usa
   const coordinatorMain = await readFile(path.join(repoRoot, "source", "node-agent-coordinator", "main.ts"), "utf8");
   const mcpBridge = await readFile(path.join(repoRoot, "source", "node-agent-coordinator", "routed-mcp-bridge.ts"), "utf8");
   const localDocker = await readFile(path.join(repoRoot, "source", "electron-main", "box", "local-docker-host-connector.ts"), "utf8");
+  // Every assertion below is a regex against one of these files. `assert.match` on
+  // an empty string fails, but `assert.doesNotMatch` on an empty string passes
+  // trivially, so a truncated or unread-but-present file would turn the five
+  // negative assertions below into no-ops. Every source has to carry content.
+  for (const [name, text] of Object.entries({
+    rendererPatch, preload, mainEdge, inference, cursorSession, cursorBackend,
+    providers, codexDirect, turnShell, coordinator, coordinatorMain, mcpBridge, localDocker,
+  })) {
+    assert.ok(text.trim().length > 0, `${name} is empty, so its regex assertions below prove nothing`);
+  }
   assert.match(rendererPatch, /desktop\.agent\.getInferenceRouter\(\)/);
   assert.match(rendererPatch, /desktop\.agent\.setInferenceRouter\(n\)/);
   assert.match(rendererPatch, /desktop\.agent\.getBoxRuntime\(\)/);
@@ -64,6 +99,19 @@ test("Router settings use the trusted backend and display recorded inference usa
   assert.match(rendererPatch, /Last used/);
   assert.match(rendererPatch, /Tracked activity/);
   assert.match(rendererPatch, /RRouterProviders\.filter/);
+  assert.match(rendererPatch, /\{value:"custom",label:"Custom",description:"Route through your own OpenAI-compatible endpoint\.",kind:"custom",secret:"OPENAI_COMPATIBLE_API_KEY"/);
+  assert.match(rendererPatch, /kind:"custom"/);
+  assert.match(rendererPatch, /s\.kind==="custom"/);
+  assert.match(rendererPatch, /"aria-label":"Endpoint base URL"/);
+  assert.match(rendererPatch, /"aria-label":"Endpoint model id"/);
+  assert.match(rendererPatch, /const E=\{baseUrl:g\.trim\(\),modelId:v\.trim\(\)\}/);
+  assert.match(rendererPatch, /desktop\.agent\.setInferenceRouter\(s\.value,E\)/);
+  assert.match(rendererPatch, /typeof window\.desktop\?\.agent\?\.setInferenceRouter!=="function"/);
+  assert.match(rendererPatch, /desktop\.secrets\.upsert\(\{\[s\.secret\]:r\.trim\(\)\}\)/);
+  assert.doesNotMatch(rendererPatch, /title:r\.kind==="key"\?"OpenRouter account":"Account"/);
+  assert.match(rendererPatch, /title:RRouterCredentialTitle\(r\)/);
+  assert.match(rendererPatch, /label:RRouterCredentialLabel\(r\)/);
+  assert.match(rendererPatch, /RRouterCredentialDescription\(r\)/);
   assert.match(preload, /getInferenceRouter: \(\) => edge\("getInferenceRouter"\)/);
   assert.match(preload, /getBoxRuntime: \(\) => edge\("getBoxRuntime"\)/);
   assert.match(preload, /setBoxRuntime: \(mode: string\) => edge\("setBoxRuntime", \{ mode \}\)/);
