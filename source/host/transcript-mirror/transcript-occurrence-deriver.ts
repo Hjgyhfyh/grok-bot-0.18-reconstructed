@@ -129,17 +129,28 @@ implements TranscriptDeriver<TranscriptOccurrenceBlobStore> {
     if (current.case !== "agent") return { occurrences: [] };
     const previousAgent = previous?.case === "agent" ? previous : undefined;
 
-    if (
-      previousAgent != null
-      && !bytesEqual(previousAgent.userMessage, current.userMessage)
-    ) {
+    if (previousAgent != null && !bytesEqual(previousAgent.userMessage, current.userMessage)) {
       throw new TranscriptJournalCorruptionError(
         "durable agent user message changed after checkpoint",
       );
     }
+    // An open turn keeps a deferred cursor: the trailing assistant/thinking step
+    // is never written to the canonical transcript, because a later checkpoint may
+    // still rewrite it. A resumed turn therefore reports a SHORTER step list than
+    // the durable one — the stream restarted from its base state and is still
+    // filling the same turn. That is the same rewind `deferredStep` already models
+    // at the bottom of this function, so the check accepts it only while a deferred
+    // cursor for this very turn is held.
+    //
+    // Without a cursor the turn was finalised, every step reached the file, and a
+    // shorter list can only come from a writer that is not this conversation — the
+    // state no longer contains lines that are already durable. That stays
+    // corruption, which is the class this check was written to catch.
+    const rewindingOpenTurn = deferredStep?.turnIndex === turnIndex;
     if (
       previousAgent != null
       && current.steps.length < previousAgent.steps.length
+      && !rewindingOpenTurn
     ) {
       throw new TranscriptJournalCorruptionError(
         "durable agent steps moved backwards",
@@ -149,7 +160,16 @@ implements TranscriptDeriver<TranscriptOccurrenceBlobStore> {
     let firstChangedStep = previousAgent?.steps.length ?? 0;
     if (previousAgent != null) {
       for (let index = 0; index < previousAgent.steps.length; index += 1) {
-        if (bytesEqual(previousAgent.steps[index]!, current.steps[index]!)) {
+        const currentStepBlob = current.steps[index];
+        // Only a rewound open turn reaches here: the shrink check above throws
+        // unless a deferred cursor for this turn is held, and a non-shrinking
+        // turn has a blob at every index this loop visits. The durable list has
+        // run past the new tail, so the tail starts here.
+        if (currentStepBlob === undefined) {
+          firstChangedStep = index;
+          break;
+        }
+        if (bytesEqual(previousAgent.steps[index]!, currentStepBlob)) {
           continue;
         }
         if (index + 1 !== previousAgent.steps.length) {
@@ -163,6 +183,13 @@ implements TranscriptDeriver<TranscriptOccurrenceBlobStore> {
     }
     if (deferredStep?.turnIndex === turnIndex) {
       firstChangedStep = Math.min(firstChangedStep, deferredStep.stepIndex);
+    }
+    // A rewound open turn can land before `firstChangedStep`. Nothing past the
+    // new tail exists to emit, so the emission window is empty rather than
+    // negative; the clamp only ever applies to the rewind above, because every
+    // other path already leaves `firstChangedStep` at or below the tail.
+    if (firstChangedStep > current.steps.length) {
+      firstChangedStep = current.steps.length;
     }
 
     const occurrences: TranscriptOccurrence[] = [];

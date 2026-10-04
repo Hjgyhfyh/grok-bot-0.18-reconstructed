@@ -130,6 +130,7 @@ import {
 import { DEFAULT_SAND_SYSTEM_PROMPT, buildSandSubagentSystemPrompt } from "./runner/system-prompt.js";
 import {
   createSystemPromptAssembly,
+  readAgentInstructions,
   type MemoryPromptStore,
   type MemorySnapshotStore,
   type PromptSnapshotStore,
@@ -161,6 +162,9 @@ import type {
   TurnToolsetTurnInput,
 } from "./runner/tools/turn-toolset.js";
 import type { TurnCheckpoint, TurnSettleHost } from "./runner/turn-settle.js";
+import { ConversationStateStructure } from "../packages/proto/generated/agent/v1/agent_pb.js";
+import type { BlobStore } from "../packages/agent-kv/blob-store.js";
+import { toHex } from "../packages/agent-kv/serde.js";
 import { isMemorableExchange } from "./runner/sand-memory.js";
 import type { TextExecutor } from "./runner/sand-memory.js";
 import type { RunnerPromptGlueOwner } from "./runner/runner-prompt-glue.js";
@@ -356,6 +360,241 @@ function asActionAuditor(
   const record = (value as Record<string, unknown>).record;
   if (typeof record !== "function") return undefined;
   return { record: entry => record.call(value, entry) };
+}
+
+/**
+ * The checkpoint owner every settle host writes through. It is the narrow
+ * slice of `AgentStore2` that `turn-settle.ts` actually calls, so a scope can
+ * supply the agent's own store, a subagent's own store, or nothing at all.
+ */
+export interface ProductionCheckpointStore {
+  handleCheckpoint(context: unknown, checkpoint: unknown): Promise<void>;
+  getMetadata(key: string): string | undefined;
+  getBlobStore?(): BlobStore<unknown>;
+}
+
+const SUBAGENT_CONVERSATION_ROOT_PREFIX = "sand-subagent-conversation-root-v1__";
+
+/**
+ * The durable root slot one subagent's own conversation occupies.
+ *
+ * It is a pure function of the subagent id, exactly like the agent's own
+ * `SAND_CONVERSATION_ROOT_SLOT_ID`: no metadata row and no file name has to
+ * agree on where a subagent's checkpoint lives, so a cold process finds it again
+ * by recomputing the same bytes. Deriving it from the id is also what keeps two
+ * subagents of one agent apart — a shared fixed slot would let the second
+ * subagent overwrite the first one's history, which is the same class of defect
+ * as one subagent writing into its parent's journal key.
+ */
+export function subagentConversationRootBlobId(agentId: string): Uint8Array {
+  return new TextEncoder().encode(`${SUBAGENT_CONVERSATION_ROOT_PREFIX}${agentId}`);
+}
+
+/**
+ * A subagent's own durable conversation, kept out of its parent's store.
+ *
+ * A subagent used to settle through the parent's `AgentStore2`: its checkpoint
+ * replaced the parent's whole `ConversationStateStructure` and its
+ * `latestRootBlobId`, so the parent's durable root was whatever the child last
+ * wrote. This store gives the child its own root slot in the agent's blob store
+ * and never touches the parent's structure, metadata or root id. The parent's
+ * `subagentStates` entry (written by the Task tool through
+ * `persistSubagentState`) keeps describing the subagent for `resume`.
+ */
+export class SubagentConversationStore {
+  #structure = new ConversationStateStructure();
+  readonly #blobStore: BlobStore<unknown>;
+  readonly #rootBlobId: Uint8Array;
+  readonly #ready: Promise<void>;
+
+  constructor(readonly agentId: string, blobStore: BlobStore<unknown>) {
+    this.#blobStore = blobStore;
+    this.#rootBlobId = subagentConversationRootBlobId(agentId);
+    this.#ready = this.#load();
+  }
+
+  /** Resolves once the durable root has been read, so a cold subagent resumes
+   *  its own turns instead of racing its first checkpoint against them. */
+  ready(): Promise<void> {
+    return this.#ready;
+  }
+
+  async #load(): Promise<void> {
+    let bytes: Uint8Array | undefined;
+    try {
+      bytes = await this.#blobStore.getBlob(undefined, this.#rootBlobId);
+    } catch {
+      return;
+    }
+    if (!(bytes instanceof Uint8Array) || bytes.length === 0) return;
+    try {
+      this.#structure = ConversationStateStructure.fromBinary(bytes);
+    } catch {
+      this.#structure = new ConversationStateStructure();
+    }
+  }
+
+  getId(): string {
+    return this.agentId;
+  }
+
+  getBlobStore(): BlobStore<unknown> {
+    return this.#blobStore;
+  }
+
+  getConversationStateStructure(): ConversationStateStructure {
+    return this.#structure;
+  }
+
+  async handleCheckpoint(
+    _context: unknown,
+    checkpoint: ConversationStateStructure,
+  ): Promise<void> {
+    this.#structure = checkpoint;
+    await this.#blobStore.setBlob(
+      undefined,
+      this.#rootBlobId,
+      checkpoint.toBinary(),
+    );
+  }
+
+  getMetadata(key: string): string | undefined {
+    return key === "latestRootBlobId" ? toHex(this.#rootBlobId) : undefined;
+  }
+
+  dispose(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
+/** The runner surface a settle host reads and writes for ONE agent. */
+export interface ProductionTurnSettleRunner {
+  readonly currentRunGeneration?: number;
+  getBlobStore?(): unknown;
+  getLatestPromptMessages?(): readonly unknown[];
+  setAgentConversationStateStructure?(structure: TurnCheckpoint): void;
+}
+
+/**
+ * Everything a settle host must be told about the agent whose turn it settles.
+ *
+ * The three fields that used to be closed over `session.id` — the transcript id,
+ * the runner and the checkpoint store — are the whole defect. A subagent created
+ * by `createSubagentRunner` settles through the parent's scope, so its
+ * checkpoints were appended to the parent's journal key: the parent then wrote
+ * its own next checkpoint, whose turn list no longer contained the subagent's
+ * turn, and `transcript-occurrence-deriver.ts` refused it with "durable
+ * conversation turns moved backwards". A subagent's scope passes the subagent's
+ * own agent id, its own runner and its own store, so the two never share a key.
+ */
+export interface ProductionTurnSettleScope {
+  /** The agent id this scope owns. It is the transcript id and the journal key. */
+  readonly agentId: string;
+  readonly isSubagentRunner: boolean;
+  /** The runner of THIS agent. A subagent must pass its own, never the parent's. */
+  readonly runner: ProductionTurnSettleRunner | undefined;
+  /** The durable checkpoint store of THIS agent, and of no other. */
+  readonly agentStore: ProductionCheckpointStore;
+}
+
+/**
+ * The identity a Task subagent settles under.
+ *
+ * This is the seam the whole fix turns on, and it is the ONLY place a subagent's
+ * journal key is chosen. Reading the parent out of here — `agentId: parentId`, or
+ * the parent's `agentStore` — is what made every `Task` dispatch kill its own
+ * parent turn with "durable conversation turns moved backwards". The subagent id
+ * and the parent's id are both in hand here, which is exactly why the choice
+ * cannot be an accident.
+ */
+export function resolveSubagentSettleIdentity(
+  subagentId: string,
+  parentAgentStore: ProductionCheckpointStore,
+): {
+  readonly agentId: string;
+  readonly isSubagentRunner: true;
+  readonly conversationStore: SubagentConversationStore;
+  /** Resolves when the subagent's durable root has been read. */
+  readonly ready: Promise<void>;
+} {
+  const conversationStore = new SubagentConversationStore(
+    subagentId,
+    getAgentBlobStore(
+      parentAgentStore as unknown as { getBlobStore(): BlobStore<unknown> },
+    ),
+  );
+  return {
+    agentId: subagentId,
+    isSubagentRunner: true,
+    conversationStore,
+    ready: conversationStore.ready(),
+  };
+}
+
+export interface ProductionTurnSettleHostExtras {
+  readonly transcriptMirror?: TurnSettleHost["transcriptMirror"];
+  readonly persistAnnouncedAgentProfile?: TurnSettleHost["persistAnnouncedAgentProfile"];
+  /**
+   * A shared-room turn settles with the subagent flag on, because it has no
+   * canonical transcript of its own. Kept as an explicit input so the flag is
+   * never inferred from a captured constant again.
+   */
+  readonly settlesAsSubagent?: boolean;
+}
+
+/**
+ * Builds the settle host for one agent scope.
+ *
+ * Every identity here comes from `scope`, never from a captured parent session:
+ * `getTranscriptId` is the journal key, `getBlobStore` is the store the deriver
+ * resolves that key's blobs through, and `agentStore` is what
+ * `turn-settle.ts` persists into.
+ */
+export function createProductionTurnSettleHostForScope(
+  scope: ProductionTurnSettleScope,
+  extras: ProductionTurnSettleHostExtras = {},
+): TurnSettleHost {
+  const store = scope.agentStore;
+  if (
+    store == null
+    || typeof store.handleCheckpoint !== "function"
+    || typeof store.getMetadata !== "function"
+  ) {
+    throw new TypeError("production Agent checkpoint store is not bound");
+  }
+  const runner = scope.runner;
+  const generation = runner?.currentRunGeneration;
+  const fallbackBlobStore = getAgentBlobStore(
+    store as unknown as { getBlobStore(): BlobStore<unknown> },
+  );
+  return {
+    isSubagentRunner: scope.isSubagentRunner || extras.settlesAsSubagent === true,
+    ...(extras.transcriptMirror === undefined
+      ? {}
+      : { transcriptMirror: extras.transcriptMirror }),
+    getTranscriptId: () => scope.agentId,
+    getBlobStore: () => runner?.getBlobStore?.() ?? fallbackBlobStore,
+    agentStore: () => ({
+      handleCheckpoint: (context: unknown, checkpoint: unknown) =>
+        store.handleCheckpoint(context, checkpoint),
+      getMetadata: (key: string) => store.getMetadata(key),
+    }),
+    setLocalState: checkpoint => {
+      if (typeof runner?.setAgentConversationStateStructure !== "function") {
+        throw new TypeError("production Agent local checkpoint store is not bound");
+      }
+      runner.setAgentConversationStateStructure(checkpoint);
+    },
+    ownsRunner: () => true,
+    isRunSuperseded: () =>
+      generation !== undefined
+      && runner?.currentRunGeneration !== undefined
+      && runner.currentRunGeneration !== generation,
+    latestPromptMessages: () => runner?.getLatestPromptMessages?.() ?? [],
+    persistAnnouncedAgentProfile: (snapshots, snapshot, identity) => {
+      extras.persistAnnouncedAgentProfile?.(snapshots, snapshot, identity);
+    },
+  };
 }
 
 function asLocalToolPermissionProjection(
@@ -1463,6 +1702,12 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           isSharedRoomRunner: isSharedRoomTurn,
           isSystemPromptOverridden: typeof overrides.systemPrompt === "string",
           agentProfileProvider: () => hooks.agentProfileProvider?.() ?? null,
+          // Read from the agent directory on every prompt build. A cached copy
+          // would make an edited instruction take effect only after a restart,
+          // and the whole point of the field is that the user can write it once
+          // and see the next turn obey it.
+          agentInstructionProvider: () =>
+            readAgentInstructions(dirname(session.dbPath)),
           agentStore: () => {
             const store = session.agentStore;
             return store != null && typeof store.getMetadata === "function"
@@ -2404,56 +2649,69 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
       };
     };
 
-    const createProductionTurnSettleHost = (): TurnSettleHost => {
-      const runner = builtRunner as {
-        readonly isSubagentRunner?: boolean;
-        getBlobStore?: () => unknown;
-        getConversationStateStructure?: () => unknown;
-        getLatestPromptMessages?: () => readonly unknown[];
-        currentRunGeneration?: number;
-        setAgentConversationStateStructure?: (structure: TurnCheckpoint) => void;
-      } | undefined;
+    const persistAnnouncedAgentProfile: TurnSettleHost["persistAnnouncedAgentProfile"] = (
+      snapshots,
+      snapshot,
+      identity,
+    ) => {
+      const profilePromptSnapshotStore = asPromptSnapshotStore(snapshots);
+      productionSystemPromptAssembly?.persistAnnouncedAgentProfile(
+        profilePromptSnapshotStore,
+        snapshot,
+        identity,
+      );
+    };
+
+    /**
+     * The settle host of ONE agent.
+     *
+     * It used to be a nullary closure over `session.id` and `builtRunner`, so
+     * `createSubagentRunner` — which builds its child from this very
+     * composition's `runnerOptions` — got the parent's journal key, the parent's
+     * blob store and the parent's `AgentStore2`. The child then appended its own
+     * turn to the parent's conversation, and the parent's next checkpoint looked
+     * like history moving backwards. The scope is now an argument: a subagent
+     * passes its own id, its own runner and its own store.
+     */
+    const createProductionTurnSettleHost = (
+      scope: {
+        readonly agentId: string;
+        readonly isSubagentRunner: boolean;
+        readonly runner: unknown;
+        readonly agentStore: ProductionCheckpointStore;
+      },
+    ): TurnSettleHost =>
+      createProductionTurnSettleHostForScope(
+        {
+          agentId: scope.agentId,
+          isSubagentRunner: scope.isSubagentRunner,
+          runner: scope.runner as ProductionTurnSettleRunner | undefined,
+          agentStore: scope.agentStore,
+        },
+        {
+          ...(transcriptMirrorForTurn === undefined
+            ? {}
+            : { transcriptMirror: transcriptMirrorForTurn }),
+          persistAnnouncedAgentProfile,
+          settlesAsSubagent: isSharedRoomTurn,
+        },
+      );
+
+    const parentSettleScope = (): {
+      agentId: string;
+      isSubagentRunner: boolean;
+      runner: unknown;
+      agentStore: ProductionCheckpointStore;
+    } => {
       const store = session.agentStore;
-      if (
-        store == null
-        || typeof store.handleCheckpoint !== "function"
-        || typeof store.getMetadata !== "function"
-      ) throw new TypeError("production Agent checkpoint store is not bound");
-      const generation = runner?.currentRunGeneration;
+      if (store == null) {
+        throw new TypeError("production Agent checkpoint store is not bound");
+      }
       return {
-        isSubagentRunner: isSharedRoomTurn,
-        ...(transcriptMirrorForTurn === undefined
-          ? {}
-          : { transcriptMirror: transcriptMirrorForTurn }),
-        getTranscriptId: () => session.id,
-        getBlobStore: () => runner?.getBlobStore?.() ?? getAgentBlobStore(
-          store as Parameters<typeof getAgentBlobStore>[0],
-        ),
-        agentStore: () => ({
-          handleCheckpoint: (context: unknown, checkpoint: unknown) =>
-            store.handleCheckpoint(context, checkpoint),
-          getMetadata: (key: string) => store.getMetadata(key),
-        }),
-        setLocalState: checkpoint => {
-          if (typeof runner?.setAgentConversationStateStructure !== "function") {
-            throw new TypeError("production Agent local checkpoint store is not bound");
-          }
-          runner.setAgentConversationStateStructure(checkpoint);
-        },
-        ownsRunner: () => true,
-        isRunSuperseded: () =>
-          generation !== undefined
-          && runner?.currentRunGeneration !== undefined
-          && runner.currentRunGeneration !== generation,
-        latestPromptMessages: () => runner?.getLatestPromptMessages?.() ?? [],
-        persistAnnouncedAgentProfile: (snapshots, snapshot, identity) => {
-          const profilePromptSnapshotStore = asPromptSnapshotStore(snapshots);
-          productionSystemPromptAssembly?.persistAnnouncedAgentProfile(
-            profilePromptSnapshotStore,
-            snapshot,
-            identity,
-          );
-        },
+        agentId: session.id,
+        isSubagentRunner: false,
+        runner: builtRunner,
+        agentStore: store as unknown as ProductionCheckpointStore,
       };
     };
 
@@ -2531,12 +2789,27 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           ? {}
           : { localToolPermission: projectedLocalToolPermission }),
       });
-      const getProductionConversationState = () => {
+      /**
+       * The base conversation state of ONE scope.
+       *
+       * It used to close over `builtRunner`, which is always the PARENT's
+       * runner, so a subagent started its turn from the parent's durable
+       * history. Its checkpoint was then the parent's turns plus the subagent's
+       * turn, written into the parent's journal key — which is how the parent's
+       * next, shorter checkpoint became "durable conversation turns moved
+       * backwards". A subagent reads its own store and starts empty.
+       */
+      const getProductionConversationState = (scope?: {
+        readonly subagentStore?: SubagentConversationStore;
+      }): ConversationStateStructure => {
+        if (scope?.subagentStore !== undefined) {
+          return scope.subagentStore.getConversationStateStructure();
+        }
         const runner = builtRunner as {
           getAgentConversationStateStructure?: () => unknown;
         } | undefined;
         if (typeof runner?.getAgentConversationStateStructure === "function") {
-          return runner.getAgentConversationStateStructure();
+          return runner.getAgentConversationStateStructure() as ConversationStateStructure;
         }
         const store = session.agentStore;
         if (store != null && typeof store.getConversationStateStructure === "function") {
@@ -2557,8 +2830,20 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
         readonly agentId: string;
         readonly isSubagentRunner: boolean;
         readonly subagentType: string | undefined;
-      }): ReturnType<typeof createProductionTurnRunShellHostInput> =>
-      createProductionTurnRunShellHostInput({
+        /** The subagent's own durable conversation; absent for the parent. */
+        readonly subagentStore?: SubagentConversationStore;
+        /** Resolves once the subagent's durable root has been read. */
+        readonly ready?: Promise<void>;
+        /**
+         * The runner that owns this scope. Read lazily by the settle host,
+         * because a subagent's shell is built BEFORE its runner exists and the
+         * caller fills this in once `buildRunner` has returned it. Falling back
+         * to `builtRunner` here is the whole defect, so an unfilled slot on a
+         * subagent scope is a hard error rather than a silent parent fallback.
+         */
+        scopeRunner?: unknown;
+      }): ReturnType<typeof createProductionTurnRunShellHostInput> => {
+        const hostInput = createProductionTurnRunShellHostInput({
         createAgentOwnerInput: ({ requestId, runOptions, context, cancelThisRun, emitUpdate }) => {
           if (session.agentStore == null || typeof session.agentStore.getBlobStore !== "function") {
             throw new TypeError("production Agent blob store is not bound");
@@ -2689,10 +2974,48 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
                     `too many subagents are already running (limit ${SAND_MAX_ACTIVE_SUBAGENTS}): wait for one to finish before dispatching another`,
                   );
                 }
+                // The child's OWN durable conversation.
+                //
+                // `runnerOptions.getAgentId` answers `session.id` — the PARENT's —
+                // and `runnerOptions.blobStore` / `session.agentStore` are the
+                // parent's too. `conversationId: agentId` and
+                // `transcriptId: agentId` below could not undo that, because
+                // `SandAgentRunner.getConversationId()` prefers `getAgentId` and
+                // the settle host took the journal key from the captured
+                // session. The child therefore checkpointed into the parent's
+                // journal and the parent's next checkpoint was refused with
+                // "durable conversation turns moved backwards". Its own store,
+                // its own journal key and its own agent id are what keep the two
+                // conversations apart.
+                if (session.agentStore == null
+                  || typeof session.agentStore.getBlobStore !== "function") {
+                  throw new TypeError("production Agent blob store is not bound");
+                }
+                const subagentIdentity = resolveSubagentSettleIdentity(
+                  agentId,
+                  session.agentStore as unknown as ProductionCheckpointStore,
+                );
+                const subagentScope: {
+                  agentId: string;
+                  isSubagentRunner: boolean;
+                  subagentType: string | undefined;
+                  subagentStore: SubagentConversationStore;
+                  ready?: Promise<void>;
+                  scopeRunner?: unknown;
+                } = {
+                  agentId: subagentIdentity.agentId,
+                  isSubagentRunner: subagentIdentity.isSubagentRunner,
+                  subagentType: args.subagentType,
+                  subagentStore: subagentIdentity.conversationStore,
+                  ready: subagentIdentity.ready,
+                };
                 const child = deps.buildRunner({
                   ...runnerOptions,
                   conversationId: agentId,
                   transcriptId: agentId,
+                  // Answers the child's own id, not the captured parent session.
+                  getAgentId: () => agentId,
+                  getBoxId: () => agentId,
                   isSubagent: true,
                   subagentType: args.subagentType,
                   initialState: {
@@ -2700,13 +3023,17 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
                     summaryArchives: [],
                     turnTimings: [],
                   },
-                  productionTurnRunShell: buildProductionTurnRunShellInput({
-                    agentId,
-                    isSubagentRunner: true,
-                    subagentType: args.subagentType,
-                  }),
+                  productionTurnRunShell: buildProductionTurnRunShellInput(subagentScope),
                 });
-                bindSessionOwnedRunner(child);
+                // The child's shell was built before the child existed; hand the
+                // scope its own runner now so the settle host never falls back
+                // to the parent's.
+                subagentScope.scopeRunner = child;
+                // The parent's `AgentStore2` is deliberately NOT bound here.
+                // `setAgentStore` is the child's only fallback for
+                // `getAgentConversationStateStructure()`, and binding it made the
+                // child's base state the parent's history again.
+                bindSessionOwnedRunner(child, { bindParentAgentStore: false });
                 ownedRunners.add(child);
                 return {
                   run: async (prompt, options) => {
@@ -2889,7 +3216,7 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
         promptOptions: (_prompt, options) => toGeneratedTurnPromptOptions(options),
         assembleGeneratedTurnAction: productionPromptGlue.assembleGeneratedTurnAction,
         compactionEpoch: () => 0,
-        getConversationState: getProductionConversationState,
+        getConversationState: () => getProductionConversationState(scope),
         ...(mcp.mcp != null && typeof mcp.mcp.getTools === "function"
           ? {
               mcp: {
@@ -2903,12 +3230,38 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           getExecutor: () => createTextExecutor(owner.runContext.toolSession.getExecutor()),
         }),
         context: () => productionContext,
-        createSettleHost: createProductionTurnSettleHost,
+        // The scope decides the journal key, the blob store and the durable
+        // checkpoint owner. Handing the child the parent's would put its turn in
+        // the parent's journal, which is the defect this whole scope exists to
+        // remove.
+        createSettleHost: () => {
+          const owner = scope.scopeRunner ?? builtRunner;
+          if (owner == null) {
+            throw new TypeError("production Agent runner is not bound");
+          }
+          return createProductionTurnSettleHost({
+            agentId: scope.agentId,
+            isSubagentRunner: scope.isSubagentRunner,
+            runner: owner,
+            agentStore: scope.subagentStore
+              ?? parentSettleScope().agentStore,
+          });
+        },
         profilePromptSnapshots: () => session.db,
         isSubagentRunner: scope.isSubagentRunner,
         subagents: { sessions: new Map() },
         getConversationId: () => scope.agentId,
-        runGeneration: () => (builtRunner as { currentRunGeneration?: number } | undefined)?.currentRunGeneration ?? 0,
+        // The generation of THIS scope's runner. Reading the parent's here made
+        // a subagent's turn report the parent's run generation, so a parent
+        // interrupt could supersede a child that was still working.
+        runGeneration: () => {
+          const owner = scope.scopeRunner ?? builtRunner;
+          if (owner == null && scope.isSubagentRunner) {
+            throw new TypeError("production subagent runner is not bound");
+          }
+          return (owner as { currentRunGeneration?: number } | undefined)
+            ?.currentRunGeneration ?? 0;
+        },
         setActiveTurnRequestSource: () => {},
         beginAutoReviewUserMessageEpoch: () => {},
         setActiveRunInterrupted: () => {},
@@ -2921,6 +3274,19 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           : { lastReactionApplied: () => hooks.transport.lastReactionApplied?.() === true }),
         cancelThisRun: () => {},
       });
+        return scope.subagentStore === undefined
+          ? hostInput
+          : {
+              ...hostInput,
+              // A subagent's durable root is read on a worker thread, so its
+              // first turn must not read the base state before that read lands
+              // and silently start from an empty conversation.
+              createRunInput: async input => {
+                await scope.ready;
+                return await hostInput.createRunInput(input);
+              },
+            };
+      };
 
       // The parent's own shell. A subagent's shell is built inside a turn with
       // its own scope, so assigning this after the builder keeps the two from
@@ -2942,8 +3308,21 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
       });
     }
 
-    function bindSessionOwnedRunner(runner: Runner): void {
-      runner.setAgentStore(session.agentStore, hooks.agentProfileProvider);
+    /**
+     * Hands a runner the session-owned stores.
+     *
+     * `bindParentAgentStore: false` is what a subagent needs. `setAgentStore` is
+     * the only fallback `SandAgentRunner.getAgentConversationStateStructure()`
+     * has, so binding the parent's store made a child's base state — and, with
+     * it, the whole checkpoint the child writes — the parent's history.
+     */
+    function bindSessionOwnedRunner(
+      runner: Runner,
+      options: { readonly bindParentAgentStore?: boolean } = {},
+    ): void {
+      if (options.bindParentAgentStore !== false) {
+        runner.setAgentStore(session.agentStore, hooks.agentProfileProvider);
+      }
       runner.setMemoryStore(session.memory);
       runner.setUserMemory(runnerOptions.userMemory);
       runner.setProjectMemory(runnerOptions.projectMemory);

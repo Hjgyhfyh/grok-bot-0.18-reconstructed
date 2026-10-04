@@ -28,8 +28,11 @@ import {
   findBackendConnectError,
   PROVIDER_OVERLOAD_ERROR_DETAIL,
   PROVIDER_OVERLOAD_ERROR_TITLE,
-  type BackendConnectError,
+  PROVIDER_OVERLOADED_ERROR_KIND,
+  TURN_CANCELLED_ERROR_TITLE,
+  USER_CANCELLED_ERROR_KIND,
 } from "./agent-run-error.js";
+import { ErrorDetails } from "../../../packages/proto/generated/aiserver/v1/utils_pb.js";
 import {
   createSendMessageEntry,
   describeRepliedMessageQuote,
@@ -134,41 +137,26 @@ export function recordTurnQueueWaitSpan(args: {
 }
 
 /**
- * `ConnectError.findDetails()` dereferences its argument before it ever looks at the error's
- * own details (`@connectrpc/connect` 1.x, `connect-error.js:93`), so calling it with no registry
- * throws `TypeError: Cannot use 'in' operator …` — for every `ConnectError`, with or without
- * details. `abstract-user-message-action-handler.ts:2129` throws exactly one of those for a
- * cancelled turn, and `runTurn`'s catch reads the code on its next line: the handler that was
- * supposed to report the turn threw a second, different error instead, and the turn died
- * without a reason on the one path where the user already had one.
+ * The registry-less `ConnectError.findDetails()` call used to sit under a local guard here,
+ * because `agent-run-error.ts` — its owner — passed no registry and `findDetails` dereferences
+ * its argument before it looks at the error (`@connectrpc/connect` 1.x,
+ * `connect-error.js:92`). That raised `TypeError: Cannot use 'in' operator …` for *every*
+ * `ConnectError`, and `abstract-user-message-action-handler.ts:2129` throws exactly one of
+ * those for a turn the user stopped: the handler meant to report the turn raised a second,
+ * different error instead, and the turn died without a reason on the one path where the user
+ * already had one.
  *
- * The proper fix belongs in `agent-run-error.ts`, which owns `isConnectError`; until it has an
- * owner, every reader on this side refuses to let the probe take the whole error path down.
+ * The classifier now decodes through the registry `ErrorDetails` and refuses to raise, so the
+ * guard is gone rather than kept beside the repair. `describeAgentRunFailure` stays as the
+ * named boundary `runTurn` reads, and no longer needs a fallback: there is no second error
+ * here that could replace the one being reported.
  */
-function findBackendConnectErrorSafely(error: unknown): BackendConnectError | null {
-  try {
-    return findBackendConnectError(error, false);
-  } catch {
-    return null;
-  }
-}
-
-/** The same probe through `describeAgentRunError`, which walks the details twice. */
 export function describeAgentRunFailure(error: unknown): Record<string, unknown> {
-  try {
-    return describeAgentRunError(error);
-  } catch {
-    return {
-      detail:
-        error instanceof Error
-          ? error.message
-          : String(error),
-    };
-  }
+  return describeAgentRunError(error);
 }
 
 export function connectCodeOf(error: unknown): string | undefined {
-  const connectError = findBackendConnectErrorSafely(error);
+  const connectError = findBackendConnectError(error, false);
   if (connectError == null || typeof connectError.code !== "number") {
     return undefined;
   }
@@ -395,21 +383,27 @@ function retryAfterSecondsOf(error: unknown): number | undefined {
  * A title the backend itself wrote. Only one short single line is taken: a title carrying a
  * line break or a control character is not a title, and accepting one would let a stack or a
  * pasted request body ride along in a field the renderer prints as a sentence.
+ *
+ * `findDetails` is given the `ErrorDetails` registry it requires. Called with no registry it
+ * raises `TypeError: Cannot use 'in' operator …` before it ever looks at this error, which is
+ * why this used to be wrapped in a guard that hid the repair in `agent-run-error.ts`.
  */
 function curatedBackendTitleOf(error: unknown): string | undefined {
-  const connectError = findBackendConnectErrorSafely(error);
+  const connectError = findBackendConnectError(error, false);
   if (connectError == null) return undefined;
-  let title: string | undefined;
   try {
-    title = connectError.findDetails()[0]?.details?.title?.trim();
+    const decoded = connectError.findDetails(ErrorDetails) as Array<{
+      details?: { title?: string };
+    }>;
+    const title = decoded[0]?.details?.title?.trim();
+    return title != null &&
+      title.length > 0 &&
+      !/[\r\n\u0000-\u001f\u007f]/.test(title)
+      ? title.slice(0, 120)
+      : undefined;
   } catch {
     return undefined;
   }
-  return title != null &&
-    title.length > 0 &&
-    !/[\r\n\u0000-\u001f\u007f]/.test(title)
-    ? title.slice(0, 120)
-    : undefined;
 }
 
 /**
@@ -844,9 +838,11 @@ export class TurnRuntime {
           this.tm.trayErrors.pushError({
             agentId: session.id,
             title:
-              description.errorKind === "provider_overloaded"
+              description.errorKind === PROVIDER_OVERLOADED_ERROR_KIND
                 ? PROVIDER_OVERLOAD_ERROR_TITLE
-                : "Agent failed to respond",
+                : description.errorKind === USER_CANCELLED_ERROR_KIND
+                  ? TURN_CANCELLED_ERROR_TITLE
+                  : "Agent failed to respond",
             requestId,
             ...description,
           });

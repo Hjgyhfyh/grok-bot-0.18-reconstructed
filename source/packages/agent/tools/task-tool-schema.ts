@@ -87,7 +87,16 @@ export function buildTaskParametersSchema(configs: readonly TaskSchemaSubagentCo
   const configNames = configs.map(config => getSubagentTypeName(config.subagent_type));
   const normalizedToCanonical = new Map<string, string>();
   for (const canonicalName of configNames) normalizedToCanonical.set(normalizeSubagentTypeName(canonicalName), canonicalName);
-  const defaultSubagentTypeName = configNames.includes(GENERAL_PURPOSE_SUBAGENT_TYPE) ? GENERAL_PURPOSE_SUBAGENT_TYPE : configNames[0] ?? GENERAL_PURPOSE_SUBAGENT_TYPE;
+  // The enumeration is the registry, never a name the registry does not hold.
+  // `configNames[0] ?? GENERAL_PURPOSE_SUBAGENT_TYPE` used to invent
+  // `generalPurpose` for an empty list: the field then accepted a type that no
+  // dispatch could resolve, its description read "Must be one of: .", and the
+  // call died one layer down at
+  // `task-subagent-preparation.ts:494` with "No subagent types are available."
+  const noSubagentTypesAvailable = configNames.length === 0;
+  const defaultSubagentTypeName = configNames.includes(GENERAL_PURPOSE_SUBAGENT_TYPE)
+    ? GENERAL_PURPOSE_SUBAGENT_TYPE
+    : configNames[0];
   const preprocessSubagentType = (value: unknown): unknown => {
     if (value === undefined) return defaultSubagentTypeName;
     if (typeof value !== "string") return value;
@@ -97,8 +106,19 @@ export function buildTaskParametersSchema(configs: readonly TaskSchemaSubagentCo
   };
   const typeDescription = options.subagentModelsInUserInfo === true
     ? "Subagent type to use for this task. Available types are listed in the initial user-info message."
-    : `Subagent type to use for this task. Must be one of: ${configNames.join(", ")}.`;
-  const parsingSubagentTypeField = z.preprocess(preprocessSubagentType, stringChoice(configNames.length > 0 ? configNames : [GENERAL_PURPOSE_SUBAGENT_TYPE], typeDescription));
+    : noSubagentTypesAvailable
+      ? "Subagent type to use for this task. No subagent type is available in this session, so this call cannot succeed."
+      : `Subagent type to use for this task. Must be one of: ${configNames.join(", ")}.`;
+  // With no registry entry there is nothing to choose from and nothing to
+  // validate against: the field stays an unconstrained optional string so the
+  // honest "No subagent types are available." surfaces from the resolver instead
+  // of a schema that promised a type which does not exist.
+  const parsingSubagentTypeField = z.preprocess(
+    preprocessSubagentType,
+    noSubagentTypesAvailable
+      ? z.string().optional().describe(typeDescription)
+      : stringChoice(configNames, typeDescription),
+  );
   const modelFacingSubagentTypeField = options.subagentModelsInUserInfo === true
     ? z.preprocess(preprocessSubagentType, z.string().describe(typeDescription))
     : parsingSubagentTypeField;

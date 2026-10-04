@@ -75,6 +75,11 @@ function createLifecycleHarness({ existingAgentIds = [], lockedAgentIds = new Se
     sessions,
     sessionStore: {
       agentDirExists: (id) => dirs.has(id),
+      // A real method of `SandAgentSessionStore`, missing from this stub until
+      // `updateAgent` started resolving the agent's instruction file to report
+      // it back. The path points at nothing, so reading an agent that has no
+      // instructions still returns the empty string.
+      getAgentDir: (id) => path.join(repoRoot, "tests", ".no-such-agent-dir", id),
       getAgentProfileText: () => ({ name: "Old", description: "Old description" }),
       writeAgentProfileFile: (id, profile) => calls.push(["writeAgentProfileFile", id, profile]),
       updateAgentProfile: async (id, profile) => {

@@ -15,6 +15,21 @@ export const DISABLE_SEND_ACCEPT_RETURN_ENV = "SAND_DISABLE_SEND_ACCEPT_RETURN";
 const SAND_AGENT_PURPOSES = new Set(["disk-saver", "plugin-auth"]);
 const TEMPLATE_ID_PATTERN = /^[a-z0-9-]{1,64}$/;
 
+/**
+ * Every profile field a create request may carry, in the order it is forwarded.
+ * `instructions` is the agent's own instruction text; it is the one field the
+ * renderer never had a control for, which is why creating a "project auditor"
+ * or an "idea collector" used to be impossible.
+ */
+const AGENT_PROFILE_CREATE_FIELDS = [
+  "name",
+  "description",
+  "title",
+  "avatarShape",
+  "avatarColor",
+  "instructions",
+] as const;
+
 type DynamicMethod = (...args: any[]) => any;
 export type DynamicGatewayApi = Record<string, any>;
 
@@ -80,19 +95,41 @@ export function createHostGatewayApi(
     method(telemetry.analytics, "markActive")(reason);
   };
 
+  /**
+   * The profile fields of a create request.
+   *
+   * `createAgent` used to read `args.name` and `args.description` off the
+   * request root and nothing else. The renderer sends `{ profile: {...} }` —
+   * the same shape `updateAgent` takes — so both reads were `undefined`, the
+   * store fell back to its own defaults, and a caller who passed
+   * `{name:"Acceptance Alpha",description:"acceptance run"}` got an agent named
+   * `Grok` with an empty description and no error anywhere. A create that
+   * discards the name it was given is indistinguishable from a create that was
+   * never asked for one, which is why this went unnoticed for as long as it did.
+   *
+   * Both shapes are accepted: the flat one (root fields) and the nested one
+   * (`profile`). The nested object wins only for the fields it actually
+   * carries, so a caller may send `{profile:{name}, description}` without
+   * losing the description. Anything that is neither object nor absent is
+   * ignored rather than passed down as `[object Object]`.
+   */
+  const createProfileFields = (args: any): Record<string, unknown> => {
+    const nested =
+      typeof args?.profile === "object" && args.profile !== null
+        ? args.profile
+        : {};
+    const fields: Record<string, unknown> = {};
+    for (const key of AGENT_PROFILE_CREATE_FIELDS) {
+      const value = nested[key] !== undefined ? nested[key] : args?.[key];
+      if (value !== undefined) fields[key] = value;
+    }
+    return fields;
+  };
+
   const mintAgent = async (args: any) => {
+    const fields = createProfileFields(args);
     const result = await method(manager, "createAgent")(
-      {
-        name: args.name,
-        description: args.description,
-        ...(args.title === undefined ? {} : { title: args.title }),
-        ...(args.avatarShape === undefined
-          ? {}
-          : { avatarShape: args.avatarShape }),
-        ...(args.avatarColor === undefined
-          ? {}
-          : { avatarColor: args.avatarColor })
-      },
+      fields,
       args.origin,
       {
         isIntroductionSuppressed: args.isIntroductionSuppressed ?? false,

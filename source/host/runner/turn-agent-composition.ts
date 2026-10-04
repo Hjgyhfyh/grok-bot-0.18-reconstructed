@@ -1733,7 +1733,8 @@ export const GENERAL_PURPOSE_SUBAGENT_TYPE_NAME = "generalPurpose";
  * Every entry is unconditional on purpose. `computerUse` and `browserUse` need
  * a monitor, which this box does not have — their tool factories are not even
  * present in the production toolset provider — so the honest list here is
- * `generalPurpose` alone, plus `executor` when multitask is on.
+ * `generalPurpose` alone, plus `executor` when multitask is on. Multitask ADDS
+ * the executor next to `generalPurpose`; it does not take its place.
  */
 export function buildSandSubagentConfigsForRun(input: {
   readonly isSubagentRunner: boolean;
@@ -1762,8 +1763,23 @@ export function buildSandSubagentConfigsForRun(input: {
     const generalPurposeIndex = configs.findIndex((config) =>
       isGeneralPurposeSubagentConfig(config, input.getSubagentTypeName));
     const executor = withPermissionMode(createSandExecutorSubagentConfig());
-    if (generalPurposeIndex >= 0) configs.splice(generalPurposeIndex, 1, executor);
-    else configs.push(executor);
+    // The executor is ADDED NEXT TO generalPurpose, never in place of it.
+    //
+    // `splice(generalPurposeIndex, 1, executor)` is what this used to do, and it
+    // is why `subagent_type: "generalPurpose"` was refused by a live box while the
+    // Task schema still promised it: `sand_multitask` defaults to true
+    // (`experiment-config.gen.ts:135`), so the replacement ran on every turn and
+    // the only entry left was `executor`. The doc comment above already said
+    // "generalPurpose alone, PLUS executor when multitask is on"; the code did
+    // the other thing.
+    //
+    // Order still decides the default: `task-subagent-preparation.ts:493` and
+    // `buildTaskParametersSchema` both fall back to `configNames[0]`. When
+    // generalPurpose is present it stays at index 0, so a bare Task call keeps
+    // resolving to it; when it is somehow absent the executor takes index 0
+    // rather than the list ending on a type nothing defaults to.
+    if (generalPurposeIndex >= 0) configs.push(executor);
+    else configs.unshift(executor);
   }
   return configs;
 }

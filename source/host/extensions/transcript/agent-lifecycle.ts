@@ -18,6 +18,11 @@ import {
   introductionFailedTrayKey,
 } from "../../../shared/agents/onboarding.js";
 import { sandErrorDetail } from "../../ports/telemetry.js";
+import {
+  normalizeAgentInstructions,
+  readAgentInstructions,
+  writeAgentInstructions,
+} from "../../runner/system-prompt-assembly.js";
 import { SandAgentDb } from "../session/agent-db.js";
 import { checkpointSandAgentDb } from "../../storage/store-db.js";
 import { publishTranscriptMutation } from "../../transcript-mutation-events.js";
@@ -39,6 +44,29 @@ interface CreateOptions {
   isKickstartRequested?: boolean;
   isIntroductionSuppressed?: boolean;
   configureAgentDir?(dir: string): void;
+}
+
+/**
+ * Separates the instruction text from the rest of a create profile.
+ *
+ * The instruction does not belong to `profile.json` and cannot go into the
+ * store's `createSession`, which rebuilds the profile from the fields it knows:
+ * an unknown key handed to it is silently dropped, which is how a create that
+ * carried instructions used to succeed while producing an agent that had none.
+ * Anything that is not a plain object yields an empty instruction rather than a
+ * crash, because a malformed create profile has always been the caller's
+ * problem to report, not a reason to fail before the agent exists.
+ */
+function splitAgentInstructions(profile: unknown): {
+  instructions: string;
+  identity: Record<string, unknown>;
+} {
+  const source =
+    typeof profile === "object" && profile !== null && !Array.isArray(profile)
+      ? (profile as Record<string, unknown>)
+      : {};
+  const { instructions, ...identity } = source;
+  return { instructions: normalizeAgentInstructions(instructions), identity };
 }
 
 export class AgentLifecycle {
@@ -68,8 +96,29 @@ export class AgentLifecycle {
     if (options.isKickstartRequested === true)
       void this.kickstartCreatedAgent(next.id);
     return {
-      agent: this.tm.roster.finalizeSummaryForRpc(summary, stamp),
+      agent: this.withAgentInstructions(
+        this.tm.roster.finalizeSummaryForRpc(summary, stamp),
+        next.id,
+      ),
       transcript: getTranscript(),
+    };
+  }
+
+  /**
+   * Puts the stored instruction text on the summary the caller gets back.
+   *
+   * `buildSummary` builds the agent record from `profile.json`, which by design
+   * carries no instructions, so without this the only way to read an agent's own
+   * brief back is to open its folder by hand. A field a caller can write but not
+   * read is a field nobody can check.
+   */
+  private withAgentInstructions(summary: any, agentId: string): any {
+    if (summary == null || typeof summary !== "object") return summary;
+    return {
+      ...(summary as Record<string, unknown>),
+      instructions: readAgentInstructions(
+        this.tm.sessionStore.getAgentDir(agentId),
+      ),
     };
   }
   async kickstartCreatedAgent(agentId: string): Promise<void> {
@@ -108,10 +157,19 @@ export class AgentLifecycle {
     origin: string,
     options: CreateOptions,
   ): Promise<any> {
+    const { instructions, identity } = splitAgentInstructions(profile);
     const session = await this.tm.sessionStore.createSession(
-      profile,
+      identity,
       origin,
       options.purpose,
+    );
+    // Written after the directory exists, and before the caller can run a turn,
+    // so the first turn of a brand new agent already carries its instructions.
+    // Over the ceiling this throws and no agent is returned: half an agent is
+    // worse than a refusal the user can act on.
+    writeAgentInstructions(
+      this.tm.sessionStore.getAgentDir(session.id),
+      instructions,
     );
     options.configureAgentDir?.(this.tm.sessionStore.getAgentDir(session.id));
     if (options.isIntroductionSuppressed !== true)
@@ -616,7 +674,15 @@ export class AgentLifecycle {
       throw new SandAgentLifecycleError(
         `Agent ${agentId} no longer exists on disk.`,
       );
+    // `undefined` means "this update says nothing about instructions" and the
+    // stored text is left alone. A string, including the empty one, is a
+    // decision: it is stored, or it clears the instruction file. The overload
+    // that silently drops the field is how an edit screen with an instruction
+    // box would leave the agent running its old brief with no error.
+    const hasInstructions =
+      typeof profile?.instructions === "string";
     const current = this.tm.sessionStore.getAgentProfileText(agentId);
+    const agentDir = this.tm.sessionStore.getAgentDir(agentId);
     const trimmed = {
       ...(avatarShape === undefined ? {} : { avatarShape }),
       ...(avatarColor === undefined ? {} : { avatarColor }),
@@ -624,6 +690,12 @@ export class AgentLifecycle {
       description: description ?? current?.description ?? "",
       ...(title === undefined ? {} : { title }),
     };
+    // Validated before any profile write, so an over-long instruction leaves
+    // the name and description exactly as they were instead of half-applying
+    // the update and then failing.
+    const instructions = hasInstructions
+      ? normalizeAgentInstructions(profile.instructions)
+      : undefined;
     const stamp = this.tm.roster.reserveSnapshotStamp();
     const active = this.tm.sessions.activeSession;
     const summary =
@@ -631,11 +703,15 @@ export class AgentLifecycle {
         ? (this.tm.sessionStore.writeAgentProfileFile(agentId, trimmed),
           await this.tm.sessionStore.summarizeOpenSession(active))
         : await this.tm.sessionStore.updateAgentProfile(agentId, trimmed);
+    if (instructions !== undefined)
+      writeAgentInstructions(agentDir, instructions);
     await this.tm.roster.emitAgentUpdate(agentId);
     this.tm.roster.emitProfileChanged(agentId);
-    return summary == null
-      ? null
-      : this.tm.roster.finalizeSummaryForRpc(summary, stamp);
+    if (summary == null) return null;
+    return this.tm.roster.finalizeSummaryForRpc(
+      this.withAgentInstructions(summary, agentId),
+      stamp,
+    );
   }
   async setAgentUnread(
     agentId: string,
