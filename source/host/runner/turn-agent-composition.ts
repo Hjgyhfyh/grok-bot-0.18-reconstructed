@@ -107,6 +107,7 @@ import type {
 } from "./subagent-runtime.js";
 import { SubagentRegistry, subagentRegistryResource } from "../../packages/agent/tools/subagent-registry.js";
 import {
+  AgentType,
   NoopDocumentationHydrationService,
   NoopWebScraperService,
 } from "../../packages/agent/utils/agent-config.js";
@@ -252,6 +253,30 @@ export function createSandTurnModelProjection(modelId: string) {
 }
 
 /**
+ * The one place that decides what kind of agent this turn is.
+ *
+ * `agentType` used to be the literal `"IDE"` for every runner, subagents
+ * included. `"IDE"` is not a member of the `AgentType` enum — the members are
+ * lowercase `"ide"`, `"cli"`, `"background"`, `"bugbot"` — so
+ * `parseAgentType` answered `undefined` for every turn this host ever ran, and
+ * every reader that keys on the real value (`isBackgroundAgent` in
+ * `create-shell-tool.ts`, the summarizer's transcript gate, the mode-change
+ * reminder in `mode-processing.ts`) was reading a field that could only be
+ * empty. A subagent therefore never reached the branch that says "nobody is
+ * watching this run, so do not stop to ask the user for permission".
+ *
+ * Both facts now come from this function: the static Agent config and the Shell
+ * tool options read the same answer, so the classifier cannot see a background
+ * agent in one place and an interactive one in the other.
+ */
+export function resolveSandAgentType(isSubagentRunner: boolean): AgentType {
+  // A Task subagent runs unattended. The user is not in the loop for it, so it
+  // must not reach an approval it can never receive — `isBackgroundAgent` turns
+  // the interactive Smart Mode classifier off for exactly this case.
+  return isSubagentRunner ? AgentType.BACKGROUND : AgentType.IDE;
+}
+
+/**
  * Builds the dependency-closed static Agent config portion of the immutable
  * buildAgentForRun owner. Dynamic host branches remain caller supplied.
  */
@@ -290,7 +315,7 @@ export function createSandAgentStaticConfig(
       rerenderUserInfoOnSummarization: true,
       skipPreTurnStateSnapshot: true,
     },
-    agentType: "IDE" as const,
+    agentType: resolveSandAgentType(input.isSubagentRunner),
     conversationId: input.conversationId,
     conversationGroupId: input.conversationId,
     ...(input.attachedMediaUrlProvider === undefined
@@ -339,6 +364,12 @@ export function createTurnAgentToolsHandoff(input: {
       ...input.turn,
       ...createTurnScopeToolHooks(input.turnScope),
     };
+  // The Shell tool reads `options.agentType` for `isBackgroundAgent`
+  // (`create-shell-tool.ts:391`), and nothing else in the host ever wrote it —
+  // so an unattended subagent was classified exactly like a turn with the user
+  // watching. Same resolver as the static Agent config, so the config and the
+  // tool cannot disagree about what kind of agent this is.
+  const agentType = resolveSandAgentType(input.toolHost.isSubagentRunner);
 
   const createPerTurnToolHost = (props: TurnToolsetBuildProps): TurnToolsetHost => {
     const resolvedShellAutoReview = turn.shellAutoReview === undefined
@@ -467,6 +498,7 @@ export function createTurnAgentToolsHandoff(input: {
                 resourceAccessor: currentProps.resourceAccessor as TurnShellToolFactoryInput["resourceAccessor"],
                 options: {
                 surface: "host_machine",
+                agentType,
                 toolName: SAND_EXTERNAL_SHELL_TOOL_NAME,
                 readToolIdentifier: "EXTERNAL_READ",
                 awaitToolIdentifier: "AWAIT",
@@ -500,6 +532,7 @@ export function createTurnAgentToolsHandoff(input: {
                 resourceAccessor: resourceAccessor as TurnShellToolFactoryInput["resourceAccessor"],
                 options: {
                 surface: "isolated_box",
+                agentType,
                 toolName: SAND_BOX_SHELL_TOOL_NAME,
                 awaitToolIdentifier: "BOX_AWAIT",
                 enableBlockUntilMs: true,
@@ -1366,6 +1399,13 @@ export interface TurnLocalResourceProjectionInput {
   readonly agentId: string;
   readonly now?: () => number;
   readonly mcp?: TurnMcpProjectionInput;
+  /**
+   * How deep the runner that owns this projection sits: 0 for the agent the user
+   * talks to, 1 for a Task subagent of it. It is what `SandSubagentHostAdapter`
+   * counts against `SAND_MAX_SUBAGENT_DEPTH`. Absent means 0, and the host's own
+   * `createSubagentRunner` guard (`scope.isSubagentRunner`) stays the live one.
+   */
+  readonly subagentDepth?: number;
 }
 
 export interface TurnSubagentLaunchReviewInput {
@@ -1584,6 +1624,10 @@ export function createTurnLocalResourceProjection(
     input.subagentSessions,
     input.createSubagentRunner,
     input.subagentDispatcher,
+    {
+      depth: input.subagentDepth ?? 0,
+      maxDepth: SAND_MAX_SUBAGENT_DEPTH,
+    },
   );
 
   const subagentExecutor = createSubagentExecutor(adapter);

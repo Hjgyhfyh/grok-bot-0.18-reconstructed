@@ -49,6 +49,7 @@ import type {
   InactiveTurnAgentStreamLifecycleInput,
   InactiveTurnAgentStreamStartInput,
 } from "./inactive-turn-agent-stream.js";
+import type { RetryPolicy } from "./transient-stream-error.js";
 
 export interface TurnAgentPromptSession {
   getModelId(): string;
@@ -353,6 +354,14 @@ export interface TurnRunOptions {
   /** The user's reactions to the agent's own messages, reported once each. */
   readonly userReactionNotices?: readonly string[];
   readonly autoReviewEpoch?: "continue" | "new";
+  /**
+   * The transient stream retry ladder this turn runs under. Absent means the
+   * shared overload policy (`resolveOverloadStreamRetryPolicy`). An automation
+   * supplies its own so its backoff and its `onRetry` log belong to it; before
+   * this field existed the policy was passed here and dropped on the floor,
+   * because nothing read it.
+   */
+  readonly transientStreamRetry?: RetryPolicy;
   readonly lineage?: {
     readonly parentRequestId: string;
     readonly rootParentRequestId: string;
@@ -372,7 +381,6 @@ export interface TurnRunContext {
   readonly privacyMode?: unknown;
   readonly inferenceSession?: TurnSession;
   readonly boxConnection?: unknown;
-  readonly mcpTools?: readonly unknown[];
 }
 
 export interface PreparedTurn {
@@ -424,13 +432,9 @@ export interface TurnRunShellHost {
   resolvePrivacyMode?(): Promise<unknown>;
   createInferenceSession?(context: TurnRunContext): Promise<TurnSession>;
   ensureBoxReady?(context: TurnRunContext): Promise<unknown>;
-  discoverMcpTools?(context: TurnRunContext): Promise<readonly unknown[]>;
-  refreshMcpAccountConfig?(): void;
   resolveMcpCustomInstructions?(): Promise<unknown>;
   setMcpDiscoveryUnavailableForTurn?(value: boolean): void;
-  setMcpConnectedServerNamesForTurn?(names: readonly string[]): void;
   setMcpCustomInstructionsForTurn?(instructions: unknown): void;
-  noteMcpToolDiscoveryFailed?(error: unknown): void;
   traceSendPhase?<T>(
     context: TurnRunContext,
     name: string,
@@ -671,26 +675,24 @@ export function createTurnRunShell(host: TurnRunShellHost) {
       }
 
       host.setMcpDiscoveryUnavailableForTurn?.(false);
-      if (host.discoverMcpTools != null) {
-        try {
-          const mcpTools = await host.discoverMcpTools(context);
-          context = { ...context, mcpTools };
-          host.setMcpConnectedServerNamesForTurn?.(
-            mcpTools.flatMap((tool) => {
-              if (
-                typeof tool !== "object"
-                || tool == null
-                || !("providerIdentifier" in tool)
-                || typeof tool.providerIdentifier !== "string"
-              ) return [];
-              return [tool.providerIdentifier];
-            }),
-          );
-        } catch (error) {
-          host.noteMcpToolDiscoveryFailed?.(error);
-        }
-        host.refreshMcpAccountConfig?.();
-      }
+      // MCP discovery is NOT here, and used to look like it was.
+      //
+      // `discoverMcpTools` was declared on this host, called from the block this
+      // comment replaces, and never assigned by ANY host — so the block never
+      // ran, `context.mcpTools` was always undefined, and the three hooks it fed
+      // (`refreshMcpAccountConfig`, `setMcpConnectedServerNamesForTurn`,
+      // `noteMcpToolDiscoveryFailed`) were unreachable too. It is the reason a
+      // hunt for "why do local MCP servers disappear" ended up reading this file
+      // instead of the real path.
+      //
+      // The single live path is the per-turn MCP provider:
+      // `TurnAgentMcpTurnProvider.getTools()` inside
+      // `createTurnAgentRunInputProjection` (turn-agent-composition.ts), reached
+      // from this shell through `prepareTurn` -> the production adapter's
+      // `createRunInput`. It owns discovery, the account-config refresh and the
+      // failure callback in one place. A second discovery pass here would be a
+      // second source of truth about which MCP tools the turn has, so the field
+      // is deleted rather than connected.
       if (host.resolveMcpCustomInstructions != null) {
         host.setMcpCustomInstructionsForTurn?.(
           await host.resolveMcpCustomInstructions(),
