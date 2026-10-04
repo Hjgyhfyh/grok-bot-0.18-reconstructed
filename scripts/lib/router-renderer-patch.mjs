@@ -45,6 +45,15 @@ const NOT_SIGNED_IN_CHIP_AFTER = 'name:e.kind==="logging-in"?"Signing in":"Local
 // to connect an account; with a custom endpoint that instruction is simply wrong.
 const NOT_SIGNED_IN_ROW_BEFORE = '(p="Not signed in",b="Connect your Cursor account to Grok Bot")';
 const NOT_SIGNED_IN_ROW_AFTER = '(p="Local",b="Using your own endpoint")';
+// The roster is fetched only when this mapper produces a non-empty account slot. Signed out it
+// produced null, so `roster.connect()` — the one and only caller of listAgents — never ran, and
+// the sidebar read "No saved agents yet." while the host sat there with a working local agent
+// store and a live coordinator. A local slot is what lets the roster load with no Cursor account.
+// It is a real string rather than a flag because the same value is what scopes settings and keys
+// account-scoped persistence; an empty slot would leave those unscoped rather than locally owned.
+// A signed-in account still wins: the `authId ?? email` branch is untouched.
+const ACCOUNT_SLOT_BEFORE = 'function dde(n){if(n.kind!=="logged-in")return null;const e=n.authId??n.email;return e==null||e.length===0?null:e}';
+const ACCOUNT_SLOT_AFTER = 'function dde(n){if(n.kind!=="logged-in")return "local";const e=n.authId??n.email;return e==null||e.length===0?"local":e}';
 export const COMPONENT_SOURCE = String.raw`
 const RRouterProviders=[
   {value:"cursor",label:"Cursor",description:"Use your signed-in Cursor account.",kind:"account"},
@@ -109,6 +118,10 @@ export function patchOriginalAccountRow(source) {
   return replaceExactlyOnce(source, NOT_SIGNED_IN_ROW_BEFORE, NOT_SIGNED_IN_ROW_AFTER, "account row label");
 }
 
+export function patchOriginalAccountSlot(source) {
+  return replaceExactlyOnce(source, ACCOUNT_SLOT_BEFORE, ACCOUNT_SLOT_AFTER, "account slot");
+}
+
 export async function applyOriginalRendererRouterPatch({ stageRoot }) {
   const assetsRoot = path.join(stageRoot, "dist", "renderer", "assets");
   const registryCandidates = [];
@@ -135,7 +148,7 @@ export async function applyOriginalRendererRouterPatch({ stageRoot }) {
   }
   const changes = [];
   for (const [role, candidate, transforms] of [
-    ["registry", registryCandidates[0], [patchOriginalSettingsRegistry, patchOriginalSignInGate]],
+    ["registry", registryCandidates[0], [patchOriginalSettingsRegistry, patchOriginalSignInGate, patchOriginalAccountSlot]],
     ["panel", panelCandidates[0], [patchOriginalSettingsPanel, patchOriginalAccountRow]],
   ]) {
     const patched = transforms.reduce((source, transform) => transform(source), candidate.source);
@@ -151,8 +164,8 @@ export async function applyOriginalRendererRouterPatch({ stageRoot }) {
     schemaVersion: 1,
     mode: "original-renderer-settings-extension",
     chunks: changes,
-    features: ["settings-router-provider", "settings-local-docker-vm", "usage-current-provider", "skip-signin-gate", "shell-during-boot-check", "no-account-nag"],
-    transformations: ["settings-registry", "router-panel", "usage-panel", "signin-gate", "boot-check-gate", "account-chip-label", "account-row-label"],
+    features: ["settings-router-provider", "settings-local-docker-vm", "usage-current-provider", "skip-signin-gate", "shell-during-boot-check", "no-account-nag", "local-roster-without-account", "endpoint-model-picker"],
+    transformations: ["settings-registry", "router-panel", "usage-panel", "component-source-injection", "signin-gate", "boot-check-gate", "account-chip-label", "account-row-label", "account-slot"],
   };
   const provenancePath = path.join(stageRoot, "dist", "renderer-router-extension.json");
   await writeFile(provenancePath, `${JSON.stringify(record, null, 2)}\n`);

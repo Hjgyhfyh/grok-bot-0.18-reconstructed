@@ -357,11 +357,19 @@ test("the local slot is still authorized and a host that refuses it launches not
       log.problems.some((problem) => problem.includes("not bound to this account")),
       `the refusal was not reported, got: ${log.problems.join(" | ")}`,
     );
-    assert.equal(settled.kind, REFUSED_STATUS.kind, "the runtime settled on a status it never observed");
-    assert.deepEqual(log.delivered, [REFUSED_STATUS], "the revoked status was never delivered to the renderer");
+    assert.deepEqual(settled, REFUSED_STATUS, "the runtime settled on something other than the revoked status");
+    // Startup settles the status without re-delivering it; delivery belongs to observe.
+    assert.deepEqual(log.delivered, [], "a startup refusal re-delivered a status the renderer never lost");
 
     await runtime.restart();
     assert.equal(log.sessions.length, 0, "restarting a refused local slot launched a coordinator behind the refusal");
+
+    // A later observation must not slip a coordinator past the very same refusal.
+    await runtime.observe({ kind: "logged-out" });
+    await runtime.whenIdle();
+    assert.equal(log.authorizations.length, 2, "the local slot was not re-authorized on the later observation");
+    assert.equal(log.sessions.length, 0, "a later observation launched a coordinator for a slot the host refuses");
+    assert.deepEqual(log.delivered, [REFUSED_STATUS], "the revoked status was never delivered to the renderer");
   } finally {
     await loaded.dispose();
   }
