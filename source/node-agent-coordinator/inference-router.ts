@@ -167,6 +167,9 @@ export function createCoordinatorInferenceRouter(options: {
     const tools = Array.isArray(directTools) ? directTools as Record<string, any>[] : undefined;
     const onTextDelta = (_delta: string, accumulated: string) => emitAssistant(accumulated, true);
     try { content = await runRoutedProviderText(provider, messages, bridge == null ? {
+      // The agent is the conversation here: its transcript is one continuous thread, and
+      // OpenCode Go routes and caches on a stable per-conversation id.
+      sessionId: agentId,
       ...(tools === undefined ? {} : { tools }),
       executeTool: async (definition, toolArgs, toolCallId) => await options.dispatchRemote("executeRoutedMcpTool", {
         providerIdentifier: definition.providerIdentifier,
@@ -177,7 +180,7 @@ export function createCoordinatorInferenceRouter(options: {
         agentId,
       }),
       onTextDelta,
-    } : { mcpServerUrl: bridge.url, onTextDelta }); }
+    } : { sessionId: agentId, mcpServerUrl: bridge.url, onTextDelta }); }
     finally { endActivity(); await bridge?.close(); }
     await append(agentId, [{ provider, role: "assistant", content, id: assistantId, timestampMs: assistantTimestampMs }]);
     emitAssistant(content, false);

@@ -7,6 +7,8 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { jsonSchema, streamText, tool, type CoreMessage, type LanguageModelV1, type ToolSet } from "ai";
 
 import { BasePromptBuilder, BasePromptExecutor } from "../../../packages/chat-inference/base.js";
+import { conversationIdKey } from "../../../packages/chat-inference-proto/client.js";
+import type { Context } from "../../../packages/context/core.js";
 import { isSandInferenceCustomEndpoint, type SandInferenceCustomEndpoint, type SandInferenceProvider } from "../../../shared/inference-router.js";
 import { resolveClaudeCodeCliPath } from "../../../shared/node/inference-router-local.js";
 import { getSandRootDir } from "../../host-paths.js";
@@ -61,6 +63,43 @@ function customEndpoint(): SandInferenceCustomEndpoint {
   const stored: unknown = new SandSettingsStore(join(getSandRootDir(), "settings.json")).getInferenceCustomEndpoint();
   if (!isSandInferenceCustomEndpoint(stored)) throw new Error("The custom endpoint is not configured. Set its base URL and model in Settings → Router.");
   return stored;
+}
+
+// OpenCode Go refuses every request that arrives without a session identity —
+// `Request is missing x-opencode-session and cannot be routed efficiently`. The burden is
+// explicitly the client's: "Send a stable session ID in `x-opencode-session` for each
+// conversation so we can optimize routing and prompt caching"
+// (https://opencode.ai/docs/go/#where-can-i-use-it). The docs prescribe no format, so the
+// value is the conversation's own id and nothing else: stability per conversation is the
+// whole requirement.
+const OPENCODE_SESSION_HEADER = "x-opencode-session";
+const OPENCODE_SESSION_HOST = "opencode.ai";
+
+let processScopedSessionId: string | undefined;
+
+// A caller that carries no conversation identity still needs one id for every request it
+// makes, so it falls back to an id that lives as long as this host process.
+function processSessionId(): string {
+  processScopedSessionId ??= crypto.randomUUID();
+  return processScopedSessionId;
+}
+
+function contextConversationId(ctx: unknown): string | undefined {
+  if (ctx == null || typeof (ctx as { get?: unknown }).get !== "function") return undefined;
+  try {
+    const value = (ctx as Context).get(conversationIdKey);
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+  } catch { return undefined; }
+}
+
+// The custom endpoint is whatever the user typed into Settings → Router. It can be any
+// OpenAI-compatible host, so an OpenCode-specific header must not ride along to an
+// unrelated one: only `opencode.ai` and its subdomains get it.
+function customEndpointHeaders(baseUrl: string, sessionId: string): Record<string, string> {
+  let hostname: string;
+  try { hostname = new URL(baseUrl).hostname.toLowerCase(); } catch { return {}; }
+  if (hostname !== OPENCODE_SESSION_HOST && !hostname.endsWith(`.${OPENCODE_SESSION_HOST}`)) return {};
+  return { [OPENCODE_SESSION_HEADER]: sessionId };
 }
 
 function providerPrompt(messages: readonly ProviderMessage[]): string {
@@ -269,9 +308,21 @@ function openRouterExecutor(messages: readonly ProviderMessage[], invocationId: 
   return { fullStream: result.fullStream, response: result.response, usage: result.usage, extendedUsage, providerMetadata: result.providerMetadata, invocationId: Promise.resolve(invocationId) };
 }
 
-function customExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void) {
+function customExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void, sessionId?: string) {
   const endpoint = customEndpoint();
-  const model: LanguageModelV1 = createOpenAI({ apiKey: customCredential(), baseURL: endpoint.baseUrl, compatibility: "compatible", name: "custom" }).chat(endpoint.modelId as any);
+  const model: LanguageModelV1 = createOpenAI({
+    apiKey: customCredential(),
+    baseURL: endpoint.baseUrl,
+    compatibility: "compatible",
+    name: "custom",
+    // `headers` on the provider instance is the layer that reaches the wire. `createOpenAI`
+    // folds it into `getHeaders()`, which the chat model passes to `postJsonToApi` as
+    // `combineHeaders(this.config.headers(), options.headers)` — the object sent on the POST
+    // to `/chat/completions`, for both `doGenerate` and the `doStream` this call uses. There
+    // is no `defaultHeaders` option in `@ai-sdk/openai` 1.3.24: that name belongs to the
+    // unrelated `openai` v4 SDK, and nothing in this repo uses it.
+    headers: customEndpointHeaders(endpoint.baseUrl, sessionId ?? processSessionId()),
+  }).chat(endpoint.modelId as any);
   const tools = toToolSet(definitions, executeTool);
   const result = streamText({ model, system: GROK_ROUTER_SYSTEM_PROMPT, messages: messages as CoreMessage[], ...(tools === undefined ? {} : { tools }), toolCallStreaming: true, maxSteps: tools === undefined ? 1 : 8 });
   const extendedUsage = result.usage.then(value => ({ inputTokens: value.promptTokens, outputTokens: value.completionTokens, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 0 }));
@@ -281,10 +332,12 @@ function customExecutor(messages: readonly ProviderMessage[], invocationId: stri
 
 class ProviderPromptExecutor extends BasePromptExecutor<ProviderMessage> {
   constructor(readonly provider: RoutedProvider, initialMessages?: readonly ProviderMessage[], readonly onUsage?: (usage: UsageRecord) => void) { super(new BasePromptBuilder(initialMessages)); }
-  stream(_ctx: unknown, invocationId = crypto.randomUUID(), definitions?: readonly Loose[]) {
+  stream(ctx: unknown, invocationId = crypto.randomUUID(), definitions?: readonly Loose[]) {
     if (this.provider === "codex") return codexExecutor(this.getMessages(), invocationId, definitions, undefined, this.onUsage);
     if (this.provider === "claude-code") return claudeExecutor(this.getMessages(), invocationId, this.onUsage);
-    if (this.provider === "custom") return customExecutor(this.getMessages(), invocationId, definitions, undefined, this.onUsage);
+    // Only the custom route asks for a session identity, and it takes the real conversation
+    // id off the turn context so the header survives every turn of the same conversation.
+    if (this.provider === "custom") return customExecutor(this.getMessages(), invocationId, definitions, undefined, this.onUsage, contextConversationId(ctx));
     return openRouterExecutor(this.getMessages(), invocationId, definitions, undefined, this.onUsage);
   }
 }
@@ -299,6 +352,8 @@ export async function runRoutedProviderText(provider: RoutedProvider, messages: 
   readonly tools?: readonly Loose[];
   readonly executeTool?: RoutedToolExecutor;
   readonly onTextDelta?: (delta: string, accumulated: string) => void;
+  /** The conversation this text belongs to. The custom endpoint reports it to OpenCode Go. */
+  readonly sessionId?: string;
 }): Promise<string> {
   const invocationId = crypto.randomUUID();
   const onUsage = (usage: UsageRecord) => recordRoutedUsage(provider, usage);
@@ -307,7 +362,7 @@ export async function runRoutedProviderText(provider: RoutedProvider, messages: 
     : provider === "claude-code"
       ? claudeExecutor(messages, invocationId, onUsage, options?.mcpServerUrl)
       : provider === "custom"
-        ? customExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage)
+        ? customExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage, options?.sessionId)
         : openRouterExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage);
   let text = "";
   for await (const event of result.fullStream) {

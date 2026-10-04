@@ -220,7 +220,7 @@ export const FLAGS = {
       // rebuild. Default OFF.
       sand_product_analytics: {
         client: true,
-        default: true
+        default: false
       },
       // The Sand host's pressure-triggered CPU flight recorder; read live per
       // pressure window, so this doubles as the kill switch. Knobs live in
@@ -248,13 +248,15 @@ export const FLAGS = {
       // are deleted once, keyed off a per-store version marker (see
       // SandAgentSessionStore.clearStaleCheckpointRootsOnce). Evaluated in the
       // Sand host via its SandExperimentService and pinned once at host startup
-      // (the SAND_STALE_ROOT_GC env var still overrides it, as a dev switch /
-      // kill switch). While OFF the cleanup does nothing and records no marker,
-      // so stores clean up on their first open after the gate reaches them.
-      // Default OFF.
+      // (there is deliberately no env override: clearStaleCheckpointRootsOnce
+      // reads the pinned module variable directly). While OFF the cleanup does
+      // nothing and records no marker, so stores clean up on their first open
+      // after the gate reaches them.
+      // Default ON: the cleanup is guarded by a write-generation and root-id
+      // check, runs at most once per store, and cannot throw.
       sand_stale_root_gc: {
         client: true,
-        default: false
+        default: true
       },
       // Per-user rollout of Sand's one-time retirement of the frozen legacy
       // conversation blobs in an existing agent's store.db. Conversation blobs are

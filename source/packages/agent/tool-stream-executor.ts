@@ -63,7 +63,11 @@ type StreamChunk =
   | { readonly type: "reasoning-signature"; readonly signature: string }
   | { readonly type: "tool-call-streaming-start"; readonly toolCallId: string; readonly toolName: string }
   | { readonly type: "tool-call-delta"; readonly toolCallId: string; readonly toolName: string; readonly argsTextDelta: string }
-  | { readonly type: "tool-call"; readonly toolCallId: string; readonly toolName: string; readonly args: unknown };
+  | { readonly type: "tool-call"; readonly toolCallId: string; readonly toolName: string; readonly args: unknown }
+  // A provider failure arrives as a single `error` part and then the stream ends. It must be part
+  // of this union: without it the collection loop below silently dropped it and went on to await
+  // a promise the SDK never settles, so a failing turn hung forever instead of reporting.
+  | { readonly type: "error"; readonly error: unknown };
 
 type AssistantContentPart =
   | { type: "text"; text: string }
@@ -1198,6 +1202,8 @@ function streamModelAndCollectToolCalls(
               currentToolCallId = undefined;
             }
           }
+        } else if (chunk.type === "error") {
+          throw chunk.error;
         }
       }
       closeCurrentStream();
@@ -1221,7 +1227,12 @@ function streamModelAndCollectToolCalls(
     } catch (error) {
       closeCurrentStream();
       closeToolIterables();
-      await settledResultResponse;
+      // `settledResultResponse` is deliberately NOT awaited here. It resolves off
+      // `result.response`, an AI SDK DelayedPromise that only settles in the stream's normal
+      // `flush`; a provider error ends the stream before that point, so awaiting it here is
+      // precisely what left a failing turn hanging with no error and no assistant message.
+      // It is already `.then(onFulfilled, onRejected)`, so it needs no rejection handler.
+      void settledResultResponse;
       const messages: ModelResponse["messages"] = [{
         role: "assistant",
         content: sanitizeContentBufferForReplay(contentBuffer),
@@ -1242,24 +1253,35 @@ function streamModelAndCollectToolCalls(
     }
     return { ...response, messages: newMessages };
   })();
+  // `result.usage`, `result.extendedUsage` and `result.providerMetadata` are the same kind of
+  // never-settled-on-error promise as `result.response`, and callers do await them
+  // (prompt-suggestion-handler.ts:177, self-summary-handler.ts:213, summarization-handler.ts:210).
+  // Race each one against this function's own `responsePromise`, which always settles, so a
+  // provider error yields zero-usage telemetry instead of a second hang on the same turn.
+  const responseSettled = responsePromise.then(
+    () => undefined,
+    () => undefined,
+  );
+  const settledOrZeroUsage = <T>(value: Promise<T>, fallback: T) =>
+    Promise.race([value.catch(() => fallback), responseSettled.then(() => fallback)]);
   return {
     fullStream,
     toolCalls: toolCallsIterable,
     toolCallEvents: toolCallEventsIterable,
     response: responsePromise,
-    usage: result.usage.catch(() => ({
+    usage: settledOrZeroUsage(result.usage, {
       totalTokens: 0,
       promptTokens: 0,
       completionTokens: 0,
-    })),
-    extendedUsage: result.extendedUsage.catch(() => ({
+    }),
+    extendedUsage: settledOrZeroUsage(result.extendedUsage, {
       inputTokens: 0,
       outputTokens: 0,
       cacheReadTokens: 0,
       cacheWriteTokens: 0,
       maxTokens: 0,
-    })),
-    providerMetadata: result.providerMetadata.catch(() => undefined),
+    }),
+    providerMetadata: settledOrZeroUsage(result.providerMetadata, undefined as unknown),
     invocationId: result.invocationId,
   };
 }

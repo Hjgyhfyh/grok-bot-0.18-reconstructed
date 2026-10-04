@@ -123,7 +123,7 @@ export function createMainEdgeHandlers(deps: MainEdgeDeps): HandlerMap {
     getHostSidebarSections: async () => (await deps.readHostSettingsFromBox()).sidebarSections ?? null,
     setHostSidebarSections: (raw) => echo(deps, "sidebarSections", req(raw).sections, "sidebar sections"),
     getAvailableModels: () => deps.fetchAvailableModels(),
-    getInferenceRouter: async () => { const settings = await deps.readHostSettingsFromBox().catch(() => ({} as UnknownRecord)); const provider = invoke(deps.settingsStore, "getInferenceProvider"); return { provider: isSandInferenceProvider(provider) ? provider : "cursor", usage: settings.inferenceRouterUsage ?? invoke(deps.settingsStore, "getInferenceRouterUsage") ?? null, endpoint: invoke(deps.settingsStore, "getInferenceCustomEndpoint") ?? null, local: getLocalInferenceCliStatus() }; },
+    getInferenceRouter: async () => { const settings = await deps.readHostSettingsFromBox().catch(() => ({} as UnknownRecord)); const provider = invoke(deps.settingsStore, "getInferenceProvider"); return { provider: isSandInferenceProvider(provider) ? provider : "custom", usage: settings.inferenceRouterUsage ?? invoke(deps.settingsStore, "getInferenceRouterUsage") ?? null, endpoint: invoke(deps.settingsStore, "getInferenceCustomEndpoint") ?? null, local: getLocalInferenceCliStatus() }; },
     listInferenceRouterModels: async (raw) => await listSandEndpointModels({ baseUrl: req(raw).baseUrl, apiKey: await storedCustomEndpointApiKey(deps) }),
     // The routing decision is made from the BOX copy of the settings
     // (`inference-router.ts` reads `getInferenceProvider()` on the host side),

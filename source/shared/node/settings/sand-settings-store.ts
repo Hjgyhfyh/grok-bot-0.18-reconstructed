@@ -14,7 +14,8 @@ import { DEFAULT_SAND_BOX_RUNTIME, isSandBoxRuntime, type SandBoxRuntime } from 
 
 export const SETTINGS_VERSION = 1;
 export const SAND_DOWNGRADE_MAX_FAST_MIGRATION_ID = "downgrade-persisted-max-fast";
-export const SAND_SETTINGS_MIGRATION_IDS = [SAND_DOWNGRADE_MAX_FAST_MIGRATION_ID] as const;
+export const SAND_LOCAL_INFERENCE_PROVIDER_MIGRATION_ID = "local-inference-provider";
+export const SAND_SETTINGS_MIGRATION_IDS = [SAND_DOWNGRADE_MAX_FAST_MIGRATION_ID, SAND_LOCAL_INFERENCE_PROVIDER_MIGRATION_ID] as const;
 
 type StringMap = Record<string, string>;
 type StringListMap = Record<string, string[]>;
@@ -99,8 +100,14 @@ export class SandSettingsStore {
     catch { return emptySettings(); }
   }
   private applyPendingMigrations(settings: SandStoredSettings): SandStoredSettings {
-    if (settings.settingsMigrations.includes(SAND_DOWNGRADE_MAX_FAST_MIGRATION_ID)) return settings;
-    const migrated = { ...settings, settingsMigrations: [...settings.settingsMigrations, SAND_DOWNGRADE_MAX_FAST_MIGRATION_ID], ...(settings.agentDefaultModel === undefined ? {} : { agentDefaultModel: downgradePersistedFast(settings.agentDefaultModel) }) };
+    const done = new Set(settings.settingsMigrations);
+    const pending: string[] = []; let next = settings;
+    // The early return this replaced only ever checked the first id, so a second
+    // migration would have been unreachable on every already-migrated file.
+    if (!done.has(SAND_DOWNGRADE_MAX_FAST_MIGRATION_ID)) { pending.push(SAND_DOWNGRADE_MAX_FAST_MIGRATION_ID); next = { ...next, ...(next.agentDefaultModel === undefined ? {} : { agentDefaultModel: downgradePersistedFast(next.agentDefaultModel) }) }; }
+    if (!done.has(SAND_LOCAL_INFERENCE_PROVIDER_MIGRATION_ID)) { pending.push(SAND_LOCAL_INFERENCE_PROVIDER_MIGRATION_ID); next = { ...next, inferenceProvider: next.inferenceProvider ?? "custom" }; }
+    if (pending.length === 0) return settings;
+    const migrated = { ...next, settingsMigrations: [...settings.settingsMigrations, ...pending] };
     try { this.persist(migrated); } catch {}
     return migrated;
   }
@@ -156,7 +163,10 @@ export class SandSettingsStore {
   getLocalToolPermissionChoice(): SandLocalToolPermission { return this.load().localToolPermission ?? SAND_DEFAULT_LOCAL_TOOL_PERMISSION; }
   getLocalToolPermissionCeiling(): SandLocalToolPermission | undefined { return this.load().localToolPermissionCeiling; }
   setLocalToolPermission(value: SandLocalToolPermission): void { this.update((s) => ({ ...s, localToolPermission: value })); }
-  getInferenceProvider(): SandInferenceProvider { return this.load().inferenceProvider ?? "cursor"; }
+  // The bundled default is the user's own endpoint. There is no account here to
+  // serve the "cursor" provider, so defaulting to it routed every turn into a
+  // provider that can never answer.
+  getInferenceProvider(): SandInferenceProvider { return this.load().inferenceProvider ?? "custom"; }
   setInferenceProvider(value: SandInferenceProvider): void { this.update((s) => ({ ...s, inferenceProvider: value })); }
   getInferenceCustomEndpoint(): SandInferenceCustomEndpoint | undefined { return this.load().inferenceCustomEndpoint; }
   setInferenceCustomEndpoint(value: SandInferenceCustomEndpoint | undefined): void { this.update((s) => { const { inferenceCustomEndpoint: _old, ...rest } = s; return value === undefined ? rest : { ...rest, inferenceCustomEndpoint: value }; }); }

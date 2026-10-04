@@ -12,7 +12,11 @@ import {
   type NamedActivityHoldState,
 } from "../../sand-activity.js";
 import { SandRunScheduler, type RunLane } from "./run-scheduler.js";
-import type { TranscriptManagerLike } from "./transcript-hub.js";
+import {
+  realClock,
+  type Disposable,
+  type TranscriptManagerLike,
+} from "./transcript-hub.js";
 
 export function isRunSchedulerDisabled(): boolean {
   return process.env.SAND_DISABLE_RUN_SCHEDULER === "1";
@@ -25,6 +29,17 @@ export function envPositiveInt(name: string, fallback: number): number {
 }
 export const RUN_WATCHDOG_DEFAULT_MS = 120_000;
 export const RUN_WATCHDOG_GRACE_DEFAULT_MS = 30_000;
+/**
+ * Upper bound on how long a single run window may hold the host's busy state.
+ *
+ * The run-queue watchdog cannot cover this: `SandRunScheduler.armWatchdog()`
+ * returns early unless a user task is queued behind the active run, so a run
+ * that wedges with nothing queued behind it is never watched at all. The host
+ * must therefore bound the run window itself, because `inFlightRunCounts` is
+ * the only thing that makes `GET /health` report `isBusy`.
+ */
+export const RUN_LEASE_DEFAULT_MS = 900_000;
+export const RUN_LEASE_GRACE_DEFAULT_MS = 30_000;
 
 export class RunLifecycle {
   readonly inFlightRunCounts = new Map<any, number>();
@@ -40,8 +55,18 @@ export class RunLifecycle {
   readonly lastRequestIdBySession = new Map<string, string>();
   readonly turnRequestIdsBySession = new Map<string, Set<string>>();
   readonly turnEndedSeqBySession = new Map<string, number>();
+  readonly runLeaseTimers = new Map<any, Disposable>();
+  readonly runLeaseGraceTimers = new Map<any, Disposable>();
+  readonly leaseReleasedWindows = new WeakMap<object, number>();
+  readonly runLeaseMs: number;
+  readonly runLeaseGraceMs: number;
 
   constructor(readonly tm: TranscriptManagerLike) {
+    this.runLeaseMs = envPositiveInt("SAND_RUN_LEASE_MS", RUN_LEASE_DEFAULT_MS);
+    this.runLeaseGraceMs = envPositiveInt(
+      "SAND_RUN_LEASE_GRACE_MS",
+      RUN_LEASE_GRACE_DEFAULT_MS,
+    );
     this.runScheduler = isRunSchedulerDisabled()
       ? null
       : new SandRunScheduler({
@@ -217,20 +242,105 @@ export class RunLifecycle {
     this.inFlightRunCounts.set(session, inFlight + 1);
     this.tm.sessions.liveSessions.set(session.id, session);
     this.activeRunSession = session;
+    if (inFlight === 0) this.armRunLease(session);
     void this.tm.roster.emitAgentUpdate(session.id);
   }
 
-  endSessionRun(session: any): void {
+  /**
+   * Bounds one run window. The lease outlives the caller only when the run never
+   * settles, which is exactly the case `endSessionRun` alone cannot cover.
+   */
+  private armRunLease(session: any): void {
+    this.cancelRunLease(session);
+    this.runLeaseTimers.set(
+      session,
+      realClock.schedule(this.runLeaseMs, () => {
+        this.runLeaseTimers.delete(session);
+        this.onRunLeaseExpired(session);
+      }),
+    );
+  }
+
+  private cancelRunLease(session: any): void {
+    this.runLeaseTimers.get(session)?.dispose();
+    this.runLeaseTimers.delete(session);
+    this.runLeaseGraceTimers.get(session)?.dispose();
+    this.runLeaseGraceTimers.delete(session);
+  }
+
+  private onRunLeaseExpired(session: any): void {
+    if (!this.inFlightRunCounts.has(session)) return;
+    const windows = this.inFlightRunCounts.get(session) ?? 1;
+    let interrupted = false;
+    try {
+      interrupted =
+        this.tm.runnerRegistry.interruptWedgedRunForWatchdog(session.id) ===
+        true;
+    } catch {}
+    try {
+      this.tm.telemetry.reportTurnInterrupt({
+        conversationId: session.id,
+        reason: "run_lease_expired",
+        hadActiveRun: interrupted,
+        wasInFlight: true,
+        runWindowMs: Date.now() - (this.runWindowStartedAt.get(session) ?? Date.now()),
+        runWindows: windows,
+      });
+    } catch {}
+    this.runLeaseGraceTimers.set(
+      session,
+      realClock.schedule(this.runLeaseGraceMs, () => {
+        this.runLeaseGraceTimers.delete(session);
+        this.releaseExpiredRunWindow(session);
+      }),
+    );
+  }
+
+  /**
+   * Drops a run window whose turn neither settled nor threw. The late
+   * `endSessionRun` from the abandoned turn is swallowed by
+   * `leaseReleasedWindows`, so the release cannot be undone by the very task it
+   * replaces, and a later turn on the same session keeps its own accounting.
+   */
+  private releaseExpiredRunWindow(session: any): void {
+    const windows = this.inFlightRunCounts.get(session);
+    if (windows == null) return;
+    this.inFlightRunCounts.delete(session);
+    this.leaseReleasedWindows.set(session, windows);
+    this.cancelRunLease(session);
+    this.clearRunWindowFlags(session);
+    this.finishRunWindow(session);
+  }
+
+  private consumeLeaseReleasedWindow(session: any): boolean {
+    const pending = this.leaseReleasedWindows.get(session);
+    if (pending == null) return false;
+    if (pending > 1) this.leaseReleasedWindows.set(session, pending - 1);
+    else this.leaseReleasedWindows.delete(session);
+    return true;
+  }
+
+  private clearRunWindowFlags(session: any): void {
     this.setSessionComposing(session.id, false);
     this.setSessionRetrying(session.id, false);
     this.setSessionActivity(session.id, undefined);
     this.sessionActivityHolds.delete(session.id);
+  }
+
+  endSessionRun(session: any): void {
+    if (this.consumeLeaseReleasedWindow(session)) return;
+    this.clearRunWindowFlags(session);
     const remaining = (this.inFlightRunCounts.get(session) ?? 1) - 1;
     if (remaining > 0) {
       this.inFlightRunCounts.set(session, remaining);
       return;
     }
+    this.finishRunWindow(session);
+  }
+
+  private finishRunWindow(session: any): void {
     this.inFlightRunCounts.delete(session);
+    this.cancelRunLease(session);
     this.recordTurnCompleted(session);
     this.tm.turnRuntime.activeRequestPrompts.delete(session.id);
     this.tm.turnRuntime.activeRequestSources.delete(session.id);

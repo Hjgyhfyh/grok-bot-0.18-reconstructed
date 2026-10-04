@@ -519,7 +519,13 @@ test("the injected panel source executes and exposes its router components", () 
   assert.equal(typeof panels.RRouterCredential, "function");
   assert.deepEqual(
     Array.from(panels.RRouterProviders, provider => provider.value),
-    ["cursor", "claude-code", "codex", "openrouter", "custom"],
+    ["claude-code", "codex", "openrouter", "custom"],
+    "the Cursor provider is gone: no entry may route a turn into an account-backed provider that cannot answer",
+  );
+  assert.equal(
+    panels.RRouterProviders.some(provider => provider.kind === "account"),
+    false,
+    "no provider may claim an account-backed credential now that the Cursor entry is removed",
   );
   assert.equal(panels.RRouterIsKeyed(panels.RRouterProviders.find(p => p.value === "custom")), true);
   assert.equal(panels.RRouterCredentialTitle(panels.RRouterProviders.find(p => p.value === "openrouter")), "OpenRouter account");

@@ -35,7 +35,13 @@ export class SandExperimentService {
   subscribe(listener: (snapshot: Snapshot) => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   getSnapshot(): Snapshot { return this.snapshot; }
   getFeatureGateProperty(name: FeatureFlagName): MutableGateProperty { let property = this.gateProperties.get(name); if (property == null) { property = new MutableGateProperty(this.checkFeatureGate(name)); this.gateProperties.set(name, property); } return property; }
-  pinGateOnAuthenticatedBootstrap(name: FeatureFlagName, pin: (value: boolean) => void): void { if (this.hasAuthenticatedNetworkBootstrap) { pin(this.checkFeatureGate(name)); return; } const unsubscribe = this.subscribe(() => { if (!this.hasAuthenticatedNetworkBootstrap) return; unsubscribe(); pin(this.checkFeatureGate(name)); }); }
+  // Pin the gate immediately from whatever is readable right now (the bundled
+  // default, a hydrated cache, or a live client) and then re-pin once an
+  // authenticated network bootstrap lands. Before this change the immediate pin
+  // did not exist: a signed-out host has no authenticated bootstrap, so the
+  // callback never fired and every gate pinned this way was dead forever. The
+  // late re-pin keeps the signed-in rollout working.
+  pinGateOnAuthenticatedBootstrap(name: FeatureFlagName, pin: (value: boolean) => void): void { if (this.hasAuthenticatedNetworkBootstrap) { pin(this.checkFeatureGate(name)); return; } const unsubscribe = this.subscribe(() => { if (!this.hasAuthenticatedNetworkBootstrap) return; unsubscribe(); pin(this.checkFeatureGate(name)); }); pin(this.checkFeatureGate(name)); }
   checkFeatureGate(name: FeatureFlagName): boolean { const local = this.overrideStore.read(name); if (local != null) return local; const environment = this.canUseFeatureFlagOverrides() ? envGateOverride(name, this.options.env) : undefined; if (environment != null) return environment; if (this.client == null) return FLAGS[name]?.default ?? false; try { return this.client.checkGate(name, READ_OPTIONS); } catch { return FLAGS[name]?.default ?? false; } }
   hasAuthenticatedStatsigBootstrap(): boolean { return this.hasAuthenticatedNetworkBootstrap; }
   hasLiveStatsigBootstrap(): boolean { return this.hasLiveNetworkBootstrap; }

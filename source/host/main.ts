@@ -271,6 +271,10 @@ export async function main(
     );
     void host.reportBoxReady();
   } catch (error) {
+    // The telemetry call below is the only thing that used to record this, so a
+    // host that died during startup exited 1 with nothing on stderr and no way
+    // to tell a failed network bootstrap from a bad setting. Print it first.
+    log.error("[sand-host] fatal startup failure:", error);
     host.reportProcessCrash(error, "fatal_startup");
     await host.flushTelemetryForFatalExit();
     await boxExecDaemon?.close().catch(closeError => host.reportProcessCrash(closeError, "box_exec_daemon_startup_cleanup"));
