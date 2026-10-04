@@ -24,6 +24,25 @@ export const BOX_BLOCKED_MAX_HOLD_MS = 15 * 60_000;
 export class SandBoxHostConnectError extends Error {}
 export class SandComputerRecreateRefusedError extends Error {}
 
+/**
+ * Name of the refusal `account/cursor-auth.ts` raises from `getValidAccessToken`
+ * when no account is signed in. The connector recognises it by name instead of
+ * importing the class: pulling `account/cursor-auth.ts` in here would drag the
+ * whole account service and its electron secret store into the box module graph.
+ * Renaming the class breaks `tests/local-box-connection.test.mjs`, which pins both
+ * halves against the real module.
+ */
+export const SIGN_IN_REQUIRED_ERROR_NAME = "SandAuthSignInRequiredError";
+
+/**
+ * A credential refusal is permanent. No retry, reconnect or reconnect-and-hope can
+ * mint a token, so it must reach the coordinator carrying an outcome the UI can
+ * name. The shared access-denied marker is that carrier: `classifyGatewayFetchFailure`
+ * maps it to `access_denied`, which `PERMANENT_REFUSAL_KINDS` already lists, so the
+ * roster read stops reporting "Can't reach your computer" and stops burning a retry.
+ */
+export const SIGN_IN_REQUIRED_ACCESS_DENIED_MESSAGE = `${GATEWAY_ACCESS_DENIED_MESSAGE_MARKER}: no signed-in account, so the box broker cannot be reached`;
+
 export interface BrokerBox { gatewayUrl: string; gatewayToken: string; networkToken: string; vncUrl: string; forkVncBaseUrl: string }
 export interface BrokerClient {
   ensureSandBox(request: PartialMessage<EnsureSandBoxRequest>): Promise<EnsureSandBoxResponse>;
@@ -71,6 +90,23 @@ function blockedError(info: SandBoxBlockedInfo, cause?: ConnectError): ConnectEr
   return new ConnectError(encodeSandBoxBlockedMessage(info), cause?.code ?? Code.ResourceExhausted, cause?.metadata, undefined, cause);
 }
 
+/**
+ * Walks the cause chain looking for the sign-in refusal. The transport interceptor
+ * calls `deps.getAccessToken` inside the request, so the refusal is whatever the
+ * credential dependency threw, wrapped or not.
+ */
+export function isSignInRequiredFailure(error: unknown): boolean {
+  const seen = new Set<object>();
+  let current = error;
+  while (current != null && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const node = current as { readonly name?: unknown; readonly constructor?: { readonly name?: unknown }; readonly cause?: unknown };
+    if (node.name === SIGN_IN_REQUIRED_ERROR_NAME || node.constructor?.name === SIGN_IN_REQUIRED_ERROR_NAME) return true;
+    current = node.cause;
+  }
+  return false;
+}
+
 export class BrokeredHostConnector {
   private blocked: { info: SandBoxBlockedInfo; untilMs: number } | undefined;
   private readonly client: BrokerClient;
@@ -91,6 +127,10 @@ export class BrokeredHostConnector {
       }
       if (error instanceof ConnectError && error.metadata.get(AUTOMATION_FAILURE_HINT_HEADER) === SAND_UPDATE_REQUIRED_HINT) this.updateSink?.noteBackendUpdateRequirement(true);
       if (error instanceof ConnectError && error.metadata.get(AUTOMATION_FAILURE_HINT_HEADER) == null && (error.code === Code.Unauthenticated || error.code === Code.PermissionDenied)) throw new ConnectError(GATEWAY_ACCESS_DENIED_MESSAGE_MARKER, error.code, error.metadata, undefined, error);
+      // Nobody is signed in, so the request never left this process. Reporting it
+      // raw would let `classifyGatewayFetchFailure` file it under `network`, and the
+      // sidebar would tell a signed-out user their computer is unreachable.
+      if (isSignInRequiredFailure(error)) throw new ConnectError(SIGN_IN_REQUIRED_ACCESS_DENIED_MESSAGE, Code.Unauthenticated, undefined, undefined, error);
       throw error;
     }
     this.blocked = undefined;
@@ -144,6 +184,21 @@ export class EnvDescriptorHostConnector {
     if (baseUrl == null || baseUrl.length === 0) throw new SandBoxHostConnectError(`${GATEWAY_URL_ENV} is not set`);
     return buildConnection(baseUrl, this.env[GATEWAY_TOKEN_ENV]?.trim() ?? "", this.env[GATEWAY_NETWORK_TOKEN_ENV]?.trim() ?? "");
   }
+  /**
+   * Both credentials are minted by the Cursor backend, not by the gateway this
+   * connector points at. An external host cannot mint either, so local exec and
+   * box-side inference stay off for that configuration.
+   *
+   * These methods must still exist. `adapters/coordinator-gateway.ts` calls
+   * `requireFunction(remote?.issueLocalExecDaemonCredential, ...)` while it builds
+   * the binding, before `createWindow()`, and a missing method there threw a
+   * wiring error that `main.ts` swallowed into telemetry — a headless process with
+   * no window and no visible error. Returning `undefined` is the honest answer:
+   * `coordinator-executors.mintLocalExecDaemonCredential` maps it to `null`, and
+   * `local-exec/supervisor.refreshCredential` returns without handing anything off.
+   */
+  async issueLocalExecDaemonCredential(): Promise<{ readonly credential: string; readonly backendUrl: string; readonly expiresAtMs?: number } | undefined> { return undefined; }
+  async issueInferenceCredential(): Promise<{ readonly accessToken: string; readonly backendUrl: string; readonly expiresAtMs: number } | undefined> { return undefined; }
 }
 
 export function createRemoteHostConnector(deps: BrokerDeps, env: NodeJS.ProcessEnv = process.env, updateSink?: { noteBackendUpdateRequirement(required: boolean): void }, descriptorFastPath?: { store: GatewayDescriptorStore; getAccountScope(): string | undefined }): SandRemoteHostConnector {

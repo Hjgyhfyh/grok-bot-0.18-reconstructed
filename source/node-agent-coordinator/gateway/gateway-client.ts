@@ -28,12 +28,48 @@ import {
   classifyBaseUrlKind,
   classifyGatewayError,
   classifyStreamDown,
-  outcomeForHttpStatus
+  outcomeForHttpStatus,
+  type GatewayFailureClassification
 } from "./gateway-reachability.js";
 import { SseBlockDecoder } from "./sse-block-decoder.js";
 
 export const PERMANENT_REFUSAL_KINDS = new Set(["no_storage", "box_blocked", "access_denied"]);
 export const PRE_DISPATCH_KINDS = new Set(["refused", "dns"]);
+
+/**
+ * Exact message of `SandAuthSignInRequiredError` in `account/cursor-auth.ts`.
+ * Nothing but the message survives the control port that carries a connector
+ * refusal from the main process into this one, so the message is the only signal
+ * left here. Changing it breaks `tests/local-box-connection.test.mjs`.
+ */
+export const SIGN_IN_REQUIRED_MESSAGE = "Sign in to Cursor to run Grok Bot.";
+export const CREDENTIALS_REFUSAL_CAUSE_SUMMARY = "credentials";
+
+function hasSignInRequiredMessage(error: unknown): boolean {
+  const seen = new Set<object>();
+  let current = error;
+  while (current != null && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const message = (current as { readonly message?: unknown }).message;
+    if (typeof message === "string" && message.includes(SIGN_IN_REQUIRED_MESSAGE)) return true;
+    current = (current as { readonly cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/**
+ * `classifyGatewayFetchFailure` has no marker to match on when the credential
+ * dependency refuses before a request is dispatched, so it falls through to
+ * `network` — a retryable outcome. Nothing about the next attempt can differ,
+ * because the next attempt has no token either. Reporting `access_denied` names
+ * the real cause, and `PERMANENT_REFUSAL_KINDS` then stops `boundedRosterRead`
+ * from spending a second attempt on it.
+ */
+export function classifyGatewayConnectFailure(error: unknown): GatewayFailureClassification & { httpStatus?: number } {
+  const classified = classifyGatewayError(error);
+  if (PERMANENT_REFUSAL_KINDS.has(classified.outcome) || !hasSignInRequiredMessage(error)) return classified;
+  return { outcome: "access_denied", causeSummary: CREDENTIALS_REFUSAL_CAUSE_SUMMARY };
+}
 export const CREATE_AGENT_RETRY_POLICY = { name: "gateway-create-agent-retry", maxAttempts: 3, initialDelayMs: 1_000, maxDelayMs: 4_000, backoffFactor: 2 } as const;
 export const SSE_RECONNECT_MIN_MS = 1_000;
 export const SSE_RECONNECT_MAX_MS = 10_000;
@@ -277,7 +313,7 @@ export class CoordinatorGatewayClient {
     } catch (error) {
       this.reportCommandSpan(method, commandTrace, { startEpochMs: fetchStartEpochMs, durationMs: this.options.timing.clock.monotonicNow() - fetchStartMonotonicMs, isError: true });
       if (error instanceof SandGatewayCommandError || error instanceof GatewayEndpointChangedError) throw error;
-      const classified = classifyGatewayError(error);
+      const classified = classifyGatewayConnectFailure(error);
       this.reportReachability({ outcome: classified.outcome, method, latencyMs: this.options.timing.clock.monotonicNow() - startMonotonicMs, baseUrlKind: classifyBaseUrlKind(connection?.baseUrl), ...(classified.httpStatus === undefined ? {} : { httpStatus: classified.httpStatus }), ...(classified.causeSummary === undefined ? {} : { causeSummary: classified.causeSummary }) }, connection?.baseUrl);
       if (error instanceof SandGatewayUnreachableError) throw error;
       const blocked = findSandBoxBlockedMessage(error);
