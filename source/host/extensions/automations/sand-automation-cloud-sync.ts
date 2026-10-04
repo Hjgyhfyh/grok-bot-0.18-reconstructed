@@ -339,6 +339,12 @@ interface UnknownSchedulingEvidence { readonly kind: "unknown" }
 type AnySchedulingEvidence = SchedulingEvidence | UnknownSchedulingEvidence;
 interface SchedulingAuthority { readonly desiredCloudAutomationIds: Set<string>; readonly enabledRemoteAutomationIds: Set<string> }
 
+/**
+ * What this sync can promise about scheduling right now. `error` means saved
+ * routines cannot fire at all; it never claims a schedule is armed.
+ */
+export interface CloudSchedulingStatus { readonly state: "idle" | "error"; readonly detail?: string }
+
 export class SandAutomationCloudSync {
   private inFlight: Promise<void> | undefined;
   private rerun = false;
@@ -347,6 +353,8 @@ export class SandAutomationCloudSync {
   private readonly lastNotifiedSchedulingAuthorityByAgent = new Map<string, SchedulingAuthority>();
   private readonly failedAgentIds = new Set<string>();
   private readonly pendingAgentDeletions = new Set<string>();
+  private routinesWaitingForCredential: number | undefined;
+  private notifiedCredentialGap: number | undefined;
   private settings: { getUserTimeZone: () => string | undefined };
 
   constructor(private readonly deps: {
@@ -371,9 +379,33 @@ export class SandAutomationCloudSync {
     if (!isServerSchedulable(automation)) return true;
     if (triggerListeners(automation.trigger).length === 0) return false;
     if (automation.id === undefined) return true;
+    // Without a connection `reconcile()` returns on its first line, so no
+    // evidence is ever published and every listener below would look
+    // server-owned. That dropped the listener, never called `source.start()`, and
+    // left the relay status at `{state:"idle"}` — a routine that looks configured
+    // and never listens. Nothing is enabled on the account side without a
+    // credential, so the local relay is the only candidate; letting it try means
+    // it reports its own auth failure as `state:"error"` with a detail instead
+    // of the whole path looking idle.
+    if (!this.deps.hasCredential()) return true;
     const evidence = this.schedulingEvidenceByAgent.get(agentId);
     if (evidence?.kind !== "known") return false;
     return !evidence.enabledRemoteAutomationIds.has(stableAutomationId({ agentId, localId: automation.id }));
+  }
+
+  /**
+   * What this sync can promise right now. It never claims a schedule is armed:
+   * only the Cursor account scheduler runs a time-based routine, and there is no
+   * local timer to fall back on. A missing credential with saved routines is an
+   * `error` with the reason, not `idle`.
+   */
+  getStatus(): CloudSchedulingStatus {
+    if (this.deps.hasCredential()) return { state: "idle" };
+    if (this.routinesWaitingForCredential === 0) return { state: "idle" };
+    return {
+      state: "error",
+      detail: `${this.routinesWaitingForCredential} routine(s) are saved, but nothing can fire them: schedules and event listeners are run by the user's Cursor account, and Grok Bot is not connected to one. Connect the Cursor account — until then no scheduled or event routine runs.`,
+    };
   }
 
   reconcileNow(): Promise<void> {
@@ -421,8 +453,33 @@ export class SandAutomationCloudSync {
     for (const agentId of [...this.pendingAgentDeletions]) await this.deleteAgent(agentId);
   }
 
+  /**
+   * Count the enabled routines that cannot run because there is no account
+   * connection. Reading them locally is the only thing that can be said about
+   * them, and it is what turns an unreachable scheduler from `idle` into an
+   * `error` the user can act on.
+   */
+  private async noteCredentialGap(): Promise<void> {
+    let waiting = 0;
+    try {
+      for (const { automation } of await this.deps.listAutomations())
+        if (automation.isEnabled) waiting += 1;
+    } catch {
+      // A local listing failure is reported by its own path; the gap stands.
+    }
+    this.routinesWaitingForCredential = waiting;
+    if (this.notifiedCredentialGap === waiting) return;
+    this.notifiedCredentialGap = waiting;
+    this.deps.reportDiagnostic?.({ extension: "automation_cloud_sync", operation: "credential_missing", errorType: "MissingCredential", waitingRoutineCount: waiting });
+  }
+
   private async reconcile(): Promise<void> {
-    if (!this.deps.hasCredential()) return;
+    if (!this.deps.hasCredential()) {
+      await this.noteCredentialGap();
+      return;
+    }
+    this.routinesWaitingForCredential = 0;
+    this.notifiedCredentialGap = undefined;
     await this.retryPendingAgentDeletions();
     let scheduled: readonly { agentId: string; automation: ScheduledCloudAutomation }[];
     try { scheduled = await this.deps.listAutomations(); } catch (error) { this.recordFailure({ operation: "list-local", error }); return; }

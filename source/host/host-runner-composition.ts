@@ -40,12 +40,14 @@ import {
   SAND_EXTERNAL_READ_TOOL_DESCRIPTION,
   SAND_BOX_READ_TOOL_DESCRIPTION,
   SAND_READ_FORMATTING_OPTIONS,
+  liveMcpToolsForTurn,
   type TurnToolsetHostFactoryProvider,
 } from "./runner/tools/turn-toolset.js";
 import type {
   TurnAwaitToolFactoryInput,
   TurnCloudAgentToolFactoryInput,
   TurnMcpManagementToolFactoryInput,
+  TurnMcpMetaToolFactoryInput,
   TurnReadToolFactoryInput,
   TurnWebFetchToolFactoryInput,
   TurnWebSearchToolFactoryInput,
@@ -74,8 +76,15 @@ import { CONNECTOR_MANIFESTS } from "../shared/channels.js";
 import { parseStoredTrigger } from "./automations/automation-trigger.js";
 import { listenerPlatformsInTrigger } from "./automations/listener-integrations.js";
 import { resolveSharedRoomBoxToolsEnabled } from "./groups/xuser.js";
-import { boxAgentWindowIndex, boxSupportsMultiWindow } from "./box/box-capabilities.js";
+import { boxAgentWindowIndex, boxIsPreparing, boxSupportsMultiWindow } from "./box/box-capabilities.js";
 import { createAutoReviewGate } from "./runner/auto-review-gate.js";
+import { reportHostDiagnostic } from "./host-diagnostics.js";
+import { errorLogTag } from "../shared/errors.js";
+import { boundedConnectorTag } from "../shared/observability/connector-auth-telemetry.js";
+import {
+  mcpErrorClassOf,
+  takeMcpExecErrorClass,
+} from "../shared/node/mcp/mcp-diagnostics.js";
 import {
   sandAutoReviewApprovalExpiryPolicy,
   SandAutoReviewController,
@@ -94,6 +103,9 @@ import { createStreamAttempt } from "./runner/stream-attempt.js";
 import {
   createTurnAgentRunStreamInput,
   createTurnAgentStreamStart,
+  buildSandSubagentConfigsForRun,
+  SAND_MAX_ACTIVE_SUBAGENTS,
+  SAND_MAX_SUBAGENT_DEPTH,
   type TurnLocalResourceProjectionInput,
 } from "./runner/turn-agent-composition.js";
 import {
@@ -115,9 +127,11 @@ import {
   createShellWatchReadAccessor,
   type ShellTerminalWatchHost,
 } from "./runner/shell-terminal-watch.js";
-import { DEFAULT_SAND_SYSTEM_PROMPT } from "./runner/system-prompt.js";
+import { DEFAULT_SAND_SYSTEM_PROMPT, buildSandSubagentSystemPrompt } from "./runner/system-prompt.js";
 import {
   createSystemPromptAssembly,
+  type MemoryPromptStore,
+  type MemorySnapshotStore,
   type PromptSnapshotStore,
 } from "./runner/system-prompt-assembly.js";
 import { PrivacyMode, type PrivacyMode as PrivacyModeValue } from "../packages/redaction/privacy-mode.js";
@@ -147,11 +161,14 @@ import type {
   TurnToolsetTurnInput,
 } from "./runner/tools/turn-toolset.js";
 import type { TurnCheckpoint, TurnSettleHost } from "./runner/turn-settle.js";
+import { isMemorableExchange } from "./runner/sand-memory.js";
 import type { TextExecutor } from "./runner/sand-memory.js";
 import type { RunnerPromptGlueOwner } from "./runner/runner-prompt-glue.js";
 import type { TransferBox } from "./box/box-transfer.js";
 import type { CapableBox } from "./box/box-capabilities.js";
-import type { UserComputerHandle } from "./runner/tools/sand-file-transfer-tools.js";
+import { isNoMonitorComputerUseExecutor } from "./ports/box.js";
+import { computerUseExecutorResource } from "../packages/agent-exec/computer-use.js";
+import type { UserComputerHandle, FileTransferController } from "./runner/tools/sand-file-transfer-tools.js";
 import type { AgentProfilePromptSnapshot } from "./runner/sand-agent-profile-prompt.js";
 import type {
   RunningSubagentInfo,
@@ -556,6 +573,54 @@ function asPromptUserComputers(value: unknown): RunnerPromptGlueOwner["userCompu
   };
 }
 
+/**
+ * Adapts the local-exec bridge's computer registry to the `FileTransferController`
+ * shape the shipped CopyToBox/CopyFromBox tools consume.
+ *
+ * The bridge answers two different shapes: `list()` rows carry
+ * `{ id, label, connected }`, and `resolve()` answers `{ id, label, box }` without
+ * the liveness flag. The tools need one row with both, so liveness is read from
+ * the same `list()` the bridge itself derives it from, and the box comes from
+ * `resolve()`. Neither half is synthesized here.
+ */
+function asFileTransferUserComputers(
+  value: unknown,
+): FileTransferController["userComputers"] | undefined {
+  if (typeof value !== "object" || value == null) return undefined;
+  const candidate = value as Record<string, unknown>;
+  const resolve = candidate.resolve;
+  const list = candidate.list;
+  if (typeof resolve !== "function" || typeof list !== "function") return undefined;
+  const listed = (): readonly { id: string; connected: boolean }[] => {
+    const rows = list.call(value);
+    if (!Array.isArray(rows)) return [];
+    return rows.flatMap(row => {
+      if (typeof row !== "object" || row == null) return [];
+      const id = Reflect.get(row, "id");
+      const connected = Reflect.get(row, "connected");
+      return typeof id === "string" && typeof connected === "boolean"
+        ? [{ id, connected }]
+        : [];
+    });
+  };
+  const handle = (id: string): UserComputerHandle | undefined => {
+    const live = listed().find(computer => computer.id === id);
+    if (live === undefined) return undefined;
+    return asUserComputer(resolve.call(value, id));
+  };
+  return {
+    resolve: (computerId) => {
+      if (computerId != null) return handle(computerId);
+      const active = listed().find(computer => computer.connected);
+      return active === undefined ? undefined : handle(active.id);
+    },
+    list: () => listed().flatMap(computer => {
+      const resolved = handle(computer.id);
+      return resolved === undefined ? [] : [{ ...resolved, connected: computer.connected }];
+    }),
+  };
+}
+
 function isGeneratedSelectedVideo(
   value: unknown,
 ): value is NonNullable<GeneratedTurnPromptOptions["selectedVideos"]>[number] {
@@ -676,6 +741,7 @@ function toGeneratedTurnPromptOptions(
     readonly appendReplyReminder?: boolean;
     readonly hidden?: boolean;
     readonly recentUserMessages?: readonly { readonly id: string; readonly text: string }[];
+    readonly userReactionNotices?: readonly string[];
   },
 ): GeneratedTurnPromptOptions {
   const selectedImages = options.selectedImages?.flatMap(image => {
@@ -703,6 +769,9 @@ function toGeneratedTurnPromptOptions(
     ...(options.appendReplyReminder === undefined ? {} : { appendReplyReminder: options.appendReplyReminder }),
     ...(options.hidden === undefined ? {} : { hidden: options.hidden }),
     ...(options.recentUserMessages === undefined ? {} : { recentUserMessages: options.recentUserMessages }),
+    // This is a whitelist, not a pass-through: an option missing here never
+    // reaches `assembleGeneratedTurnAction` and is dropped without a trace.
+    ...(options.userReactionNotices === undefined ? {} : { userReactionNotices: options.userReactionNotices }),
   };
 }
 
@@ -916,8 +985,53 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
     const cloudAgents = extensions.api("cloud-agents");
     const foreverBox = extensions.api("forever-box");
     const remoteBox = foreverBox.box as DynamicApi;
+    /** Tool names of the most recent turn built for this runner; empty at first. */
+    const lastTurnToolNames = new Set<string>();
+    /**
+     * Whether this box actually has a monitor.
+     *
+     * This used to be the literal `true` in four places, which is how the
+     * prompt came to promise a desktop the box cannot show: the reconstructed
+     * box installs `noMonitorComputerUseExecutor`
+     * (`box/generated-production.ts:225`), an executor whose only method throws
+     * `SandBoxNoMonitorAvailableError`. The honest predicate is the one the box
+     * itself answers — whether its computer-use executor is that throwing stub.
+     *
+     * Reading it needs a live connection, so the answer is cached by
+     * `probeBoxDesktop` (defined below, next to the accessor it reuses) and
+     * stays `false` until a turn has proven otherwise: a desktop section that
+     * turns out to be real costs one turn of omission, while promising a
+     * desktop that does not exist is the defect being fixed.
+     */
+    const boxDesktopProbe = { answer: false, started: false };
+    const boxHasMonitorDesktop = (): boolean => boxDesktopProbe.answer;
     const transcriptsDir = method(sessionApi, "transcriptsDir")?.() ??
       dirname(dirname(session.dbPath));
+
+    /**
+     * Builds the controller the shipped CopyToBox/CopyFromBox tools need, or
+     * undefined when either endpoint is missing.
+     *
+     * `agentBox` is the same box Shell and Read run in. `userComputers` is the
+     * same bridge ExternalShell runs on, so a file the model can read with
+     * ExternalRead is a file CopyToBox can pull. Both halves must be real
+     * ports: the tools copy bytes, and a half-wired controller would fail on
+     * the first call rather than at build time, so absence is decided here.
+     */
+    const createHostFileTransferController = (): FileTransferController | undefined => {
+      const agentBox = asCapableTransferBox(remoteBox);
+      const userComputers = asFileTransferUserComputers(localExec.userComputers);
+      if (agentBox === undefined || userComputers === undefined) return undefined;
+      return {
+        agentBox,
+        userComputers,
+        // The local bridge keys every read/write by computer, not by agent, so
+        // the conversation id is the honest identity on both ends of a transfer.
+        getComputerAgentId: () => session.id,
+        getBoxId: () => session.id,
+        isBoxPreparing: () => boxIsPreparing(agentBox, session.id),
+      };
+    };
 
     const actionAuditor = deps.decorateActionAuditor?.(
       extensions.api("action-audit"),
@@ -1276,7 +1390,7 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           box,
           remoteBox: remoteBoxForPrompt,
           userComputers,
-          remoteBoxHasDesktop: true,
+          remoteBoxHasDesktop: boxHasMonitorDesktop(),
           isSubagentRunner: false,
           isComputerUseSubagent: false,
           isBrowserUseSubagent: false,
@@ -1341,6 +1455,11 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
             ? overrides.systemPrompt
             : DEFAULT_SAND_SYSTEM_PROMPT,
           isSubagentRunner: false,
+          // The exact tool names the live turn carries. buildTurnTools reports
+          // them through the per-turn input, and the Agent renders the prompt
+          // from the handle it just built, so the prompt describes this turn
+          // and not the families the source tree happens to contain.
+          isToolAvailable: name => lastTurnToolNames.has(name),
           isSharedRoomRunner: isSharedRoomTurn,
           isSystemPromptOverridden: typeof overrides.systemPrompt === "string",
           agentProfileProvider: () => hooks.agentProfileProvider?.() ?? null,
@@ -1351,10 +1470,23 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
               : null;
           },
           compactionEpoch: () => 0,
-          memoryStore: () => null,
-          memorySnapshots: () => null,
-          userMemory: () => null,
-          projectMemory: () => null,
+          // These four were the literal `() => null`, which made the memory
+          // section unreachable in every prompt: the agent had a real
+          // `session.memory` on `runnerOptions` and could still not recall
+          // anything it had learned. The stores already built at
+          // `runnerOptions` are the same objects, so the prompt reads exactly
+          // what the turn would read.
+          memoryStore: () => session.memory as unknown as MemoryPromptStore,
+          memorySnapshots: () => session.db as unknown as MemorySnapshotStore,
+          userMemory: () => method(memory, "createUserMemory")?.({
+            agentId: session.id,
+            resolveAgentName: resolveAgentDisplayName,
+          }) ?? null,
+          projectMemory: () => method(memory, "createProjectMemory")?.({
+            agentDir: dirname(session.dbPath),
+            agentId: session.id,
+            resolveAgentName: resolveAgentDisplayName,
+          }) ?? null,
           isBoxScopedSubagent: () => false,
           requestContext: {
             resolve: () => {
@@ -1381,6 +1513,7 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           mcpManagement: () => mcp.management,
           isMcpMultiAccountEnabled: () => method(experiments, "isMcpMultiAccountEnabled")?.() ?? false,
           isCloudAgentsDisabledByTeam: () => method(experiments, "isCloudAgentsDisabledByTeam")?.() ?? false,
+          isReferenceDocsAvailable: () => false,
           mcpCustomInstructionsSection: () => productionPromptGlue?.getMcpCustomInstructionsSection() ?? null,
           mcpDiscoveryStatusSection: () => productionPromptGlue?.getMcpDiscoveryStatusSection() ?? null,
           remoteBoxSection: () => productionPromptGlue?.getRemoteBoxSection() ?? "",
@@ -1404,7 +1537,7 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           }),
       remoteBox,
       userComputers: localExec.userComputers,
-      remoteBoxHasDesktop: true,
+      remoteBoxHasDesktop: boxHasMonitorDesktop(),
       boxHandoff: {
         requestHelp: (request: unknown) =>
           method(extensions.api("session"), "startHandoff")?.(request)
@@ -1523,6 +1656,19 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
       remoteBox as unknown as ProductionBoxResourceOwner,
       session.id,
     );
+    const probeBoxDesktop = (context: unknown): void => {
+      if (boxDesktopProbe.started) return;
+      boxDesktopProbe.started = true;
+      void baseProductionResourceAccessor(context)
+        .then(accessor => {
+          boxDesktopProbe.answer = !isNoMonitorComputerUseExecutor(
+            accessor.get(computerUseExecutorResource),
+          );
+        })
+        .catch(() => {
+          // No connection means no reachable desktop; the answer stays `false`.
+        });
+    };
     const productionResourceAccessor = async (
       context: unknown,
     ): Promise<ProductionResourceAccessor> => {
@@ -1558,7 +1704,7 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
       };
       const accessor = createRemoteBoxResourceAccessor({
         remoteBox: owner,
-        remoteBoxHasDesktop: true,
+        remoteBoxHasDesktop: boxHasMonitorDesktop(),
         resolveBoxId: () => session.id,
         getConversationId: () => session.id,
         setRemoteBoxTerminalsFolder: folder => runner.setRemoteBoxTerminalsFolder?.(folder),
@@ -1672,6 +1818,12 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
         conversationSizeGuard: () =>
           sessionApi.store?.ensureConversationCapacityForTurn?.(session),
         memoryStore: session.memory,
+        // `isMemorableExchange` was never passed, so `turn-settle.ts:354` always
+        // saw `undefined` and refused to write memory for any exchange. The gate
+        // itself is unchanged — `sand_memory_dreaming` is still not enabled; what
+        // changed is that the predicate the settle host already asks for is
+        // actually supplied.
+        isMemorableExchange: isMemorableExchange,
         userMemory: method(memory, "createUserMemory")?.({
           agentId: session.id,
           resolveAgentName: resolveAgentDisplayName
@@ -2024,6 +2176,7 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
     ): TurnToolsetHostFactoryProvider => {
       const cloudAgent = dependencies.cloudAgent;
       const mcpManagement = dependencies.mcpManagement;
+      const fileTransferController = createHostFileTransferController();
       const provider: TurnToolsetHostFactoryProvider = {
       createSendMessageToolInputs: turn => ({
         dependencies: turn.emitUpdate === undefined
@@ -2165,6 +2318,37 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           },
               }),
             }),
+        ...(fileTransferController === undefined
+          ? {}
+          : {
+              // CopyToBox/CopyFromBox move bytes between this agent's box and a
+              // connected computer. Both endpoints are live ports already: the
+              // box through remoteBox, the computer through the same local-exec
+              // bridge ExternalShell runs on.
+              createFileTransferToolInputs: () => ({
+                controller: fileTransferController,
+              }),
+            }),
+        ...(dependencies.subagentManagement === undefined
+          ? {}
+          : {
+              createSubagentManagementToolInputs: () => ({
+                controller: dependencies.subagentManagement as SubagentManagementController,
+              }),
+            }),
+        ...(method(mcp.mcp, "getTools") === undefined
+          ? {}
+          : {
+              // GetMcpTools/CallMcpTool. The descriptor source is the Agent's
+              // own per-turn snapshot, the only synchronous truth about what this
+              // turn can reach. An empty one keeps the pair absent instead of
+              // offering a tool whose only answer is "nothing here".
+              createMcpMetaToolInputs: (_turn, props): TurnMcpMetaToolFactoryInput => ({
+                resourceAccessor: props.resourceAccessor as TurnMcpMetaToolFactoryInput["resourceAccessor"],
+                getMcpTools: () => liveMcpToolsForTurn(_turn, props),
+                callOptions: {},
+              }),
+            }),
         ...(!isSharedRoomTurn && cloudAgent !== undefined
           ? {
               createCloudAgentToolInputs: (): TurnCloudAgentToolFactoryInput => ({
@@ -2300,21 +2484,42 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
         cloudAgent: "off",
         subagentLaunch: "off",
       };
+      /** Agents of this runner that have a turn in flight right now. */
+      const liveSubagents = new Set<string>();
+      // `subagentConfigs` used to be the literal `[]` and the Task tool was
+      // offered anyway, so every call died in `task-subagent-preparation.ts:494`
+      // with `ToolCallArgParseError("No subagent types are available.")`. It is a
+      // getter because the flags behind it (monitor, multitask, browserUse) are
+      // only known once the box connection and the experiment gates have been
+      // read, which happens after this object is built.
       const baseTurn: TurnToolsetTurnInput = {
         autoReviewModes,
-        subagentConfigs: [],
+        get subagentConfigs() {
+          return buildSandSubagentConfigsForRun({
+            isSubagentRunner: false,
+            remoteBoxHasDesktop: boxHasMonitorDesktop(),
+            remoteBoxAvailable: method(remoteBox, "isAvailable")?.() !== false,
+            browserUseSubagentEnabled: method(experiments, "isBrowserUseSubagentEnabled")?.() ?? false,
+            isSystemPromptOverridden: typeof overrides.systemPrompt === "string",
+            isMultitaskEnabled: method(experiments, "isMultitaskEnabled")?.() ?? false,
+          });
+        },
       };
       const staticModelId = process.env.SAND_AGENT_MODEL ?? DEFAULT_SAND_MODEL;
-      const lazyToolHost = () => createProductionTurnToolsetHost({
+      const lazyToolHost = (isSubagentRunner = false) => createProductionTurnToolsetHost({
         turn: baseTurn,
         factoryProvider: createTurnToolsetFactoryProvider(hostDependencies()),
-        isSubagentRunner: false,
+        // Hardcoded `false` before: the subagent's toolset was built as if it
+        // were the parent, so `buildTurnTools` offered it `Task` — and a
+        // subagent that could dispatch a Task had no session map to dispatch
+        // into, which is how nesting got past the depth limit.
+        isSubagentRunner,
         isSharedRoomRunner: isSharedRoomTurn,
         isBoxScopedSubagent: false,
         isComputerUseSubagent: false,
         isBrowserUseSubagent: false,
         isSystemPromptOverridden: typeof overrides.systemPrompt === "string",
-        remoteBoxHasDesktop: true,
+        remoteBoxHasDesktop: boxHasMonitorDesktop(),
         getConversationId: () => session.id,
         getRemoteBoxAvailable: () => method(remoteBox, "isAvailable")?.() !== false,
         cloudAgentsDisabledByTeam: () => method(experiments, "isCloudAgentsDisabledByTeam")?.() ?? false,
@@ -2339,7 +2544,21 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
         }
         throw new TypeError("production Agent conversation state is not bound");
       };
-      runnerOptions.productionTurnRunShell = createProductionTurnRunShellHostInput({
+      // The run shell used to be built once, for the parent, and the child got
+      // `productionTurnRunShell: undefined`. `SandAgentRunner.run` then had
+      // neither a shell nor a `runStep`, returned `undefined`, and
+      // `createSubagentRunner` threw `TypeError("production subagent result is
+      // not bound")` on the first Task call — so a non-empty `subagentConfigs`
+      // would only have moved the failure. Building it per scope is what makes a
+      // subagent a real runner: its own agent id, its own empty subagent session
+      // map (a subagent cannot dispatch or manage siblings), and its own tool
+      // host with `isSubagentRunner: true`.
+      const buildProductionTurnRunShellInput = (scope: {
+        readonly agentId: string;
+        readonly isSubagentRunner: boolean;
+        readonly subagentType: string | undefined;
+      }): ReturnType<typeof createProductionTurnRunShellHostInput> =>
+      createProductionTurnRunShellHostInput({
         createAgentOwnerInput: ({ requestId, runOptions, context, cancelThisRun, emitUpdate }) => {
           if (session.agentStore == null || typeof session.agentStore.getBlobStore !== "function") {
             throw new TypeError("production Agent blob store is not bound");
@@ -2395,6 +2614,10 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
             ...baseTurn,
             emitUpdate,
             cancelThisRun,
+            onToolsetBuilt: toolNames => {
+              lastTurnToolNames.clear();
+              for (const name of toolNames) lastTurnToolNames.add(name);
+            },
             ...(runOptions.ackToken === undefined
               ? {}
               : { ackToken: runOptions.ackToken }),
@@ -2413,11 +2636,11 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           };
           return {
             context,
-            conversationId: session.id,
+            conversationId: scope.agentId,
             requestId,
             inference: createTypedInferenceOwner(extensions.api("inference").port),
             onRequestId: requestIdForwarder(hooks, "agent"),
-            isSubagentRunner: false,
+            isSubagentRunner: scope.isSubagentRunner,
             isSilenceAllowed: runOptions.isSilenceAllowed === true,
             ...(runOptions.ackToken === undefined
               ? {}
@@ -2442,6 +2665,30 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
                 agentId: string,
                 args: SubagentAdapterArgs,
               ): SubagentSession => {
+                // Depth 1 is the cap: a subagent gets its own run shell and its
+                // own tool host, but that host reports `isSubagentRunner: true`,
+                // so `buildTurnTools` never offers `Task` inside it. That is the
+                // whole depth limit — it needs no counter, and it cannot be
+                // bypassed by a subagent that tries to dispatch anyway.
+                if (scope.isSubagentRunner) {
+                  // `SAND_MAX_SUBAGENT_DEPTH` is 1, so any subagent runner is
+                  // already past the limit.
+                  throw new TypeError(
+                    `a subagent cannot spawn another subagent: nesting depth is limited to ${SAND_MAX_SUBAGENT_DEPTH}`,
+                  );
+                }
+                // Concurrency cap. Every live child holds a model stream, a
+                // transcript and a box connection, and nothing else in the
+                // process bounds the count: the Task tool would otherwise let a
+                // single turn open as many runners as it liked. Four is chosen
+                // because it is the point where "dispatch a few in parallel"
+                // stops being true — beyond it the dispatch is no longer
+                // parallel work, it is a fan-out with no owner waiting for it.
+                if (liveSubagents.size >= SAND_MAX_ACTIVE_SUBAGENTS) {
+                  throw new TypeError(
+                    `too many subagents are already running (limit ${SAND_MAX_ACTIVE_SUBAGENTS}): wait for one to finish before dispatching another`,
+                  );
+                }
                 const child = deps.buildRunner({
                   ...runnerOptions,
                   conversationId: agentId,
@@ -2453,22 +2700,31 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
                     summaryArchives: [],
                     turnTimings: [],
                   },
-                  productionTurnRunShell: undefined,
+                  productionTurnRunShell: buildProductionTurnRunShellInput({
+                    agentId,
+                    isSubagentRunner: true,
+                    subagentType: args.subagentType,
+                  }),
                 });
                 bindSessionOwnedRunner(child);
                 ownedRunners.add(child);
                 return {
                   run: async (prompt, options) => {
-                    const result = await child.run(prompt, options);
-                    if (typeof result !== "object" || result == null) {
-                      throw new TypeError("production subagent result is not bound");
+                    liveSubagents.add(agentId);
+                    try {
+                      const result = await child.run(prompt, options);
+                      if (typeof result !== "object" || result == null) {
+                        throw new TypeError("production subagent result is not bound");
+                      }
+                      const text = Reflect.get(result, "text");
+                      const aborted = Reflect.get(result, "aborted");
+                      if (typeof text !== "string" || typeof aborted !== "boolean") {
+                        throw new TypeError("production subagent result is not bound");
+                      }
+                      return { text, aborted };
+                    } finally {
+                      liveSubagents.delete(agentId);
                     }
-                    const text = Reflect.get(result, "text");
-                    const aborted = Reflect.get(result, "aborted");
-                    if (typeof text !== "string" || typeof aborted !== "boolean") {
-                      throw new TypeError("production subagent result is not bound");
-                    }
-                    return { text, aborted };
                   },
                   interrupt: reason => {
                     child.interrupt(reason);
@@ -2480,6 +2736,35 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
                 };
               };
               const computerUse = runner.computerUse;
+              // Without this projection the turn's resource accessor never
+              // registers mcpExecutorResource, so CallMcpTool would exist and
+              // fail every call on a missing-resource error. The executor and
+              // state executor come from the live MCP service; nothing here is
+              // synthesized for a server set that does not exist.
+              const mcpForTurn = method(mcp.mcp, "createExecutor") === undefined
+                ? undefined
+                : {
+                    createExecutor: (
+                      persistImage: unknown,
+                      spillLargeText: unknown,
+                      auditIdentity: { readonly agentId: string },
+                    ) => method(mcp.mcp, "createExecutor")!(
+                      persistImage,
+                      spillLargeText,
+                      auditIdentity,
+                    ),
+                    createStateExecutor: () =>
+                      method(mcp.mcp, "createStateExecutor")!(),
+                    ...(method(mcp.mcp, "resolveNeedsAuthSlot") === undefined
+                      ? {}
+                      : {
+                          resolveNeedsAuthSlot: async (
+                            providerIdentifier: string,
+                          ) => await method(mcp.mcp, "resolveNeedsAuthSlot")!(
+                            providerIdentifier,
+                          ),
+                        }),
+                  };
               return {
                 subagentSessions: runner.subagents.sessions,
                 createSubagentRunner,
@@ -2492,6 +2777,62 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
                   },
                   dispatch: input => runner.subagents.dispatchBackgroundSubagent(input),
                 },
+                ...(mcpForTurn === undefined
+                  ? {}
+                  : {
+                      mcp: {
+                        mcpForTurn,
+                        persistImage: hooks.persistImage,
+                        // The reconstructed host ships no result spiller; the
+                        // executor treats an absent spiller as "keep inline".
+                        textSpiller: undefined,
+                        isSubagentRunner: isSharedRoomTurn,
+                        beginObservation: args => {
+                          const startedAtMs = Date.now();
+                          return (errorClass?: string) => {
+                            method(analytics, "trackEvent")?.("sand.mcp.tool_call", {
+                              connector: args.connector,
+                              ...(args.requestId === undefined
+                                ? {}
+                                : { request_id: args.requestId }),
+                              duration_ms: Date.now() - startedAtMs,
+                              ...(errorClass === undefined
+                                ? {}
+                                : { error_class: errorClass }),
+                            });
+                          };
+                        },
+                        boundedConnectorTag,
+                        mcpErrorClassOf,
+                        takeMcpExecErrorClass,
+                        emitConnectorCard: emission => {
+                          const connector = emission.connector;
+                          if (connector == null) return;
+                          hooks.transport.onUpdate({
+                            type: "send-message",
+                            message: connectorCardEmissionToMessage({
+                              connector,
+                              serverId: emission.serverId,
+                              variant: emission.variant,
+                            }),
+                            timestampMs: Date.now(),
+                            ...(runOptions.ackToken === undefined
+                              ? {}
+                              : { ackToken: runOptions.ackToken }),
+                          });
+                        },
+                        cancelThisRun: reason => {
+                          runner?.interrupt?.(reason.reason);
+                        },
+                        reportDiagnostic: event => {
+                          reportHostDiagnostic({
+                            kind: event.kind,
+                            errorClass: event.errorClass,
+                          });
+                        },
+                        errorLogTag,
+                      },
+                    }),
                 requestContext: turnRequestContext,
                 includeTranscripts: !isSharedRoomTurn,
                 autoReviewEnforceEnabled: Object.values(autoReviewModes).includes("enforce"),
@@ -2504,23 +2845,32 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
                   assertNoPendingApproval: () => turnAutoReviewGate.assertNoPendingApproval(),
                 },
                 actionAuditor: projectedActionAuditor,
-                agentId: session.id,
+                agentId: scope.agentId,
               };
             },
             blobStore: getAgentBlobStore(
               session.agentStore as Parameters<typeof getAgentBlobStore>[0],
             ),
-            toolHost: lazyToolHost(),
+            toolHost: lazyToolHost(scope.isSubagentRunner),
             turn,
             staticConfig: {
               modelId: staticModelId,
               agentTokenLimit: 200_000,
-              conversationId: session.id,
+              conversationId: scope.agentId,
               isBoxScopedSubagent: false,
-              isSubagentRunner: false,
+              isSubagentRunner: scope.isSubagentRunner,
               isSharedRoomRunner: isSharedRoomTurn,
               sandSendMessageDeliveryOwed: method(experiments, "isSendMessageDeliveryOwedEnabled")?.() ?? false,
-              systemPromptGenerator: () => productionSystemPromptAssembly?.getSystemPrompt() ?? DEFAULT_SAND_SYSTEM_PROMPT,
+              // A subagent is not the user's agent. Handing it the parent's
+              // prompt taught it to SendMessage and to manage sibling subagents,
+              // which it has neither a channel nor a session map for; the
+              // dedicated subagent prompt says what it can actually do.
+              systemPromptGenerator: () => scope.isSubagentRunner
+                ? buildSandSubagentSystemPrompt({
+                    subagentType: scope.subagentType ?? "generalPurpose",
+                    readonly: false,
+                  })
+                : productionSystemPromptAssembly?.getSystemPrompt() ?? DEFAULT_SAND_SYSTEM_PROMPT,
             },
             emitUpdate,
             interactionObservers: {},
@@ -2555,9 +2905,9 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
         context: () => productionContext,
         createSettleHost: createProductionTurnSettleHost,
         profilePromptSnapshots: () => session.db,
-        isSubagentRunner: false,
+        isSubagentRunner: scope.isSubagentRunner,
         subagents: { sessions: new Map() },
-        getConversationId: () => session.id,
+        getConversationId: () => scope.agentId,
         runGeneration: () => (builtRunner as { currentRunGeneration?: number } | undefined)?.currentRunGeneration ?? 0,
         setActiveTurnRequestSource: () => {},
         beginAutoReviewUserMessageEpoch: () => {},
@@ -2570,6 +2920,15 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           ? {}
           : { lastReactionApplied: () => hooks.transport.lastReactionApplied?.() === true }),
         cancelThisRun: () => {},
+      });
+
+      // The parent's own shell. A subagent's shell is built inside a turn with
+      // its own scope, so assigning this after the builder keeps the two from
+      // reading each other half-built.
+      runnerOptions.productionTurnRunShell = buildProductionTurnRunShellInput({
+        agentId: session.id,
+        isSubagentRunner: false,
+        subagentType: undefined,
       });
     }
 

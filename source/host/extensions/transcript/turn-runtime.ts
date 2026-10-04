@@ -423,9 +423,12 @@ export class TurnRuntime {
       try {
         const unansweredPrompts =
           this.tm.widgetResponses.collectUnansweredQuestionPrompts(session);
+        const reactionNotices =
+          this.tm.widgetResponses.collectUserReactionNotices(session);
         const result = await runner.run(prompt, {
           ...options,
           ...unansweredPrompts,
+          ...reactionNotices,
           traceCtx: turnCtx,
           appendReplyReminder: true,
           requestSource: "turn",
@@ -814,7 +817,15 @@ export class TurnRuntime {
         const target = entries.find(
           (entry) => entry.id === update.messageAddress,
         );
-        if (target == null || !isUserMessageEntry(target)) return undefined;
+        if (target == null) return undefined;
+        // The agent may react on either side of its own conversation: the user's
+        // messages and its own sends. Accepting only user messages turned every
+        // reaction aimed at the agent's own message into a silent no-op — the
+        // tool reported success and no pill ever appeared, because the target was
+        // discarded here. Group rooms already allowed both sides
+        // (`applyGroupMemberReaction`), so this is the one-agent path catching up.
+        if (!isUserMessageEntry(target) && target.kind !== "send-message")
+          return undefined;
         const applied = this.tm.widgetResponses.applyReaction({
           session: reactSession,
           entryId: update.messageAddress,

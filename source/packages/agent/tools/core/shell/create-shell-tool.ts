@@ -51,6 +51,7 @@ import { AgentType } from "../../../utils/agent-config.js";
 import { loadSmartModeProjectPermissionsContext } from "../../../smart-mode-project-permissions.js";
 import { tryExtractSmartModeClassifierConversationContext } from "../../../smart-mode-classifier-context.js";
 import { executeSmartModeClassifierWithMeasurement } from "../../../utils/smart-mode-classifier-measurement.js";
+import { METADATA_MARKER as SMART_MODE_CLASSIFIER_FAILURE_METADATA_MARKER } from "../../../utils/smart-mode-classifier-error-metadata.js";
 import { delayDevSmartModeClassifierIfRequested, type OneShotState } from "../../dev-smart-mode-classifier-block.js";
 import { withToolExecutionTimeoutSuspended } from "../../tool-timeout-suspension.js";
 import type { ConversationStateHandle } from "../../../state.js";
@@ -335,13 +336,43 @@ function hashTargetEnrichment(value: unknown): string | undefined {
   return serialized === undefined ? undefined : createHash("sha256").update(serialized).digest("hex");
 }
 
+/**
+ * `unreviewed` is what the classifier produces when it could not be consulted at
+ * all. It is deliberately distinct from `block` (a decision) and from `reject`
+ * (a dead end): nothing has judged the command, so a human still has to.
+ */
 type ShellSmartModeDecision =
   | { readonly kind: "allow"; readonly enabled: boolean; readonly targetEnrichmentHash?: string }
   | { readonly kind: "block"; readonly reason: string; readonly proposedAllowRule?: string; readonly targetEnrichmentHash?: string }
+  | { readonly kind: "unreviewed"; readonly reason: string; readonly targetEnrichmentHash?: string }
   | { readonly kind: "reject"; readonly reason: string };
 
 const SMART_MODE_SHELL_BLOCK_REASON = "Blocked by Auto-review";
-const SMART_MODE_SHELL_CLASSIFIER_ERROR_REASON = "An error occured while classifying this action. Please review manually.";
+const SMART_MODE_SHELL_UNREVIEWED_PREFIX = "Auto-review could not run, so this command was not reviewed";
+
+/** One line, no newlines, bounded: the reason reaches both the approval card and the model. */
+function classifierFailureDetail(raw: string | undefined, fallback: string): string {
+  const withoutMetadata = (raw ?? "").split(SMART_MODE_CLASSIFIER_FAILURE_METADATA_MARKER)[0] ?? "";
+  const detail = withoutMetadata.replace(/\s+/g, " ").trim();
+  return detail.length === 0 ? fallback : detail.slice(0, 200);
+}
+
+/**
+ * Names the failure instead of repeating the provider's own message. A
+ * provider message can promise a self-healing that this host cannot deliver
+ * ("the computer renews this automatically, no desktop required"), and a false
+ * reassurance on an approval card is worse than a terse one.
+ */
+function classifierFailureFromError(error: unknown): string {
+  if (error instanceof Error === false) return typeof error;
+  const code = (error as { readonly code?: unknown }).code;
+  const name = error.name.length > 0 ? error.name : error.constructor?.name ?? "Error";
+  return typeof code === "string" && code.length > 0 ? `${name} (${code})` : name;
+}
+
+function unreviewedShellReason(detail: string): string {
+  return `${SMART_MODE_SHELL_UNREVIEWED_PREFIX}: ${detail}.`;
+}
 
 async function runShellSmartModeClassifier(
   ctx: Context,
@@ -443,7 +474,20 @@ async function runShellSmartModeClassifier(
     if (result.result.case === "success" && result.result.value.decision === SmartModeClassifierDecision.ALLOW) {
       return { kind: "allow", enabled: mode === "enforce", ...(targetEnrichmentHash === undefined ? {} : { targetEnrichmentHash }) };
     }
-    return { kind: "reject", reason: SMART_MODE_SHELL_CLASSIFIER_ERROR_REASON };
+    // A decision that is not ALLOW and not BLOCK is not a verdict. Reporting it
+    // as the generic "An error occured while classifying this action" told the
+    // user to review manually while offering no way to do so, and it fired for
+    // every command on a host whose classifier backend is structurally absent.
+    const detail = result.result.case === "error"
+      ? classifierFailureDetail(result.result.value.error, "the classifier reported an error")
+      : result.result.case === "success"
+        ? `the classifier returned no decision (${SmartModeClassifierDecision[result.result.value.decision] ?? String(result.result.value.decision)})`
+        : "the classifier returned no result";
+    return {
+      kind: "unreviewed",
+      reason: unreviewedShellReason(detail),
+      ...(targetEnrichmentHash === undefined ? {} : { targetEnrichmentHash }),
+    };
   };
 
   if (!enabled) {
@@ -456,7 +500,11 @@ async function runShellSmartModeClassifier(
     if (error instanceof Error && error.name === "AbortError") throw error;
     if (error instanceof ShellToolRejectedError) throw error;
     if (signal.aborted) throw new ToolCallAbortedError();
-    return { kind: "reject", reason: SMART_MODE_SHELL_CLASSIFIER_ERROR_REASON };
+    return {
+      kind: "unreviewed",
+      reason: unreviewedShellReason(classifierFailureFromError(error)),
+      ...(targetEnrichmentHash === undefined ? {} : { targetEnrichmentHash }),
+    };
   }
 }
 
@@ -611,9 +659,22 @@ export function createShellTool(resourceAccessor: ShellToolResourceAccessor, opt
     if (smartModeDecision.kind === "reject") throw new ShellToolRejectedError(command, workingDirectory, smartModeDecision.reason);
     let approvedShellBinding: { readonly executionStateIdentity?: string; readonly targetEnrichmentHash?: string } | undefined;
     let smartModeApprovalProviderApproved = false;
-    if (smartModeDecision.kind === "block") {
-      const approvalRequested = rawArgs.request_smart_mode_approval === true;
-      const approvalProvider = options.smartModeApprovalProvider;
+    const approvalProvider = options.smartModeApprovalProvider;
+    // An `unreviewed` verdict means the classifier was never consulted: it is a
+    // cloud RPC, so a host without an account cannot get one, and several
+    // surfaces bind no approval provider to ask on. Turning that into a
+    // rejection was a permanent denial, not a safety decision — it blocked
+    // every shell command forever, and Shell is the only tool in this product
+    // that writes a file, so the agent could not create, change or save
+    // anything. Nothing judged the command, so it runs and the ordinary
+    // permissions layer below still applies to it. A real `block` still blocks:
+    // that verdict did arrive.
+    const unreviewedWithoutApprovalChannel = smartModeDecision.kind === "unreviewed" && approvalProvider === undefined;
+    if ((smartModeDecision.kind === "block" || smartModeDecision.kind === "unreviewed") && !unreviewedWithoutApprovalChannel) {
+      // A block waits for the model to re-raise the exact command, because the
+      // model can see why it was blocked. An unreviewed command has no such
+      // reason to retry into existence, so the human is asked directly instead.
+      const approvalRequested = smartModeDecision.kind === "unreviewed" || rawArgs.request_smart_mode_approval === true;
       if (!approvalRequested || approvalProvider === undefined) {
         throw new ShellToolRejectedError(command, workingDirectory, smartModeDecision.reason);
       }
@@ -630,7 +691,7 @@ export function createShellTool(resourceAccessor: ShellToolResourceAccessor, opt
         ...(smartModeDecision.targetEnrichmentHash === undefined ? {} : { targetEnrichmentHash: smartModeDecision.targetEnrichmentHash }),
         blockReason: smartModeDecision.reason,
         ...(typeof rawArgs.description === "string" && rawArgs.description.trim().length > 0 ? { description: rawArgs.description.trim() } : typeof rawArgs.explanation === "string" && rawArgs.explanation.trim().length > 0 ? { description: rawArgs.explanation.trim() } : {}),
-        ...(smartModeDecision.proposedAllowRule === undefined ? {} : { proposedAllowRule: smartModeDecision.proposedAllowRule }),
+        ...("proposedAllowRule" in smartModeDecision && smartModeDecision.proposedAllowRule !== undefined ? { proposedAllowRule: smartModeDecision.proposedAllowRule } : {}),
       };
       const approval = await withToolExecutionTimeoutSuspended(ctx, () => approvalProvider.requestApproval({
         kind: "shell",

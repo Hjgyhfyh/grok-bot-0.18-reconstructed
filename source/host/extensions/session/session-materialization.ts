@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { readdir, rm, stat } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { getSandProfilePath, writeSandProfileFile, type SandAgentProfile } from "../../agents/agent-profile.js";
 import { getSandSettingsPath, writeSandSettingsFile } from "../../agents/settings-file.js";
 import { SandAgentDb } from "./agent-db.js";
-import { getAgentDbPath } from "./session-paths.js";
+import { getAgentDbPath, STORE_FILENAME } from "./session-paths.js";
+import { buildSummary, readDbExtras } from "./session-summaries.js";
 import { automationStoreForDbPath, channelStoreForDbPath, workflowStoreForDbPath } from "./session-store-factories.js";
 import type { AgentWorkerPool } from "../../agent-isolation/agent-worker-pool.js";
 
@@ -35,6 +37,10 @@ export interface MaterializationHost {
   getAgentDir(agentId: string): string;
   readActiveAgentId(): string | null;
   isVisibleAgent?(agentId: string): Promise<boolean>;
+  /** True while the host still holds the agent: an open session or a delete in flight. */
+  isAgentInUse?(agentId: string): boolean;
+  /** True when the memory extension has content stored for the agent directory. */
+  hasMemory?(agentDir: string): boolean;
   runMaintenance?(session: MaterializedSession): Promise<void>;
   report?(event: Record<string, unknown>): void;
 }
@@ -94,6 +100,45 @@ export class SandSessionMaterialization {
     } catch (error) { db.close(); throw error; }
   }
   async isAgentCapReached(): Promise<boolean> { if (await this.countOwnedAgents() < MAX_AGENTS_PER_USER) return false; await this.reclaimPrunedPlaceholders(); return await this.countOwnedAgents() >= MAX_AGENTS_PER_USER; }
-  async isPrunedPlaceholder(agentId: string): Promise<boolean> { try { await stat(getAgentDbPath(this.host.rootDir, agentId)); } catch { return false; } if (agentId === this.host.readActiveAgentId()) return false; return this.host.isVisibleAgent != null ? !(await this.host.isVisibleAgent(agentId)) : false; }
-  async reclaimPrunedPlaceholders(): Promise<void> { for (const agentId of await this.listAgentRecordIds()) { if (!await this.isPrunedPlaceholder(agentId)) continue; try { await rm(this.host.getAgentDir(agentId), { recursive: true, force: true }); } catch (error) { this.host.report?.({ family: "materialize", kind: "placeholder_reclaim_failed", agentId, errorClass: error instanceof Error ? error.name : typeof error }); } } }
+  /**
+   * Decides whether a directory on disk is a placeholder. Both branches used to
+   * answer "it is not": a directory with no `store.db` returned `false` on the
+   * first branch, and a directory with one returned `false` on the second as
+   * well, because `isVisibleAgent` asks `summarizeAgentById`, which summarizes
+   * with `includeBlank: true` and therefore returns a record for an empty agent.
+   * The reclaim pass could not remove anything, so every directory the roster
+   * does not show kept a cap slot for good and `POST /api/createAgent` answered
+   * `409 Agent limit of 50 reached` with the cap full of agents nobody could see
+   * and nobody could delete.
+   *
+   * The question is now the one the roster actually answers: would `listAgents`
+   * show this directory? An agent with a transcript, a name, a description, a
+   * title, a durable footprint, or a session the host still holds is live.
+   * Everything else on disk is garbage.
+   */
+  async isPrunedPlaceholder(agentId: string): Promise<boolean> {
+    if (agentId === this.host.readActiveAgentId()) return false;
+    if (this.host.isAgentInUse?.(agentId)) return false;
+    // The path is joined by hand: a directory whose name is not a valid agent id
+    // must turn into a reclaim, never into a thrown `SandInvalidAgentIdError`.
+    const dbPath = join(this.host.rootDir, agentId, STORE_FILENAME);
+    if (!existsSync(dbPath)) return true;
+    let db: SandAgentDb;
+    try { db = new SandAgentDb(dbPath, { recoverOnCorruption: false }); }
+    catch { return true; }
+    try {
+      const stats = await stat(dbPath).catch(() => undefined);
+      if (stats == null) return true;
+      const dbStats = { mtimeMs: Number(stats.mtimeMs) };
+      return await buildSummary({
+        extras: readDbExtras(db, agentId, dbStats),
+        dbPath,
+        dirName: agentId,
+        dbStats,
+        includeBlank: false,
+        agentHasMemory: agentDir => this.host.hasMemory?.(agentDir) === true,
+      }) == null;
+    } finally { db.close(); }
+  }
+  async reclaimPrunedPlaceholders(): Promise<void> { for (const agentId of await this.listAgentRecordIds()) { if (!await this.isPrunedPlaceholder(agentId)) continue; try { await rm(this.host.getAgentDir(agentId), { recursive: true, force: true, maxRetries: 6, retryDelay: 50 }); } catch (error) { this.host.report?.({ family: "materialize", kind: "placeholder_reclaim_failed", agentId, errorClass: error instanceof Error ? error.name : typeof error }); } } }
 }

@@ -111,6 +111,8 @@ import {
   NoopWebScraperService,
 } from "../../packages/agent/utils/agent-config.js";
 import { createSubagentModels } from "../../packages/agent/tools/core/subagent/models.js";
+import type { TaskSubagentModelConfig } from "../../packages/agent/tools/task-cluster-internal.js";
+import { getSubagentTypeName } from "../../packages/agent/tools/core/subagent/subagent-config.js";
 import { createSandSummarizationHandler } from "./conversation-state.js";
 import {
   createDiskPressureReminderMiddleware,
@@ -122,6 +124,7 @@ import { createStartOfTurnAckReminderMiddleware } from "./start-of-turn-ack-remi
 import { createSandBrowserUseSubagentConfig } from "./tools/sand-browser-use-subagent.js";
 import { createSandComputerUseSubagentConfig } from "./tools/sand-computer-use-subagent.js";
 import { createSandExecutorSubagentConfig } from "../sand-multitask.js";
+import { CustomSubagentPermissionMode, SubagentType, SubagentTypeCustom } from "../../packages/proto/generated/agent/v1/subagents_pb.js";
 import {
   buildSandSubagentLaunchReviewTarget,
   buildSandSubagentRiskTarget,
@@ -1684,6 +1687,155 @@ export function createTurnLocalResourceProjection(
   };
 }
 
+export const SAND_MAX_SUBAGENT_DEPTH = 1;
+
+/**
+ * How many subagents one runner may have in flight at once. Four is the point
+ * where "dispatch a few in parallel" stops being true: each child holds a model
+ * stream, a transcript and a box connection, and past four the dispatch is a
+ * fan-out nobody is waiting for.
+ */
+export const SAND_MAX_ACTIVE_SUBAGENTS = 4;
+
+/**
+ * `generalPurpose` — the plain work subagent, the one every other type is
+ * measured against. It is listed FIRST on purpose: `buildTaskParametersSchema`
+ * picks `configNames[0]` when no name is `generalPurpose`, and
+ * `task-subagent-preparation.ts:493` falls back to `subagentConfigs[0]`, so the
+ * first entry is what a bare Task call resolves to.
+ *
+ * The reconstructed build has no monitor, so `computerUse` / `browserUse` are
+ * never appended and this one entry is the whole list. Before this existed the
+ * list was empty and every Task call threw
+ * `ToolCallArgParseError("No subagent types are available.")`.
+ */
+export const createSandGeneralPurposeSubagentConfig = () => ({
+  subagent_type: new SubagentType({
+    type: { case: "custom", value: new SubagentTypeCustom({ name: GENERAL_PURPOSE_SUBAGENT_TYPE_NAME }) },
+  }),
+  description: [
+    "Delegate one self-contained task to a background subagent that works on its own and reports back.",
+    "Give it everything it needs in the dispatch prompt: it starts with no context of this conversation, so name the goal, the specifics, and what counts as done.",
+    "It runs in the background like any Task: you are notified when it finishes, so do not poll or await it.",
+    "It runs headless and cannot talk to the user, so it reports its result back to you and you deliver it.",
+  ].join(" "),
+  preserveTaskTool: false,
+  subagentSource: "builtin" as const,
+  permissionMode: CustomSubagentPermissionMode.DEFAULT,
+});
+
+export const GENERAL_PURPOSE_SUBAGENT_TYPE_NAME = "generalPurpose";
+
+/**
+ * The `Task` tool's subagent list for one turn, in the shape
+ * `buildTurnTools` and `buildTaskParametersSchema` expect.
+ *
+ * Every entry is unconditional on purpose. `computerUse` and `browserUse` need
+ * a monitor, which this box does not have — their tool factories are not even
+ * present in the production toolset provider — so the honest list here is
+ * `generalPurpose` alone, plus `executor` when multitask is on.
+ */
+export function buildSandSubagentConfigsForRun(input: {
+  readonly isSubagentRunner: boolean;
+  readonly remoteBoxHasDesktop: boolean;
+  readonly remoteBoxAvailable: boolean;
+  readonly browserUseSubagentEnabled: boolean;
+  readonly isSystemPromptOverridden: boolean;
+  readonly isMultitaskEnabled: boolean;
+  readonly getSubagentTypeName?: (config: unknown) => string | undefined;
+}): readonly TaskSubagentModelConfig[] {
+  // A subagent runner is handed the same list because `buildTurnTools` decides
+  // whether to offer `Task` from `host.isSubagentRunner`, not from this list —
+  // but `subagentConfigs === undefined` is exactly the case that fences a
+  // non-computer-use subagent down to an empty toolset
+  // (`turn-toolset.ts:1354`). Passing `undefined` there would leave a general
+  // purpose subagent with no tools at all, so the list is always present.
+  const configs = [withPermissionMode(createSandGeneralPurposeSubagentConfig())];
+  if (input.remoteBoxHasDesktop && input.remoteBoxAvailable) {
+    configs.push(withPermissionMode(
+      createSandComputerUseSubagentConfig({ browserUseOffered: input.browserUseSubagentEnabled })));
+    if (input.browserUseSubagentEnabled) {
+      configs.push(withPermissionMode(createSandBrowserUseSubagentConfig()));
+    }
+  }
+  if (input.isSystemPromptOverridden !== true && input.isMultitaskEnabled) {
+    const generalPurposeIndex = configs.findIndex((config) =>
+      isGeneralPurposeSubagentConfig(config, input.getSubagentTypeName));
+    const executor = withPermissionMode(createSandExecutorSubagentConfig());
+    if (generalPurposeIndex >= 0) configs.splice(generalPurposeIndex, 1, executor);
+    else configs.push(executor);
+  }
+  return configs;
+}
+
+/**
+ * Two things are normalised here, and only because two factories in other files
+ * leave them out.
+ *
+ * `permissionMode` is required by `TaskSubagentModelConfig`. `DEFAULT` is the
+ * value that leaves the subagent's permission set untouched, so a type whose
+ * factory left the field out is not silently narrowed to `UNSPECIFIED`.
+ *
+ * `computerUse` and `browserUse` build `subagent_type` as a plain object literal
+ * rather than a `SubagentType` proto instance. `getSubagentTypeName` only reads
+ * `.type.case` and `.type.value.name`, so the literal reads fine, but anything
+ * calling a proto method on it would not. Rebuilding it here means callers get
+ * one consistent shape whatever factory produced the entry.
+ */
+type LooseSubagentConfig = {
+  readonly subagent_type: unknown;
+  readonly description: string;
+  readonly preserveTaskTool: boolean;
+  readonly subagentSource?: string;
+  readonly permissionMode?: number;
+};
+
+function withPermissionMode(config: LooseSubagentConfig): TaskSubagentModelConfig {
+  const name = readSubagentTypeCaseName(config.subagent_type);
+  return {
+    subagent_type: new SubagentType({
+      type: { case: "custom", value: new SubagentTypeCustom({ name }) },
+    }),
+    description: config.description,
+    preserveTaskTool: config.preserveTaskTool,
+    ...(config.subagentSource === undefined ? {} : { subagentSource: config.subagentSource }),
+    permissionMode: config.permissionMode ?? CustomSubagentPermissionMode.DEFAULT,
+  } as TaskSubagentModelConfig;
+}
+
+/**
+ * Reads the type name out of either factory shape: a real `SubagentType` proto
+ * instance or the plain literal the `computerUse` / `browserUse` factories
+ * return. `getSubagentTypeName` handles both, so it is the single reader here.
+ */
+function readSubagentTypeCaseName(subagentType: unknown): string {
+  try {
+    return getSubagentTypeName(subagentType as TaskSubagentModelConfig["subagent_type"]);
+  } catch {
+    return GENERAL_PURPOSE_SUBAGENT_TYPE_NAME;
+  }
+}
+
+function isGeneralPurposeSubagentConfig(
+  config: unknown,
+  getSubagentTypeName?: (config: unknown) => string | undefined,
+): boolean {
+  const hostName = getSubagentTypeName?.(config);
+  if (hostName !== undefined) return hostName === GENERAL_PURPOSE_SUBAGENT_TYPE_NAME;
+  if (typeof config !== "object" || config === null || !("subagent_type" in config)) return false;
+  const subagentType = (config as { subagent_type: unknown }).subagent_type;
+  if (typeof subagentType !== "object" || subagentType === null || !("type" in subagentType)) return false;
+  const type = (subagentType as { type: unknown }).type;
+  if (typeof type !== "object" || type === null || !("case" in type)) return false;
+  if (type.case === "unspecified") return true;
+  return type.case === "custom"
+    && "value" in type
+    && typeof type.value === "object"
+    && type.value !== null
+    && "name" in type.value
+    && type.value.name === GENERAL_PURPOSE_SUBAGENT_TYPE_NAME;
+}
+
 export function createTurnAgentComposition(
   host: TurnAgentCompositionHost,
 ) {
@@ -1691,34 +1843,17 @@ export function createTurnAgentComposition(
 
   function buildSubagentConfigsForRun(): readonly unknown[] | undefined {
     if (host.isSubagentRunner) return undefined;
-    const configs = [...(host.getSubagentConfigs?.() ?? [])];
-    if (host.toolHost.remoteBoxHasDesktop && host.toolHost.getRemoteBoxAvailable()) {
-      const browserUseOffered = host.isBrowserUseSubagentEnabled?.() === true;
-      configs.push(createSandComputerUseSubagentConfig({ browserUseOffered }));
-      if (browserUseOffered) configs.push(createSandBrowserUseSubagentConfig());
-    }
-    if (host.isSystemPromptOverridden !== true && host.isMultitaskEnabled?.() === true) {
-      const executor = createSandExecutorSubagentConfig();
-      const generalPurposeIndex = configs.findIndex((config) => {
-        const hostName = host.getSubagentTypeName?.(config);
-        if (hostName !== undefined) return hostName === "generalPurpose";
-        if (typeof config !== "object" || config === null || !("subagent_type" in config)) return false;
-        const subagentType = config.subagent_type;
-        if (typeof subagentType !== "object" || subagentType === null || !("type" in subagentType)) return false;
-        const type = subagentType.type;
-        if (typeof type !== "object" || type === null || !("case" in type)) return false;
-        if (type.case === "unspecified") return true;
-        return type.case === "custom" &&
-          "value" in type &&
-          typeof type.value === "object" &&
-          type.value !== null &&
-          "name" in type.value &&
-          type.value.name === "generalPurpose";
-      });
-      if (generalPurposeIndex >= 0) configs.splice(generalPurposeIndex, 1, executor);
-      else configs.push(executor);
-    }
-    return configs;
+    return buildSandSubagentConfigsForRun({
+      isSubagentRunner: host.isSubagentRunner,
+      remoteBoxHasDesktop: host.toolHost.remoteBoxHasDesktop,
+      remoteBoxAvailable: host.toolHost.getRemoteBoxAvailable(),
+      browserUseSubagentEnabled: host.isBrowserUseSubagentEnabled?.() === true,
+      isSystemPromptOverridden: host.isSystemPromptOverridden === true,
+      isMultitaskEnabled: host.isMultitaskEnabled?.() === true,
+      ...(host.getSubagentTypeName === undefined
+        ? {}
+        : { getSubagentTypeName: host.getSubagentTypeName }),
+    });
   }
 
   function buildAgentForRunFromInput(

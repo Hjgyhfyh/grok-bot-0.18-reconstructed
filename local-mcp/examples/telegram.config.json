@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "telegram": {
+      "command": "node",
+      "args": [
+        "D:\\ТЕСТЫ\\DeepSeek-Harness\\grok-bot-0.18-reconstructed\\local-mcp\\servers\\telegram-mcp-server.mjs"
+      ],
+      "env": {
+        "TELEGRAM_BOT_TOKEN": "REPLACE_ME_create_a_bot_with_@BotFather"
+      }
+    }
+  }
+}

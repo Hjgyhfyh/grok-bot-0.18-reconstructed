@@ -277,25 +277,38 @@ function approximateTokenCountFromRawArgs(rawArgs: string): number {
   return Math.floor(rawArgs.length / 4);
 }
 
-function duplicateStream<T>(stream: AsyncIterable<T>): [WritableIterable<T>, WritableIterable<T>] {
+export function duplicateStream<T>(ctx: Context, stream: AsyncIterable<T>): [WritableIterable<T>, WritableIterable<T>] {
   const stream1 = createWritableIterable<T>();
   const stream2 = createWritableIterable<T>();
+  let abandoned1 = false;
+  let abandoned2 = false;
   async function run(): Promise<void> {
     try {
       for await (const chunk of stream) {
-        await stream1.write(chunk);
-        await stream2.write(chunk);
+        // `write()` settles only when a reader takes the chunk. A consumer that stops reading
+        // — a loop guard, a cancel, an early break in `consumeStream` — closes its branch, and
+        // the next write there throws `WriteIterableClosedError`. That is an abandoned branch,
+        // not the provider's reason: the branch is now dropped and the other one keeps being fed,
+        // so the real provider error still reaches the collector instead of being replaced.
+        const pending: Array<Promise<void>> = [];
+        if (!abandoned1) pending.push(stream1.write(chunk).then(() => {}, () => { abandoned1 = true; }));
+        if (!abandoned2) pending.push(stream2.write(chunk).then(() => {}, () => { abandoned2 = true; }));
+        await Promise.all(pending);
       }
     } catch (error) {
-      stream1.throw(error);
-      stream2.throw(error);
+      // The source failure is the real cause, so it is what both still-open branches report.
+      if (!abandoned1) stream1.throw(error);
+      if (!abandoned2) stream2.throw(error);
     } finally {
       stream1.close();
       stream2.close();
     }
   }
-  void run().catch(error => {
-    throw error;
+  // This pump used to end in `catch(error => { throw error })`. A rethrow inside a `catch` of a
+  // floating promise is an unhandled rejection, and an unhandled rejection in the Electron main
+  // process terminates it with the provider reason nowhere in the transcript.
+  void run().catch((error: unknown) => {
+    logger.error(ctx, "tool stream duplication pump failed", error);
   });
   return [stream1, stream2];
 }
@@ -914,13 +927,17 @@ function streamModelAndCollectToolCalls(
     ctx,
     interactionHandler.invocationId,
     toolDefinitions,
-    { acceptedUnadvertisedToolNames },
+    // The turn context's signal is the cancellation authority for this model call: it is the
+    // per-attempt context `stream-attempt.ts` built with `withCancel()`, so the signal that
+    // fires the first-token-stall deadline also reaches the provider socket. It was never handed
+    // to the executor, so cancel, interrupt and stall could not close the connection.
+    { acceptedUnadvertisedToolNames, abortSignal: ctx.signal },
   );
   const settledResultResponse = result.response.then(
     response => ({ didReject: false as const, response }),
     error => ({ didReject: true as const, error }),
   );
-  const [innerStream, fullStream] = duplicateStream(result.fullStream);
+  const [innerStream, fullStream] = duplicateStream(ctx, result.fullStream);
   const toolCallsIterable = createWritableIterable<NativeToolCallDescriptor>();
   const toolCallEventsIterable = createWritableIterable<ToolCallEvent>();
   const responsePromise = (async (): Promise<ModelResponse> => {

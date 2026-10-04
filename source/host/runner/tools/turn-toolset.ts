@@ -221,7 +221,18 @@ type StreamingTurnTool = TurnTool & {
   ): Promise<unknown>;
 };
 
-export type TurnToolsetBuildProps = ProductionTurnToolInputs;
+/**
+ * The immutable builder's view of the props the Agent actually passes.
+ *
+ * `AgentToolsGeneratorInput` (source/packages/agent/tools/tools-generator-contract.ts)
+ * carries `mcpTools`, the live per-turn MCP snapshot the Agent resolved before
+ * calling the generator. The bridge type never declared it, so the MCP
+ * discovery/call pair had no synchronous source of truth and stayed dormant.
+ */
+export type TurnToolsetBuildProps = ProductionTurnToolInputs & {
+  /** The Agent's live per-turn MCP snapshot; empty or absent means no servers. */
+  readonly mcpTools?: readonly unknown[];
+};
 
 export interface TurnToolsetTurnInput {
   /** The exact owner-scoped update relay installed for this prepared turn. */
@@ -246,6 +257,15 @@ export interface TurnToolsetTurnInput {
   readonly endThisRunAwaitingUser?: (reason: string) => void;
   /** Per-turn MCP descriptors used by the generated discovery/call pair. */
   readonly mcpTools?: readonly McpToolForMeta[];
+  /**
+   * Reports the exact tool names this turn carries.
+   *
+   * The system prompt is generated after the toolset (the Agent calls
+   * `systemPromptGenerator(args, toolSetHandle)` with the handle it just built),
+   * so this is the only honest place a prompt can learn what the turn really
+   * offers. Optional: absent means "tell nobody".
+   */
+  readonly onToolsetBuilt?: (toolNames: readonly string[]) => void;
   /** Optional live Shell Smart Mode identities, supplied per turn by the host. */
   readonly shellAutoReview?: {
     readonly host?: TurnShellAutoReviewInput;
@@ -882,6 +902,10 @@ export function createTurnMcpMetaToolFactory(
 ): (dynamicToolRegistry?: DynamicToolRegistry) => readonly TurnTool[] {
   return (dynamicToolRegistry) => {
     const mcpMetaToolOptions = asGeneratedMcpMetaToolOptions(input.getMcpTools());
+    // A box with no live MCP server would otherwise be offered a GetMcpTools
+    // tool that can only ever answer "nothing here". That reads to the model as
+    // a broken capability and burns a turn, so the pair stays absent instead.
+    if (mcpMetaToolOptions.mcpDescriptors.length === 0) return [];
     const discovery = createGetMcpToolsTool(mcpMetaToolOptions, {
       resourceAccessor: input.resourceAccessor,
       ...(input.discoveryOptions?.projectDir === undefined
@@ -926,7 +950,17 @@ export function createTurnBrowserToolFactory(
 export function createTurnFileTransferToolFactory(
   input: TurnFileTransferToolFactoryInput,
 ): () => readonly TurnTool[] {
-  return () => createFileTransferTools(input.controller).map(asTurnTool);
+  return () => {
+    // Both tools move bytes to or from a connected computer. With none
+    // connected every call would fail on `resolveComputerOrThrow`, and a tool
+    // that only ever reports "open the desktop app" reads to the model as a
+    // broken capability. Liveness is read at every build, so the pair appears
+    // as soon as a computer registers and disappears when it goes away.
+    if (!input.controller.userComputers.list().some(computer => computer.connected)) {
+      return [];
+    }
+    return createFileTransferTools(input.controller).map(asTurnTool);
+  };
 }
 
 export function createTurnBoxHelpToolFactory(
@@ -1290,6 +1324,28 @@ export function extractSandAutoReviewClassifierContext(
   });
 }
 
+/**
+ * The live MCP tools of this turn, filtered to real server-tool rows.
+ *
+ * The Agent hands the generator one merged list that also carries
+ * request-context rows, so an entry only counts when it names a provider and a
+ * tool the way an MCP descriptor does. On a box with no MCP server the list is
+ * empty, and the discovery/call pair must stay absent rather than answer "no
+ * servers" on every call.
+ */
+export function liveMcpToolsForTurn(
+  turn: TurnToolsetTurnInput,
+  props?: TurnToolsetBuildProps,
+): readonly McpToolForMeta[] {
+  const candidates = props?.mcpTools ?? turn.mcpTools;
+  if (candidates === undefined) return [];
+  return candidates.filter((candidate): candidate is McpToolForMeta =>
+    typeof candidate === "object"
+    && candidate !== null
+    && typeof (candidate as { readonly providerIdentifier?: unknown }).providerIdentifier === "string"
+    && typeof (candidate as { readonly toolName?: unknown }).toolName === "string");
+}
+
 export function buildTurnTools(
   host: TurnToolsetHost,
   turn: TurnToolsetInput,
@@ -1470,12 +1526,18 @@ export function buildTurnTools(
     if (requestBoxHelp !== undefined) tools.push(requestBoxHelp);
   }
 
-  // The immutable builder only offers the MCP discovery/call pair when the
-  // live per-turn MCP projection exists, or dynamic mode owns the registry.
-  // A supplied factory alone is not an MCP service and must remain dormant.
+  // The immutable builder offers the MCP discovery/call pair when the live
+  // per-turn MCP projection exists, when dynamic mode owns the registry, or
+  // when this turn's own snapshot names at least one live MCP server tool. The
+  // last clause is what production needs: `props.mcp` was never projected, so
+  // the pair had no way to switch itself on. It is gated on a non-empty
+  // snapshot rather than on the factory merely existing, because an
+  // always-empty GetMcpTools is worse than no GetMcpTools at all.
   if (
     !host.isBoxScopedSubagent
-    && (props?.mcp !== undefined || dynamicToolRegistry !== undefined)
+    && (props?.mcp !== undefined
+      || dynamicToolRegistry !== undefined
+      || liveMcpToolsForTurn(turn, props).length > 0)
   ) {
     const mcpMeta = factories.mcpMeta?.(dynamicToolRegistry);
     if (mcpMeta !== undefined) tools.push(...mcpMeta);
@@ -1528,5 +1590,9 @@ export function buildTurnTools(
       }));
   });
 
-  return fencedToolSet(guarded, host.spotlightEnabled(), dynamicToolRegistry);
+  const handle = fencedToolSet(guarded, host.spotlightEnabled(), dynamicToolRegistry);
+  // The prompt is rendered from the handle this call produced, so this is the
+  // exact moment the turn learns what it really carries.
+  turn.onToolsetBuilt?.(handle.getAllTools().map((tool) => tool.name));
+  return handle;
 }

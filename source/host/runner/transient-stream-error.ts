@@ -1,7 +1,10 @@
 export const TRANSIENT_ERRNO_CODES = new Set(["ECONNRESET", "ETIMEDOUT", "EPIPE", "ECONNABORTED", "ECONNREFUSED", "ENETRESET", "ENETDOWN", "ENETUNREACH", "EHOSTUNREACH", "EAI_AGAIN"]);
-export const TRANSIENT_MESSAGE_TOKENS = ["econnreset", "etimedout", "epipe", "econnaborted", "econnrefused", "enetreset", "enetunreach", "ehostunreach", "socket hang up", "premature close", "stream closed", "closed stream", "connection reset", "connection closed", "connection terminated", "network error", "the operation was aborted", "[aborted]", "[unavailable]", "[deadline_exceeded]"];
+// "terminated" is what an interrupted provider socket actually reports ("terminated",
+// "TypeError: terminated"); the list only carried the fuller phrase "connection terminated",
+// so the ladder never saw the failure and the turn was reported as a provider fault.
+export const TRANSIENT_MESSAGE_TOKENS = ["econnreset", "etimedout", "epipe", "econnaborted", "econnrefused", "enetreset", "enetunreach", "ehostunreach", "socket hang up", "premature close", "stream closed", "closed stream", "connection reset", "connection closed", "connection terminated", "terminated", "network error", "the operation was aborted", "[aborted]", "[unavailable]", "[deadline_exceeded]"];
 
-interface ErrorLike { readonly code?: unknown; readonly message?: unknown; readonly cause?: unknown; readonly errors?: unknown; readonly name?: unknown; readonly reason?: unknown; readonly isStepRetriesExhausted?: unknown; readonly isConversationTooLarge?: unknown; readonly isTranscriptAppendAfterCheckpointError?: unknown; readonly retryable?: unknown; readonly terminal?: unknown; readonly displayInfo?: unknown; readonly metadata?: unknown }
+interface ErrorLike { readonly code?: unknown; readonly message?: unknown; readonly cause?: unknown; readonly errors?: unknown; readonly name?: unknown; readonly reason?: unknown; readonly isStepRetriesExhausted?: unknown; readonly isConversationTooLarge?: unknown; readonly isTranscriptAppendAfterCheckpointError?: unknown; readonly retryable?: unknown; readonly isRetryable?: unknown; readonly terminal?: unknown; readonly displayInfo?: unknown; readonly metadata?: unknown }
 function asErrorLike(value: unknown): ErrorLike | null { return typeof value === "object" && value != null ? value : null; }
 function children(error: ErrorLike): unknown[] { return [error.cause, ...(Array.isArray(error.errors) ? error.errors : [])].filter((value) => value != null); }
 function visit(error: unknown, predicate: (value: ErrorLike) => boolean, seen = new Set<unknown>()): boolean {
@@ -22,7 +25,10 @@ export function isContextOverflowDeadEnd(error: unknown): boolean {
 }
 export function isRetryableProviderError(error: unknown): boolean {
   if (isContextOverflowDeadEnd(error) || isConversationTooLargeRefusal(error)) return false;
-  const retryable = isTransientStreamError(error) || visit(error, (value) => value.retryable === true);
+  // `ai` 4.3.17 marks a retryable provider failure with `isRetryable` (`ai/dist/index.mjs:289`);
+  // the ladder only read `retryable`, so every 429 and 500 came back "not retryable" and the
+  // run gave up on the first attempt. Both spellings are accepted now.
+  const retryable = isTransientStreamError(error) || visit(error, (value) => value.retryable === true || value.isRetryable === true);
   if (!retryable) return false;
   return !visit(error, (value) => value.terminal === true || value.name === "NonRetriableError" || value.name === "ActionRequiredError");
 }
@@ -94,7 +100,16 @@ export const DEFAULT_OVERLOAD_STREAM_RETRY_MAX_ATTEMPTS = 3;
 export const DEFAULT_OVERLOAD_STREAM_RETRY_BASE_DELAY_MS = 750;
 export const DEFAULT_OVERLOAD_STREAM_RETRY_MAX_DELAY_MS = 6_000;
 export const DEFAULT_FIRST_TOKEN_STALL_DEADLINE_MS = 150_000;
+/**
+ * Ceiling for the per-attempt first-token deadline. The ladder doubles the deadline on every
+ * retry (150s, 300s, 600s), so an unbounded growth outlived the 900s run lease: the lease
+ * expired while the third attempt was still waiting, and the late `endSessionRun` was
+ * swallowed, marking a running turn as finished. Capping the per-attempt deadline keeps the
+ * whole ladder (150 + 300 + 300 plus backoff) inside the lease.
+ */
+export const DEFAULT_FIRST_TOKEN_STALL_MAX_DEADLINE_MS = 300_000;
 function readIntEnv(env: NodeJS.ProcessEnv, name: string, fallback: number, min: number): number { const parsed = Number.parseInt(env[name]?.trim() ?? "", 10); return Number.isFinite(parsed) && parsed >= min ? parsed : fallback; }
+export function resolveFirstTokenStallDeadlineMs(env: NodeJS.ProcessEnv = process.env): number { return readIntEnv(env, "SAND_FIRST_TOKEN_STALL_DEADLINE_MS", DEFAULT_FIRST_TOKEN_STALL_DEADLINE_MS, 0); }
+export function resolveFirstTokenStallMaxDeadlineMs(env: NodeJS.ProcessEnv = process.env): number { return readIntEnv(env, "SAND_FIRST_TOKEN_STALL_MAX_DEADLINE_MS", DEFAULT_FIRST_TOKEN_STALL_MAX_DEADLINE_MS, 0); }
 export function resolveAutomationStreamRetryPolicy(overrides: Partial<RetryPolicy> = {}, env: NodeJS.ProcessEnv = process.env): RetryPolicy { return { maxAttempts: readIntEnv(env, "SAND_AUTOMATION_STREAM_RETRY_ATTEMPTS", 4, 1), baseDelayMs: readIntEnv(env, "SAND_AUTOMATION_STREAM_RETRY_BASE_MS", 1_000, 0), maxDelayMs: readIntEnv(env, "SAND_AUTOMATION_STREAM_RETRY_MAX_MS", 15_000, 0), ...overrides }; }
 export function resolveOverloadStreamRetryPolicy(overrides: Partial<RetryPolicy> = {}, env: NodeJS.ProcessEnv = process.env): RetryPolicy { return { maxAttempts: readIntEnv(env, "SAND_OVERLOAD_STREAM_RETRY_ATTEMPTS", 3, 1), baseDelayMs: readIntEnv(env, "SAND_OVERLOAD_STREAM_RETRY_BASE_MS", 750, 0), maxDelayMs: readIntEnv(env, "SAND_OVERLOAD_STREAM_RETRY_MAX_MS", 6_000, 0), ...overrides }; }
-export function resolveFirstTokenStallDeadlineMs(env: NodeJS.ProcessEnv = process.env): number { return readIntEnv(env, "SAND_FIRST_TOKEN_STALL_DEADLINE_MS", DEFAULT_FIRST_TOKEN_STALL_DEADLINE_MS, 0); }

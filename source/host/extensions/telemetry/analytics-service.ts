@@ -65,9 +65,20 @@ export function withAutomationRunAnalytics<T extends TelemetryService>(
     return (...args: Parameters<Method>): ReturnType<Method> =>
       telemetry[name](...args) as ReturnType<Method>;
   };
-  const reportAutomationRun = telemetry.reportAutomationRun as unknown as (
-    report: AutomationRunAnalyticsReport,
-  ) => unknown;
+  /**
+   * The one method that does not go through `forward()`. It is kept as a
+   * receiver-bound call rather than a copied reference because
+   * `reportAutomationRun` on the telemetry implementation reaches `this.mapped`.
+   * Calling the copied function bare left `this` undefined, so every automation
+   * run ended in `TypeError: Cannot read properties of undefined (reading
+   * 'mapped')` — an HTTP 500 at the end of each run.
+   */
+  const reportAutomationRun = (report: AutomationRunAnalyticsReport): unknown =>
+    (
+      telemetry.reportAutomationRun as unknown as (
+        report: AutomationRunAnalyticsReport,
+      ) => unknown
+    ).call(telemetry, report);
 
   return {
     startTurn: forward("startTurn"),

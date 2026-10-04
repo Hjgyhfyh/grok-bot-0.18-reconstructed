@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { readdir, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { errorLogTag } from "../../../shared/errors.js";
 import { getSandProfilePath, readSandProfileFile, writeSandProfileFile, type SandAgentProfile } from "../../agents/agent-profile.js";
 import { getSandSettingsPath, writeSandSettingsFile } from "../../agents/settings-file.js";
@@ -18,10 +18,23 @@ import { buildSummary, loadAgentDbExtras, type DbExtras } from "./session-summar
 import { SandConnectorSecretStore } from "./connector-secret-store.js";
 import { ensureConversationCapacityForTurn } from "./conversation-size-limits.js";
 import { expirePendingAutoReviewApprovalEntries, expirePendingLocalToolPermissionAskEntries } from "./pending-card-sweeps.js";
-import { ACTIVE_AGENT_FILENAME, getAgentDbPath, getConnectorSecretsRoot, statIfExists } from "./session-paths.js";
+import { ACTIVE_AGENT_FILENAME, CONVERSATION_BLOBS_FILENAME, getAgentDbPath, getConnectorSecretsRoot, STORE_FILENAME, statIfExists } from "./session-paths.js";
 import { automationStoreForDbPath, channelStoreForDbPath, NO_SESSION_MEMORY, workflowStoreForDbPath } from "./session-store-factories.js";
 import { publishTranscriptMutation } from "../../transcript-mutation-events.js";
 import { reportSessionDiagnostic } from "./session-diagnostics.js";
+
+/**
+ * Retry budget for one `rm` of an agent directory. `node:fs/promises.rm`
+ * retries the child that failed with `EBUSY`/`EPERM` for the whole budget, so
+ * one call both waits for a holder in another thread to let go and then deletes
+ * in one step (measured on this machine: a handle released 100 ms into an `rm`
+ * finished the unlink at 153 ms). `maxRetries: 6, retryDelay: 50` was measured
+ * at 8.4 s before giving up, which is far too long to hold a delete open; these
+ * values were measured at 3.4 s, which is several orders above a worker hand-off
+ * and short enough that a delete which cannot succeed says so promptly.
+ */
+const AGENT_DIR_RM_RETRIES = 6;
+const AGENT_DIR_RM_RETRY_DELAY_MS = 20;
 
 export interface OpenAgentSession {
   id: string;
@@ -70,6 +83,7 @@ export class SandAgentSessionStore {
   private isAgentBeingDeleted: (id: string) => boolean = () => false;
   private resolveUserTimeZone: () => string | undefined;
   private readonly extrasCache = new Map<string, { key: string; extras: DbExtras }>();
+  private readonly openSessions = new Map<string, OpenAgentSession>();
   readonly connectorSecrets: SandConnectorSecretStore;
   readonly materialization: MaterializationPort | undefined;
   readonly conversationState: ConversationStatePort | undefined;
@@ -106,11 +120,104 @@ export class SandAgentSessionStore {
     const dbPath = getAgentDbPath(this.rootDir, id), db = new SandAgentDb(dbPath); db.set("agentId", id); db.setAgentOrigin(origin); if (purpose != null) db.setAgentPurpose(purpose); db.setIntroductionPending(true);
     return { id, dbPath, db, agentStore: { dispose: async () => {} } };
   }
-  async createSession(profile: Partial<SandAgentProfile>, origin: "user" | "dev" = "user", purpose?: string): Promise<OpenAgentSession> { return this.materialization?.createSession != null ? this.materialization.createSession(profile, origin, purpose) : this.createLocalSession(profile, origin, purpose); }
-  async mintAgent(mint: (agentId: string) => Promise<OpenAgentSession>): Promise<OpenAgentSession> { if (this.materialization?.mintAgent != null) return this.materialization.mintAgent(mint); let id = randomUUID(); while (this.agentDirExists(id)) id = randomUUID(); return mint(id); }
-  async createFallbackSession(open: (agentId: string) => Promise<OpenAgentSession>): Promise<OpenAgentSession> { if (this.materialization?.createFallbackSession != null) return this.materialization.createFallbackSession(open); const [agentId] = await this.listAgentIds(); if (agentId == null) throw new Error("No fallback session is available"); return open(agentId); }
-  async openSession(agentId: string): Promise<OpenAgentSession> { if (this.materialization?.openSession != null) return this.materialization.openSession(agentId); if (!this.agentExists(agentId)) throw new Error(`Agent missing: ${agentId}`); const dbPath = getAgentDbPath(this.rootDir, agentId); return { id: agentId, dbPath, db: new SandAgentDb(dbPath), agentStore: { dispose: async () => {} } }; }
-  async deleteSession(agentId: string): Promise<void> { const dbPath = getAgentDbPath(this.rootDir, agentId); this.extrasCache.delete(agentId); deleteSandAgentDbWriteGeneration(dbPath); await rm(this.getAgentDir(agentId), { recursive: true, force: true }); publishTranscriptMutation({ kind: "agent-removed", agentId }); this.options.onAgentRemoved?.(agentId); }
+  async createSession(profile: Partial<SandAgentProfile>, origin: "user" | "dev" = "user", purpose?: string): Promise<OpenAgentSession> { await this.reclaimDanglingAgentDirs(); return this.track(this.materialization?.createSession != null ? this.materialization.createSession(profile, origin, purpose) : this.createLocalSession(profile, origin, purpose)); }
+  async mintAgent(mint: (agentId: string) => Promise<OpenAgentSession>): Promise<OpenAgentSession> { await this.reclaimDanglingAgentDirs(); if (this.materialization?.mintAgent != null) return this.track(this.materialization.mintAgent(mint)); let id = randomUUID(); while (this.agentDirExists(id)) id = randomUUID(); return this.track(mint(id)); }
+  async createFallbackSession(open: (agentId: string) => Promise<OpenAgentSession>): Promise<OpenAgentSession> { await this.reclaimDanglingAgentDirs(); if (this.materialization?.createFallbackSession != null) return this.track(this.materialization.createFallbackSession(open)); const [agentId] = await this.listAgentIds(); if (agentId == null) throw new Error("No fallback session is available"); return this.track(open(agentId)); }
+  async openSession(agentId: string): Promise<OpenAgentSession> { if (this.materialization?.openSession != null) return this.track(this.materialization.openSession(agentId)); if (!this.agentExists(agentId)) throw new Error(`Agent missing: ${agentId}`); const dbPath = getAgentDbPath(this.rootDir, agentId); return this.track(Promise.resolve({ id: agentId, dbPath, db: new SandAgentDb(dbPath), agentStore: { dispose: async () => {} } })); }
+  private track<T extends { id: string }>(opening: Promise<T>): Promise<T> { return opening.then((opened) => { this.openSessions.set(opened.id, opened as unknown as OpenAgentSession); return opened; }); }
+
+  /**
+   * Releases every handle this store still holds for one agent: the agent store
+   * and the `node:sqlite` connection to `store.db`. Windows refuses to unlink an
+   * open file, so a caller that deleted the directory first could never remove
+   * `store.db` and the agent stayed on disk forever. Handles are released here,
+   * before the unlink, because after the unlink the path is gone and there is
+   * nothing left to close.
+   */
+  async releaseSession(agentId: string): Promise<void> {
+    const session = this.openSessions.get(agentId);
+    this.openSessions.delete(agentId);
+    if (session == null) return;
+    try { await session.agentStore.dispose(); }
+    catch (error) { reportSessionDiagnostic({ family: "store_db", kind: "agent_store_dispose_failed", agentId, errorClass: errorLogTag(error) }); }
+    try { session.db.close(); }
+    catch (error) { reportSessionDiagnostic({ family: "store_db", kind: "store_db_close_failed", agentId, errorClass: errorLogTag(error) }); }
+  }
+  /**
+   * Terminates the blob worker that owns `conversation-blobs.db`. The worker pool
+   * is shared by every agent and is swept only after a five-minute idle timeout,
+   * so without this call the second `node:sqlite` handle in the agent directory
+   * outlives the delete request and `rm` fails with `EBUSY` on Windows.
+   */
+  private async releaseBlobWorker(agentId: string): Promise<void> {
+    const pool = this.materialization?.requireWorkerPool?.() as unknown as { connections?: Map<string, { close(): Promise<void> }> } | undefined;
+    const connections = pool?.connections;
+    if (connections == null) return;
+    const connection = connections.get(join(this.getAgentDir(agentId), CONVERSATION_BLOBS_FILENAME));
+    if (connection == null) return;
+    connections.delete(join(this.getAgentDir(agentId), CONVERSATION_BLOBS_FILENAME));
+    try { await connection.close(); }
+    catch (error) { reportSessionDiagnostic({ family: "store_db", kind: "blob_worker_close_failed", agentId, errorClass: errorLogTag(error) }); }
+  }
+  private async removeTranscriptJournal(agentId: string): Promise<void> {
+    if (!/^[A-Za-z0-9._-]+$/.test(agentId)) return;
+    try { await rm(join(dirname(this.rootDir), "agent-transcripts", agentId), { recursive: true, force: true, maxRetries: 2, retryDelay: 25 }); }
+    catch (error) { reportSessionDiagnostic({ family: "store_db", kind: "transcript_journal_remove_failed", agentId, errorClass: errorLogTag(error) }); }
+  }
+  /**
+   * Releases `store.db` in every holder that is not this store, then unlinks the
+   * agent directory and proves it is gone.
+   *
+   * Measured on a live box carrying fifty agents: forty-eight of the fifty
+   * `store.db` files were held open by the host process, and the set of held ids
+   * was exactly the set of rows in `search-index.db`. The holder is
+   * `SandSearchIndexWriter.storeConnections`
+   * (`extensions/content-search/search-index-writer.ts:23`): `reconcile()` opens
+   * `store.db` read-only for every agent directory and caches the connection
+   * until a `clear-agent` job evicts it. `node:sqlite` opens its file without
+   * `FILE_SHARE_DELETE`, so `DeleteFile` on `store.db` fails and `rm` leaves
+   * exactly `store.db`, `store.db-wal` and `store.db-shm` behind. Renaming the
+   * directory aside does not help: `MoveFileEx` on a directory whose subtree
+   * holds such a handle fails with the same `EPERM`, measured. The only way to
+   * free the slot is to release the handle first.
+   *
+   * The release signal for that holder is the `agent-removed` transcript
+   * mutation: the content-search extension subscribes to it and forwards it as a
+   * `clear-agent` index job. The mutation used to be published after the unlink,
+   * so the handle the worker was about to close was still open while `rm` ran
+   * and every delete of every agent failed. It is published before the first
+   * attempt now.
+   *
+   * The release itself crosses into another thread, so the unlink has to wait
+   * for it. It does: one `rm` retries the failing child for its whole budget and
+   * finishes by itself once the handle is gone mid-call (measured - a handle
+   * released 100 ms into an `rm` produced a finished unlink at 153 ms). A
+   * directory that is still there after both passes is a failure, and the caller
+   * is told which files are left instead of being handed a success.
+   */
+  private async removeAgentDirOrFail(agentId: string): Promise<void> {
+    const dir = this.getAgentDir(agentId);
+    let failure: unknown;
+    publishTranscriptMutation({ kind: "agent-removed", agentId });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await this.releaseSession(agentId);
+      await this.releaseBlobWorker(agentId);
+      try { await rm(dir, { recursive: true, force: true, maxRetries: AGENT_DIR_RM_RETRIES, retryDelay: AGENT_DIR_RM_RETRY_DELAY_MS }); }
+      catch (error) {
+        failure = error;
+        reportSessionDiagnostic({ family: "store_db", kind: "agent_dir_remove_failed", agentId, errorClass: errorLogTag(error) });
+      }
+      if (!existsSync(dir)) return;
+    }
+    const leftovers = await readdir(dir).catch(() => [] as string[]);
+    const error = new Error(
+      `Agent ${agentId} was not deleted: this app still holds ${leftovers.join(", ") || "the agent directory"}. Its slot stays taken. Quit the app, delete the folder ${dir}, then start it again.`,
+      failure === undefined ? undefined : { cause: failure },
+    );
+    Object.assign(error, { code: "SandAgentDeleteIncompleteError", agentId, leftovers });
+    throw error;
+  }
+  async deleteSession(agentId: string): Promise<void> { const dbPath = getAgentDbPath(this.rootDir, agentId); this.extrasCache.delete(agentId); await this.removeAgentDirOrFail(agentId); deleteSandAgentDbWriteGeneration(dbPath); await this.removeTranscriptJournal(agentId); this.options.onAgentRemoved?.(agentId); }
 
   activeAgentPointerPath(): string { return join(this.rootDir, ACTIVE_AGENT_FILENAME); }
   readActiveAgentId(): string | null { try { const parsed = JSON.parse(readFileSync(this.activeAgentPointerPath(), "utf8")) as { activeAgentId?: unknown }; const id = parsed.activeAgentId; return typeof id === "string" && id.length > 0 ? id : null; } catch { return null; } }
@@ -233,7 +340,34 @@ export class SandAgentSessionStore {
   async listAllAutomationsFrom(options: { definitionsOnly: boolean }) { const result = []; for (const agentId of await this.listAgentIds()) { try { const store = this.automationStoreFor(agentId), automations = options.definitionsOnly ? store.listDefinitions() : store.list(); for (const automation of automations) result.push({ agentId, automation }); } catch {} } return result; }
   async listAllAutomations() { return this.listAllAutomationsFrom({ definitionsOnly: false }); }
   async listAllAutomationDefinitions() { return this.listAllAutomationsFrom({ definitionsOnly: true }); }
-  async isAgentCapReached(): Promise<boolean> { return await this.materialization?.isAgentCapReached?.() ?? false; }
+  private async removeAgentDir(agentId: string, kind: string): Promise<boolean> {
+    // This runs on every create, mint and cap check, so it must not spend the
+    // eight-second retry budget of `removeAgentDirOrFail` on a directory that no
+    // holder will ever release.
+    try { await rm(this.getAgentDir(agentId), { recursive: true, force: true, maxRetries: 3, retryDelay: AGENT_DIR_RM_RETRY_DELAY_MS }); return true; }
+    catch (error) { reportSessionDiagnostic({ family: "store_db", kind, agentId, errorClass: errorLogTag(error) }); return false; }
+  }
+  /**
+   * Removes an agent directory that has no `store.db` left, and one whose agent
+   * was already deleted. The cap counts directories, so a leftover directory
+   * held its slot forever. A deleted agent came back because every late read of
+   * `store.db` recreates its directory: `new SandAgentDb(...)` runs
+   * `mkdirSync(dirname(dbPath))` before it opens anything. The transcript manager
+   * keeps a deleted id in its deleted set, so the roster hides the resurrected
+   * directory and the user can never delete it by hand either. The id in that
+   * set is proof enough that the directory is garbage.
+   */
+  private async reclaimDanglingAgentDirs(): Promise<void> {
+    const activeId = this.readActiveAgentId();
+    for (const agentId of await this.listAgentIds()) {
+      if (agentId === activeId || this.openSessions.has(agentId)) continue;
+      // The path is joined by hand: a directory whose name is not a valid agent
+      // id must not turn a cap check into a thrown `SandInvalidAgentIdError`.
+      if (!this.isAgentBeingDeleted(agentId) && existsSync(join(this.getAgentDir(agentId), STORE_FILENAME))) continue;
+      await this.removeAgentDir(agentId, this.isAgentBeingDeleted(agentId) ? "resurrected_dir_reclaim_failed" : "dangling_dir_reclaim_failed");
+    }
+  }
+  async isAgentCapReached(): Promise<boolean> { await this.reclaimDanglingAgentDirs(); return await this.materialization?.isAgentCapReached?.() ?? false; }
   async statOpenDb(args: { dbPath: string; agentId: string }) { try { return await stat(args.dbPath); } catch { return undefined; } }
   private profileFilesHost() { return { memory: this.memory, withAgentDb: <T>(agentId: string, fn: (db: SandAgentDb, dbPath: string) => T | Promise<T>) => this.withAgentDb(agentId, fn), statOpenDb: (args: { dbPath: string; agentId: string }) => this.statOpenDb(args), writeAgentProfileFile: (agentId: string, profile: Partial<SandAgentProfile> & { name: string; description: string }) => this.writeAgentProfileFile(agentId, profile) }; }
 }

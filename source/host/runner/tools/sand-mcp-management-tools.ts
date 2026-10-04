@@ -6,6 +6,10 @@ import {
   formatMcpAccountLabelForPrompt,
 } from "../../../shared/mcp.js";
 import { isMcpServerId } from "../../../shared/node/mcp/mcp-server-id.js";
+import {
+  isLocalMcpServerId,
+  LOCAL_MCP_CONFIG_HINT,
+} from "../../../shared/node/mcp/local-mcp-config-provider.js";
 import { searchPluginsWithJev, type PluginSearchClassifierSkip, type PluginSearchOutcome } from "../decisions/plugin-search-jev.js";
 import { defineCommunicateTool } from "./communicate-tool.js";
 import {
@@ -28,6 +32,25 @@ export interface McpInstalledServer {
   readonly statusDetail?: string;
   readonly customInstructions: string;
   readonly isTeamServer?: boolean;
+  /**
+   * Set on rows Grok Bot read from the user's own local MCP file rather than from
+   * the account. It is the flag every management tool consults before it offers a
+   * change the file itself owns.
+   */
+  readonly isLocal?: boolean;
+}
+
+/**
+ * True for a row Grok Bot started from the user's local MCP file.
+ *
+ * Two independent signals, either sufficient, because a wrong `false` here is the
+ * difference between refusing and starting an OAuth flow on a process: the
+ * explicit `isLocal` flag the service sets from the reserved identifier band, and
+ * the band itself re-checked here. A row produced by anything other than this
+ * product's own listing has neither, and is not local.
+ */
+export function isLocalMcpInstalledServer(row: McpInstalledServer): boolean {
+  return row.isLocal === true || isLocalMcpServerId(row.id);
 }
 
 export interface McpPluginSummary {
@@ -311,6 +334,7 @@ export function describeInstalled(server: McpInstalledServer): string {
       ? `tools=${server.toolCount}/${server.toolCount + server.disabledToolCount} enabled`
       : `tools=${server.toolCount}`,
   ];
+  if (isLocalMcpInstalledServer(server)) parts.push(`local=${LOCAL_MCP_CONFIG_HINT} (the user edits this file by hand)`);
   if (server.pluginId != null) parts.push(`plugin=${server.pluginId} (remove via UninstallPlugin — removes the whole plugin)`);
   if (server.statusDetail != null && server.statusDetail.length > 0) parts.push(`detail="${truncateOneLine(server.statusDetail, 200)}"`);
   if (server.customInstructions.length > 0 && server.customInstructions !== getDefaultMcpCustomInstruction(server.name)) {
@@ -425,6 +449,32 @@ function noInstalledServerMessage(token: string): string {
   return `No installed MCP server "${token}". Run GetMcpServerStatus to list every server with its identifier.`;
 }
 
+/**
+ * What Grok Bot does when a transport-level tool is pointed at a local stdio
+ * server, and why each refusal exists.
+ *
+ * `AuthenticateMcpServer` starts an OAuth flow. A stdio server has no browser
+ * flow, no token store and no account; offering the tool on one produces a
+ * connect card for a connector that can never authorize, and the agent then
+ * waits on a user who has nothing to do.
+ *
+ * `RemoveMcpAccount` and `RenameMcpAccount` edit an account's credential. There
+ * is exactly one implicit account on a stdio server and its credential is the
+ * process itself.
+ *
+ * `UninstallMcpServer` deletes a server from the account config. A local server
+ * is not in the account config at all: the "removal" the user would see is a
+ * refused write, and worse, a server that keeps running after the tool reported
+ * success is a server nobody is tracking.
+ *
+ * The refusal names the file so the agent can tell the user what to edit, and it
+ * does not leak a path the user did not ask about: the hint is the documented
+ * location, not the resolved one.
+ */
+function localStdioRefusal(row: McpInstalledServer, operation: string): string {
+  return `"${row.name}" is a local stdio server that Grok Bot reads from ${LOCAL_MCP_CONFIG_HINT} and does not manage, so ${operation}. Ask the user to edit that file by hand and then run RestartMcpServers; do not try another tool for it.`;
+}
+
 export function createMcpManagementTools(
   management: McpManagementDependencies,
   getRequestingAgentId?: () => string | undefined,
@@ -442,6 +492,23 @@ export function createMcpManagementTools(
     if (isMcpServerId(trimmed)) return trimmed;
     const listing = await readMcpInstalledListing(() => deps.listInstalled());
     return listing.kind === "unreadable" ? trimmed : resolveMcpServerRowByIdentifierOrLegacyId(listing.servers, trimmed)?.id ?? null;
+  };
+
+  /**
+   * The installed row a `server_id` names, or `null`.
+   *
+   * Separate from `resolveServerId` on purpose: that one short-circuits on a
+   * numeric id and never lists, which is right for a tool that only needs the id
+   * to pass on. Every tool that must REFUSE something needs the row itself, and
+   * a refusal is only worth anything if it happens before the call, so those pay
+   * for one listing.
+   */
+  const resolveServerRow = async (deps: McpManagementDependencies, token: string): Promise<McpInstalledServer | null> => {
+    const trimmed = token.trim();
+    const listing = await readMcpInstalledListing(() => deps.listInstalled());
+    if (listing.kind === "unreadable") return null;
+    if (isMcpServerId(trimmed)) return listing.servers.find((server) => server.id === trimmed) ?? null;
+    return resolveMcpServerRowByIdentifierOrLegacyId(listing.servers, trimmed);
   };
 
   const emitNeedsAuthCards = (before: readonly McpInstalledServer[], after: readonly McpInstalledServer[]): string | null => {
@@ -495,7 +562,7 @@ export function createMcpManagementTools(
       }),
     }),
     defineCommunicateTool(management, {
-      id: "ADD_MCP_SERVER", name: "AddMcpServer", description: "Add a remote MCP server that isn't in the catalog to the user's Cursor account — use this when the user gives you a link for a server that SearchPlugins doesn't know. Only call this after the user agrees to add it — confirm with a question widget first, since it changes the user's account configuration and the server can reach external services on their behalf. Provide the remote server's `url` (with `headers` for any auth token). Grok Bot only supports remote http/sse MCP servers (executed on the backend); local/stdio servers are not supported. Ask the user for the exact endpoint and any secrets rather than guessing; if you only have a link, open it first (WebFetch) to find the connection details. Newly added tools become available to you on your next message.", parameters: addMcpServerParameters,
+      id: "ADD_MCP_SERVER", name: "AddMcpServer", description: `Add a remote MCP server that isn't in the catalog to the user's Cursor account — use this when the user gives you a link for a server that SearchPlugins doesn't know. Only call this after the user agrees to add it — confirm with a question widget first, since it changes the user's account configuration and the server can reach external services on their behalf. Provide the remote server's \`url\` (with \`headers\` for any auth token). Grok Bot only supports remote http/sse MCP servers (executed on the backend). A local/stdio server cannot be added here: the user declares those by hand in ${LOCAL_MCP_CONFIG_HINT}, and no tool in this product writes that file — say so if the user asks you to. Ask the user for the exact endpoint and any secrets rather than guessing; if you only have a link, open it first (WebFetch) to find the connection details. Newly added tools become available to you on your next message.`, parameters: addMcpServerParameters,
       execute: guardMutation(async (_ctx, args: z.infer<typeof addMcpServerParameters>, deps) => {
         const error = validateRemoteMcpUrl(args.url);
         if (error != null) return error;
@@ -515,6 +582,7 @@ export function createMcpManagementTools(
         if (row == null) return noInstalledServerMessage(args.server_id);
         if (row.pluginId != null) return `${row.name} was installed from marketplace plugin ${row.pluginId}; use UninstallPlugin.`;
         if (row.isTeamServer === true) return `${row.name} is provided by the user's team, so it can't be removed here.`;
+        if (isLocalMcpInstalledServer(row)) return localStdioRefusal(row, "there is nothing Grok Bot can uninstall here");
         const result = await deps.removeServer(row.id);
         const status = result.removed ? `Removed MCP server ${row.name} (${row.serverIdentifier}).` : `The removal request for ${row.name} completed, but it still reads as installed.`;
         return [status, describeInstalledList(result.servers)].join("\n");
@@ -559,6 +627,11 @@ export function createMcpManagementTools(
   const authenticate = (parameters: typeof authParameters | typeof multiAuthParameters) => defineCommunicateTool(management, {
     id: "AUTHENTICATE_MCP_SERVER", name: "AuthenticateMcpServer", description: "Authenticate an installed MCP server that needs it (status needsAuth, or a tool call failing with an auth error). This is the only way to start a connector's auth: its connect card is shown to the user automatically — never compose a card, paste an authorization link, or reach the same service another way while its authorization is pending. The user authorizes in place and you're resumed automatically, so finish unrelated work, then end your turn.", parameters,
     execute: guardMutation(async (_ctx, args: { server_id: string; account_label?: string; force_reauth?: boolean }, deps) => {
+      // Refused before the id is resolved: a stdio server has nothing to
+      // authenticate, and reaching the auth watch first would open a connect card
+      // for a connector that can never be authorized.
+      const target = await resolveServerRow(deps, args.server_id);
+      if (target != null && isLocalMcpInstalledServer(target)) return localStdioRefusal(target, "there is no sign-in step to run");
       const serverId = await resolveServerId(deps, args.server_id);
       if (serverId == null) return noInstalledServerMessage(args.server_id);
       const account = multiAccount ? decodeMcpAccountLabelArgument(args.account_label ?? "default") : "default";
@@ -573,6 +646,8 @@ export function createMcpManagementTools(
       defineCommunicateTool(management, {
         id: "REMOVE_MCP_ACCOUNT", name: "RemoveMcpAccount", description: "Remove ONE account from an MCP server: the account and its credential are deleted, while the server and its other accounts stay. This is destructive — confirm with the user via a question widget before calling it. To remove a whole custom server (every account), use UninstallMcpServer; to remove a server's whole plugin (every connector, skill, and account), use UninstallPlugin.", parameters: accountParameters,
         execute: guardMutation(async (_ctx, args: z.infer<typeof accountParameters>, deps) => {
+          const target = await resolveServerRow(deps, args.server_id);
+          if (target != null && isLocalMcpInstalledServer(target)) return localStdioRefusal(target, "there is no account on it to remove");
           const serverId = await resolveServerId(deps, args.server_id);
           if (serverId == null) return noInstalledServerMessage(args.server_id);
           const accountKey = decodeMcpAccountLabelArgument(args.account_label);
@@ -583,6 +658,8 @@ export function createMcpManagementTools(
       defineCommunicateTool(management, {
         id: "RENAME_MCP_ACCOUNT", name: "RenameMcpAccount", description: "Rename one of an MCP server's accounts (change its label). The account's server identifier changes with the label at the next listing, so after renaming, re-run GetMcpServerStatus (or GetMcpTools) before calling that account's tools again — stale identifiers fail cleanly. Confirm with a question widget first.", parameters: renameParameters,
         execute: guardMutation(async (_ctx, args: z.infer<typeof renameParameters>, deps) => {
+          const target = await resolveServerRow(deps, args.server_id);
+          if (target != null && isLocalMcpInstalledServer(target)) return localStdioRefusal(target, "there is no account on it to rename");
           const serverId = await resolveServerId(deps, args.server_id);
           if (serverId == null) return noInstalledServerMessage(args.server_id);
           const accountKey = decodeMcpAccountLabelArgument(args.account_label);

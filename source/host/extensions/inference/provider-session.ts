@@ -92,6 +92,61 @@ function contextConversationId(ctx: unknown): string | undefined {
   } catch { return undefined; }
 }
 
+function isAbortSignal(value: unknown): value is AbortSignal {
+  return typeof value === "object" && value != null &&
+    typeof (value as AbortSignal).aborted === "boolean" &&
+    typeof (value as AbortSignal).addEventListener === "function";
+}
+
+/**
+ * The turn context is the abort authority of a routed turn: `stream-attempt.ts` derives the
+ * per-attempt context from `ctx.withCancel()`, so `ctx.signal` is exactly the signal the
+ * first-token-stall deadline and the user's cancel abort. Reading it here is what lets
+ * `streamText` kill its socket instead of leaving it open until the process exits.
+ */
+function contextAbortSignal(ctx: unknown): AbortSignal | undefined {
+  if (ctx == null || typeof ctx !== "object") return undefined;
+  const signal = (ctx as { signal?: unknown }).signal;
+  return isAbortSignal(signal) ? signal : undefined;
+}
+
+/**
+ * The context window of the routed model, reported to the agent as `extendedUsage.maxTokens`.
+ *
+ * Every consumer treats a non-positive `maxTokens` as "unknown": background summarization
+ * returns an undefined trigger threshold, the token-overage block is skipped, and
+ * `conversation-state.ts` never records a window for the model, so the conversation is never
+ * compacted. A hardcoded `0` therefore disabled all three at once, silently.
+ */
+const ROUTED_CONTEXT_WINDOWS: ReadonlyArray<readonly [RegExp, number]> = [
+  [/^claude|anthropic|^claude-code/, 200_000],
+  [/gemini|^google[/]/, 1_000_000],
+  [/gpt-5|^openai[/]gpt-5/, 400_000],
+  [/gpt-4/, 128_000],
+  [/llama|qwen|mistral|phi-|gemma/, 32_768],
+  [/deepseek/, 128_000],
+];
+export const DEFAULT_ROUTED_CONTEXT_WINDOW = 128_000;
+export function resolveRoutedContextWindow(modelId: string, env: NodeJS.ProcessEnv = process.env): number {
+  const override = Number.parseInt(env.SAND_ROUTED_CONTEXT_WINDOW?.trim() ?? "", 10);
+  if (Number.isFinite(override) && override > 0) return override;
+  const id = modelId.toLowerCase();
+  for (const [pattern, size] of ROUTED_CONTEXT_WINDOWS) if (pattern.test(id)) return size;
+  return DEFAULT_ROUTED_CONTEXT_WINDOW;
+}
+
+/**
+ * `ai` 4.3.17 silently defaults `temperature` to 0 for every `streamText` call, so a routed
+ * request's sampling was decided by an SDK default nobody in this repository had read. The
+ * value is now stated at the call site and can be changed without touching the SDK:
+ * `SAND_ROUTED_TEMPERATURE=0.7`. Omitting the parameter is not possible — the SDK re-applies
+ * its own 0 — so there is no `unset` mode here on purpose.
+ */
+export function resolveRoutedTemperature(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number.parseFloat(env.SAND_ROUTED_TEMPERATURE?.trim() ?? "");
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 // The custom endpoint is whatever the user typed into Settings → Router. It can be any
 // OpenAI-compatible host, so an OpenCode-specific header must not ride along to an
 // unrelated one: only `opencode.ai` and its subdomains get it.
@@ -242,7 +297,7 @@ function codexExecutor(messages: readonly ProviderMessage[], invocationId: strin
       })) {
         if (event.type === "text-delta") { text += event.delta; yield { type: "text-delta" as const, textDelta: event.delta }; continue; }
         const basic = { promptTokens: event.usage.inputTokens, completionTokens: event.usage.outputTokens, totalTokens: event.usage.inputTokens + event.usage.outputTokens };
-        const extended = { ...event.usage, maxTokens: 0 };
+        const extended = { ...event.usage, maxTokens: resolveRoutedContextWindow(model) };
         onUsage?.(event.usage);
         usage.resolve(basic);
         extendedUsage.resolve(extended);
@@ -273,7 +328,7 @@ function claudeExecutor(messages: readonly ProviderMessage[], invocationId: stri
       const input = final.usage.input_tokens, output = final.usage.output_tokens, cacheRead = final.usage.cache_read_input_tokens ?? 0, cacheWrite = final.usage.cache_creation_input_tokens ?? 0;
       onUsage?.({ inputTokens: input, outputTokens: output, cacheReadTokens: cacheRead, cacheWriteTokens: cacheWrite });
       usage.resolve({ promptTokens: input, completionTokens: output, totalTokens: input + output });
-      extendedUsage.resolve({ inputTokens: input, outputTokens: output, cacheReadTokens: cacheRead, cacheWriteTokens: cacheWrite, maxTokens: 0 });
+      extendedUsage.resolve({ inputTokens: input, outputTokens: output, cacheReadTokens: cacheRead, cacheWriteTokens: cacheWrite, maxTokens: resolveRoutedContextWindow("claude-code") });
       metadata.resolve({ anthropic: { sessionId: final.session_id, totalCostUsd: final.total_cost_usd } });
       resultResponse.resolve(response(text, invocationId, "claude-code"));
     } catch (error) { usage.reject(error); extendedUsage.reject(error); metadata.reject(error); resultResponse.reject(error); throw error; }
@@ -298,22 +353,62 @@ function toToolSet(definitions: readonly Loose[] | undefined, executeTool?: Rout
   return Object.keys(tools).length === 0 ? undefined : tools;
 }
 
-function openRouterExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void) {
+/** Per-call controls the runner threads down to `streamText`. */
+export interface RoutedStreamCallOptions {
+  /**
+   * Cancels the provider socket. The runner always supplies the turn context's signal; a
+   * caller without a turn context (labeling, routing probes) may omit it.
+   */
+  readonly abortSignal?: AbortSignal;
+}
+
+function resolveAbortSignal(ctx: unknown, options?: RoutedStreamCallOptions): AbortSignal | undefined {
+  return options?.abortSignal ?? contextAbortSignal(ctx);
+}
+
+/**
+ * `maxRetries: 0` is deliberate. The SDK default of 2 sleeps between attempts *inside* one
+ * `streamText` call, so a 429 or a 500 turned into a silent seven-second pause and then a
+ * single "Failed after 3 attempts". Retries belong to `stream-attempt.ts`, which already
+ * has the ladder, the backoff, the server-paced `Retry-After` and the retry counter.
+ */
+function routedStreamTextParams(ctx: unknown, options?: RoutedStreamCallOptions): { readonly abortSignal?: AbortSignal; readonly maxRetries: number; readonly temperature: number } {
+  const abortSignal = resolveAbortSignal(ctx, options);
+  return {
+    ...(abortSignal === undefined ? {} : { abortSignal }),
+    maxRetries: 0,
+    temperature: resolveRoutedTemperature(),
+  };
+}
+
+function openRouterExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void, ctx?: unknown, options?: RoutedStreamCallOptions) {
   const id = process.env.SAND_OPENROUTER_MODEL?.trim() || "openai/gpt-5.2";
-  const model: LanguageModelV1 = createOpenAI({ apiKey: openRouterCredential(), baseURL: "https://openrouter.ai/api/v1", compatibility: "compatible", name: "openrouter", headers: { "HTTP-Referer": "https://github.com/grok-bot-reconstructed", "X-Title": "Grok Bot Reconstructed" } }).chat(id as any);
+  const model: LanguageModelV1 = createOpenAI({
+    apiKey: openRouterCredential(),
+    baseURL: "https://openrouter.ai/api/v1",
+    // `strict` is the only mode that puts `stream_options: { include_usage: true }` on the
+    // wire (`@ai-sdk/openai` 1.3.24 sends it under a strict guard). Without it the provider
+    // returns no usage frame and `result.usage` resolves with nothing to report.
+    compatibility: "strict",
+    name: "openrouter",
+    headers: { "HTTP-Referer": "https://github.com/grok-bot-reconstructed", "X-Title": "Grok Bot Reconstructed" },
+  }).chat(id as any);
   const tools = toToolSet(definitions, executeTool);
-  const result = streamText({ model, system: GROK_ROUTER_SYSTEM_PROMPT, messages: messages as CoreMessage[], ...(tools === undefined ? {} : { tools }), toolCallStreaming: true, maxSteps: tools === undefined ? 1 : 8 });
-  const extendedUsage = result.usage.then(value => ({ inputTokens: value.promptTokens, outputTokens: value.completionTokens, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 0 }));
+  const result = streamText({ model, system: GROK_ROUTER_SYSTEM_PROMPT, messages: messages as CoreMessage[], ...(tools === undefined ? {} : { tools }), toolCallStreaming: true, maxSteps: tools === undefined ? 1 : 8, ...routedStreamTextParams(ctx, options) });
+  const extendedUsage = result.usage.then(value => ({ inputTokens: value.promptTokens, outputTokens: value.completionTokens, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: resolveRoutedContextWindow(id) }));
   if (onUsage != null) void extendedUsage.then(onUsage);
   return { fullStream: result.fullStream, response: result.response, usage: result.usage, extendedUsage, providerMetadata: result.providerMetadata, invocationId: Promise.resolve(invocationId) };
 }
 
-function customExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void, sessionId?: string) {
+function customExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void, sessionId?: string, ctx?: unknown, options?: RoutedStreamCallOptions) {
   const endpoint = customEndpoint();
   const model: LanguageModelV1 = createOpenAI({
     apiKey: customCredential(),
     baseURL: endpoint.baseUrl,
-    compatibility: "compatible",
+    // Same reason as the OpenRouter route: only `strict` puts `stream_options.include_usage`
+    // on the wire, and without a usage frame `extendedUsage.maxTokens` had nothing real to
+    // report and the token ledger stayed empty.
+    compatibility: "strict",
     name: "custom",
     // `headers` on the provider instance is the layer that reaches the wire. `createOpenAI`
     // folds it into `getHeaders()`, which the chat model passes to `postJsonToApi` as
@@ -324,21 +419,21 @@ function customExecutor(messages: readonly ProviderMessage[], invocationId: stri
     headers: customEndpointHeaders(endpoint.baseUrl, sessionId ?? processSessionId()),
   }).chat(endpoint.modelId as any);
   const tools = toToolSet(definitions, executeTool);
-  const result = streamText({ model, system: GROK_ROUTER_SYSTEM_PROMPT, messages: messages as CoreMessage[], ...(tools === undefined ? {} : { tools }), toolCallStreaming: true, maxSteps: tools === undefined ? 1 : 8 });
-  const extendedUsage = result.usage.then(value => ({ inputTokens: value.promptTokens, outputTokens: value.completionTokens, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 0 }));
+  const result = streamText({ model, system: GROK_ROUTER_SYSTEM_PROMPT, messages: messages as CoreMessage[], ...(tools === undefined ? {} : { tools }), toolCallStreaming: true, maxSteps: tools === undefined ? 1 : 8, ...routedStreamTextParams(ctx, options) });
+  const extendedUsage = result.usage.then(value => ({ inputTokens: value.promptTokens, outputTokens: value.completionTokens, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: resolveRoutedContextWindow(endpoint.modelId) }));
   if (onUsage != null) void extendedUsage.then(onUsage);
   return { fullStream: result.fullStream, response: result.response, usage: result.usage, extendedUsage, providerMetadata: result.providerMetadata, invocationId: Promise.resolve(invocationId) };
 }
 
 class ProviderPromptExecutor extends BasePromptExecutor<ProviderMessage> {
   constructor(readonly provider: RoutedProvider, initialMessages?: readonly ProviderMessage[], readonly onUsage?: (usage: UsageRecord) => void) { super(new BasePromptBuilder(initialMessages)); }
-  stream(ctx: unknown, invocationId = crypto.randomUUID(), definitions?: readonly Loose[]) {
+  stream(ctx: unknown, invocationId = crypto.randomUUID(), definitions?: readonly Loose[], options?: RoutedStreamCallOptions) {
     if (this.provider === "codex") return codexExecutor(this.getMessages(), invocationId, definitions, undefined, this.onUsage);
     if (this.provider === "claude-code") return claudeExecutor(this.getMessages(), invocationId, this.onUsage);
     // Only the custom route asks for a session identity, and it takes the real conversation
     // id off the turn context so the header survives every turn of the same conversation.
-    if (this.provider === "custom") return customExecutor(this.getMessages(), invocationId, definitions, undefined, this.onUsage, contextConversationId(ctx));
-    return openRouterExecutor(this.getMessages(), invocationId, definitions, undefined, this.onUsage);
+    if (this.provider === "custom") return customExecutor(this.getMessages(), invocationId, definitions, undefined, this.onUsage, contextConversationId(ctx), ctx, options);
+    return openRouterExecutor(this.getMessages(), invocationId, definitions, undefined, this.onUsage, ctx, options);
   }
 }
 
@@ -354,16 +449,19 @@ export async function runRoutedProviderText(provider: RoutedProvider, messages: 
   readonly onTextDelta?: (delta: string, accumulated: string) => void;
   /** The conversation this text belongs to. The custom endpoint reports it to OpenCode Go. */
   readonly sessionId?: string;
+  /** Cancels the provider socket; without it the request outlives its caller. */
+  readonly abortSignal?: AbortSignal;
 }): Promise<string> {
   const invocationId = crypto.randomUUID();
   const onUsage = (usage: UsageRecord) => recordRoutedUsage(provider, usage);
+  const callOptions = options?.abortSignal === undefined ? undefined : { abortSignal: options.abortSignal };
   const result = provider === "codex"
     ? codexExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage)
     : provider === "claude-code"
       ? claudeExecutor(messages, invocationId, onUsage, options?.mcpServerUrl)
       : provider === "custom"
-        ? customExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage, options?.sessionId)
-        : openRouterExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage);
+        ? customExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage, options?.sessionId, undefined, callOptions)
+        : openRouterExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage, undefined, callOptions);
   let text = "";
   for await (const event of result.fullStream) {
     if (event.type === "text-delta" && typeof event.textDelta === "string") {

@@ -1,3 +1,27 @@
+/**
+ * The Router settings test used to pin nine lines of an `execute()` that no longer exists.
+ *
+ * Those nine lines -- `executeTool: async (definition, toolArgs, toolCallId)`,
+ * `setTimeout(resolve, 1_200)`, `currentActivity: { kind: "thinking" }`, `onTextDelta`,
+ * `streaming`, `postEvent("agents"`, `createRoutedMcpBridge`, `listRoutedMcpTools` and
+ * `executeRoutedMcpTool` -- were the interceptor. The coordinator's inference route claimed
+ * `sendPrompt` for every provider except `cursor`, ran the user's message as a bare chat
+ * completion with no agent system prompt and no tools, and streamed the reply into the chat as
+ * if the agent had sent it. The pins kept that code alive: the only way to satisfy them was to
+ * restore the defect, so the file that was supposed to describe the shipped product described
+ * the bug instead.
+ *
+ * The pins are now the contract the fixed route actually carries: it declines the turn, it owns
+ * no tool executor and no MCP bridge, and the one thing it still asks a model for is a
+ * conversation title with no tool list. The absence of the interceptor's machinery is pinned as
+ * firmly as its presence was, because a route that starts answering again has to bring all of it
+ * back. `send-prompt-reaches-the-agent.test.mjs` proves the same thing behaviourally.
+ *
+ * The rest of this file is the packaging contract it always was: the packaged `.app` bundle is
+ * the verification authority, the renderer stays checksum-pinned, and the Router settings screen
+ * reads the trusted backend and the recorded usage.
+ */
+
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -152,9 +176,31 @@ test("Router settings use the trusted backend and display recorded inference usa
   assert.doesNotMatch(rendererPatch, /ANTHROPIC_API_KEY|OPENAI_API_KEY/);
   assert.match(turnShell, /inferenceProvider === "cursor"/);
   assert.match(turnShell, /createProviderPromptSession\(inferenceProvider\)/);
+  // The coordinator's inference route used to claim `sendPrompt` for every provider except
+  // `cursor` and answer the user itself: a bare chat completion with no agent system prompt and
+  // no tools, written into the chat as if the agent had sent it. It now declines the turn and
+  // asks a model for exactly one thing -- a conversation title, with no tool list -- so these are
+  // the pins that hold that in place. Every one of them is a real symbol or a real call site in
+  // the shipped file, never a line that exists only to satisfy a regex.
   assert.match(coordinator, /method !== "sendPrompt" \|\| provider === "cursor"/);
-  assert.match(coordinator, /executeTool: async \(definition, toolArgs, toolCallId\)/);
-  assert.match(coordinatorMain, /command\(commands, "listRoutedMcpTools", args\)/);
+  assert.match(coordinator, /return \{ handled: false \}/);
+  // The old `execute()` brought a tool executor, a streaming callback, an activity indicator and
+  // the whole routed MCP bridge with it. A route that answers the user again needs every one of
+  // those back, so their absence is the guard -- a route that quietly grew an answer path would
+  // have to grow them with it. These come first on purpose: they are the defect itself.
+  assert.doesNotMatch(coordinator, /onTextDelta/);
+  assert.doesNotMatch(coordinator, /executeTool|createRoutedMcpBridge|listRoutedMcpTools|executeRoutedMcpTool/);
+  assert.doesNotMatch(coordinator, /currentActivity|postEvent\("agents"/);
+  assert.doesNotMatch(coordinator, /routed-mcp-bridge/);
+  assert.doesNotMatch(coordinator, /setTimeout\(resolve, 1_200\)/);
+  // What is left is the one concern that is genuinely agent-free: a conversation title, asked for
+  // with no tool list, so no tool call can be answered with no agent behind it.
+  assert.match(coordinator, /runRoutedProviderText\(/);
+  assert.match(coordinator, /\{ sessionId: agentId \}/);
+  assert.match(coordinator, /parseRoutedControlEnvelope\(reply\)/);
+  assert.match(coordinator, /applyRoutedControlEnvelope\(agentId, envelope\)/);
+  // The transcript file survives as a read-only archive of the turns this route used to own, so
+  // the conversations the user can still open keep merging them. It is written by nothing here.
   assert.match(coordinator, /inference-router-transcript\.json/);
   assert.match(mcpBridge, /openWorldHint: !readOnly/);
   assert.match(coordinator, /schemaVersion: 2/);
@@ -162,20 +208,14 @@ test("Router settings use the trusted backend and display recorded inference usa
   assert.match(coordinator, /\.map\(projectInferenceRouterTranscriptEntry\)/);
   assert.match(coordinator, /readonly richText\?: string/);
   assert.match(coordinator, /richText: entry\.richText/);
-  assert.match(coordinator, /setTimeout\(resolve, 1_200\)/);
+  // A reaction the user makes on one of those archived entries is still this route's business.
   assert.match(coordinator, /method === "reactToMessage"/);
   assert.match(coordinator, /reaction\.by === "me"/);
-  assert.match(coordinator, /currentActivity: \{ kind: "thinking" \}/);
-  assert.match(coordinator, /onTextDelta/);
-  assert.match(coordinator, /streaming/);
-  assert.match(coordinator, /postEvent\("agents"/);
-  assert.match(coordinator, /createRoutedMcpBridge/);
-  assert.match(coordinator, /listRoutedMcpTools/);
-  assert.match(coordinator, /executeRoutedMcpTool/);
   assert.match(mcpBridge, /server\.listen\(0, "127\.0\.0\.1"/);
   assert.match(mcpBridge, /readOnlyHint: readOnly/);
   assert.match(mcpBridge, /request\.url !== `\/mcp\/\$\{secret\}`/);
   assert.match(coordinator, /kind: "send-message"/);
   assert.match(coordinatorMain, /createCoordinatorInferenceRouter/);
+  assert.match(coordinatorMain, /command\(commands, "listRoutedMcpTools", args\)/);
   assert.match(coordinatorMain, /routed\.handled/);
 });

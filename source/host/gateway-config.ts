@@ -15,12 +15,6 @@ export interface GatewayServerConfig {
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 export function isLoopbackHost(host: string): boolean { return LOOPBACK_HOSTS.has(host.trim().toLowerCase()); }
 
-function isTruthyEnv(value: string | undefined): boolean {
-  if (value == null) return false;
-  const normalized = value.trim().toLowerCase();
-  return normalized === "1" || normalized === "true" || normalized === "yes";
-}
-
 function readPort(raw: string | undefined): number | undefined {
   if (raw == null || raw.length === 0) return undefined;
   const parsed = Number.parseInt(raw, 10);
@@ -46,9 +40,17 @@ export function resolveGatewayServerConfig(
   const port = readPort(env.SAND_HOST_PORT);
   const tls = resolveTls(env);
   const pinnedToken = env.SAND_GATEWAY_TOKEN?.trim();
-  const requireAuth = !isLoopbackHost(host) || isTruthyEnv(env.SAND_GATEWAY_REQUIRE_AUTH) || (pinnedToken != null && pinnedToken.length > 0);
-  const authToken = requireAuth ? (pinnedToken != null && pinnedToken.length > 0 ? pinnedToken : generateToken()) : undefined;
-  return { host, ...(port === undefined ? {} : { port }), ...(authToken === undefined ? {} : { authToken }), ...(tls === undefined ? {} : { tls }) };
+  // Authentication is unconditional. The previous rule asked for a token only
+  // when the host was not loopback, when SAND_GATEWAY_REQUIRE_AUTH was set, or
+  // when a pinned token already existed. SAND_GATEWAY_BIND_HOST=0.0.0.0 with no
+  // pinned token satisfied none of those three, so `authToken` came back
+  // undefined, `gateway-server.ts` skipped its bearer check, and every one of
+  // the ~124 host commands - setBoxSecrets, setHostSettings, deleteAgents -
+  // answered any caller on the LAN. Loopback is not a reason to drop the
+  // credential either: the token is what the launcher and the desktop share,
+  // and it is read back out of gateway.json.
+  const authToken = pinnedToken != null && pinnedToken.length > 0 ? pinnedToken : generateToken();
+  return { host, ...(port === undefined ? {} : { port }), authToken, ...(tls === undefined ? {} : { tls }) };
 }
 
 export function gatewayScheme(config: GatewayServerConfig): "http" | "https" { return config.tls == null ? "http" : "https"; }

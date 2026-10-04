@@ -60,11 +60,29 @@ export class RoutedTranscriptMirror<Checkpoint, Store> {
     readonly routes = new Map<string, Promise<TranscriptMirrorRoute>>()
   ) {}
 
+  /**
+   * Pins the conversation to a regime for as long as the claim is in doubt, then
+   * releases it.
+   *
+   * The cached promise exists so concurrent first writes share one claim rather
+   * than racing two. It must not outlive a *failed* claim: `selectRoute` can fail
+   * for reasons that are not about the conversation — a transient `EPERM` or
+   * `EBUSY` while the marker is being installed, a torn read of the marker — and
+   * caching the rejection made every later `route()` for that conversation
+   * re-throw the same error for the life of the process, so a claim that would
+   * have succeeded on the next attempt never got one. A rejected claim is
+   * therefore dropped from the cache, and only a resolved one pins the regime.
+   */
   route(conversationId: string): Promise<TranscriptMirrorRoute> {
     const selected = this.routes.get(conversationId);
     if (selected != null) return selected;
 
-    const route = this.selectRoute(conversationId);
+    const route = this.selectRoute(conversationId).catch((error: unknown) => {
+      if (this.routes.get(conversationId) === route) {
+        this.routes.delete(conversationId);
+      }
+      throw error;
+    });
     this.routes.set(conversationId, route);
     return route;
   }

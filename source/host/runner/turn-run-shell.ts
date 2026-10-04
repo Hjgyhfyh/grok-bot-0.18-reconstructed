@@ -350,6 +350,8 @@ export interface TurnRunOptions {
   readonly replyContext?: unknown;
   readonly hidden?: boolean;
   readonly isSilenceAllowed?: boolean;
+  /** The user's reactions to the agent's own messages, reported once each. */
+  readonly userReactionNotices?: readonly string[];
   readonly autoReviewEpoch?: "continue" | "new";
   readonly lineage?: {
     readonly parentRequestId: string;

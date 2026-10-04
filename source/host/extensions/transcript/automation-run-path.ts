@@ -109,21 +109,18 @@ export class AutomationRunPath {
   async fireAutomation(
     args: FireAutomationArgs,
   ): Promise<FireAutomationOutcome> {
-    if (!this.tm.execution.canExecute) return undefined;
+    if (!this.tm.execution.canExecute) {
+      // The host cannot run turns right now. Skipping quietly made a routine
+      // that never fired look like one that had nothing to do.
+      this.reportRunDropped(args, "execution_unavailable");
+      return undefined;
+    }
     const runKey = `${args.agentId}:${args.automation.id}`;
     const eventBatch = args.events ?? [];
     const isEventFire = eventBatch.length > 0;
     if (!isEventFire) {
       if (this.inFlightAutomationKeys.has(runKey)) {
-        this.eventFires.reportFireDropped({
-          agentId: args.agentId,
-          trigger: args.trigger,
-          reason: "duplicate_in_flight",
-          ...(args.scheduledForMs === undefined
-            ? {}
-            : { scheduledForMs: args.scheduledForMs }),
-          ...(args.runUuid === undefined ? {} : { runUuid: args.runUuid }),
-        });
+        this.reportRunDropped(args, "duplicate_in_flight");
         return undefined;
       }
       this.inFlightAutomationKeys.add(runKey);
@@ -133,7 +130,23 @@ export class AutomationRunPath {
       let session: any;
       try {
         session = await this.tm.sessions.resolveBackgroundSession(args.agentId);
-      } catch {
+      } catch (error) {
+        // This used to be a bare `return undefined`: no telemetry at all and
+        // nothing for the user, so a routine that could not open a session
+        // looked exactly like a routine that was never due.
+        this.reportRunDropped(args, "session_unavailable");
+        this.tm.telemetry.reportAgentError({
+          source: "automation",
+          conversationId: args.agentId,
+          error: classifyAgentError(error),
+          detail: sandErrorDetail(error),
+        });
+        this.tm.trayErrors.pushError({
+          agentId: args.agentId,
+          title: `Routine "${args.automation.name}" could not start`,
+          detail: `Grok Bot could not open a session for this agent, so this routine did not run: ${errorMessage(error)}`,
+          dedupeKey: `automation-session-unavailable:${args.agentId}:${args.automation.id}`,
+        });
         return undefined;
       }
       const isGroup = this.tm.groupChat.isGroupSession(session);
@@ -142,15 +155,7 @@ export class AutomationRunPath {
       if (!isGroup && isBackgroundAutomationTrigger(args.trigger)) {
         const guard = await this.spendGuard.apply(session, args.automation);
         if (guard.paused) {
-          this.eventFires.reportFireDropped({
-            agentId: args.agentId,
-            trigger: args.trigger,
-            reason: "user_away_paused",
-            ...(args.scheduledForMs === undefined
-              ? {}
-              : { scheduledForMs: args.scheduledForMs }),
-            ...(args.runUuid === undefined ? {} : { runUuid: args.runUuid }),
-          });
+          this.reportRunDropped(args, "user_away_paused");
           return undefined;
         }
         spendGuardReminder = guard.reminder;
@@ -364,6 +369,23 @@ export class AutomationRunPath {
     return runOutcome;
   }
 
+  /**
+   * The single place a refused run is recorded. Every path that returns without
+   * running something goes through here, so a skipped fire is always visible in
+   * `reportFireDropped` telemetry instead of disappearing.
+   */
+  reportRunDropped(args: FireAutomationArgs, reason: string): void {
+    this.eventFires?.reportFireDropped?.({
+      agentId: args.agentId,
+      trigger: args.trigger,
+      reason,
+      ...(args.scheduledForMs === undefined
+        ? {}
+        : { scheduledForMs: args.scheduledForMs }),
+      ...(args.runUuid === undefined ? {} : { runUuid: args.runUuid }),
+    });
+  }
+
   notifyAutomationFailure(
     session: any,
     automation: AutomationRecord,
@@ -371,7 +393,15 @@ export class AutomationRunPath {
     trigger: AutomationRunTrigger,
     description: Record<string, any>,
   ): void {
-    if (isBackgroundAutomationTrigger(trigger)) return;
+    // There used to be `if (isBackgroundAutomationTrigger(trigger)) return;`
+    // here: a routine that fired on its own schedule or on a listener event and
+    // then failed recorded an `error` in its run history and went no further.
+    // The user learned about it only by opening the routine themselves, and a
+    // routine that failed every night for a week looked healthy. A background
+    // trigger is not a reason to be quiet — the run was still one they depend
+    // on — so background failures now take the same route as a manual one: the
+    // same tray error, deduped per agent, routine and error kind, carrying the
+    // occurrence count so a nightly failure still collapses into one entry.
     const errorKind = normalizeAutomationErrorKind(detail);
     const key = `${session.id}:${automation.id}:${errorKind}`;
     const occurrence = (this.automationFailureOccurrences.get(key) ?? 0) + 1;

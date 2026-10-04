@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "echo": {
+      "command": "node",
+      "args": [
+        "D:\\ТЕСТЫ\\DeepSeek-Harness\\grok-bot-0.18-reconstructed\\local-mcp\\servers\\echo-mcp-server.mjs"
+      ]
+    }
+  }
+}

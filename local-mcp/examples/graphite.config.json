@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "graphite": {
+      "command": "node",
+      "args": [
+        "D:\\ТЕСТЫ\\DeepSeek-Harness\\grok-bot-0.18-reconstructed\\local-mcp\\servers\\graphite-notes-mcp-server.mjs"
+      ],
+      "env": {
+        "GRAPHITE_VAULT": "C:\\Users\\user\\graphite-lite"
+      }
+    }
+  }
+}

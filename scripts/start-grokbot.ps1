@@ -2,9 +2,20 @@
 <#
   Grok Bot - turnkey launcher (Windows).
 
-  Decrypts the DPAPI-protected credentials in <sandRoot>\launcher-secrets.txt and
-  launches the packaged app with them in the environment. The credentials are
-  never written in plaintext and never leave this Windows user account.
+  Decrypts the DPAPI-protected credentials in <userProfile>\.grokbot\launcher-secrets.txt and
+  launches the packaged app with them in the environment.
+
+  Credential exposure, stated plainly:
+    * launcher-secrets.txt is DPAPI-protected and stays encrypted on disk.
+    * box-secrets.json under %LOCALAPPDATA%\GrokBotLocalBox IS plaintext. The
+      host reads its secrets from the box store, not from the environment,
+      because process.env does not survive the hand-off into the agent worker,
+      so the decryption below has to be written out. Its ACL is restricted to
+      this user, SYSTEM and Administrators, but any process running as this
+      user - including the agent itself - can read it. Do not treat it as a
+      secret store against the agent.
+    * The gateway bearer token is generated on first launch and kept in
+      launcher-gateway-token.txt next to it. It is never a literal in this file.
 
   Usage:
     powershell -ExecutionPolicy Bypass -File scripts\start-grokbot.ps1
@@ -79,12 +90,14 @@ $env:SAND_RETIRE_LEGACY_STORE_BLOBS = '1'
 # over the gateway below. Without this the desktop has no host to talk to and
 # reports "Can't reach your computer".
 #
-# The gateway stays on loopback and is protected by a bearer token. Do not bind
-# it to 0.0.0.0: the token grants ~124 commands including setHostSettings,
-# setBoxSecrets and deleteAgents, and it is stored in plain text.
+# The gateway stays on loopback and is protected by a bearer token. The token
+# grants ~124 commands including setHostSettings, setBoxSecrets and deleteAgents,
+# so it must not be a value that anyone else already knows. It used to be a
+# hardcoded literal on this line: a live probe with that string reached
+# setBoxSecrets, deleteAgents, setHostSettings and sendPrompt and all four
+# answered 200, because the literal travelled with the source.
 $boxRoot = Join-Path $env:LOCALAPPDATA 'GrokBotLocalBox'
 $gatewayPort = 8790
-$gatewayToken = 'grok-local-box-token-abc123'
 $hostCjs = Join-Path $repoRoot '.build\fidelity\app\dist\host\host-main.cjs'
 
 function Get-GatewayOwner {
@@ -92,15 +105,115 @@ function Get-GatewayOwner {
         Select-Object -First 1 -ExpandProperty OwningProcess
 }
 
+# 32 bytes from the OS CSPRNG, base64url so the value survives an Authorization
+# header unchanged.
+function New-LocalBoxGatewayToken {
+    $bytes = New-Object byte[] 32
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    return [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+# Restrict a file to this user, SYSTEM and Administrators, with inheritance off.
+# Best effort: a failure here warns and continues, because refusing to launch is
+# worse than a wider ACL on a file that already had one.
+function Protect-LocalBoxSecretFile {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    try {
+        $acl = Get-Acl -LiteralPath $Path
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleAll($rule) }
+        $identities = @(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().User,
+            (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')),
+            (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544'))
+        )
+        foreach ($sid in $identities) {
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sid, [System.Security.AccessControl.FileSystemRights]::FullControl,
+                [System.Security.AccessControl.AccessControlType]::Allow)))
+        }
+        Set-Acl -LiteralPath $Path -AclObject $acl
+    } catch {
+        Write-Warning "Could not restrict the ACL on $Path - it keeps the ACL it already had."
+    }
+}
+
+function Save-LocalBoxGatewayToken {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Token
+    )
+    $directory = Split-Path -Parent $Path
+    if ($directory -and -not (Test-Path -LiteralPath $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+    [System.IO.File]::WriteAllText($Path, $Token, (New-Object System.Text.UTF8Encoding($false)))
+    Protect-LocalBoxSecretFile -Path $Path
+    return $Token
+}
+
+function Get-StoredGatewayToken {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    try {
+        $value = ([System.IO.File]::ReadAllText($Path)).Trim()
+    } catch {
+        return $null
+    }
+    # 32 bytes in base64url is 43 characters. Anything shorter was truncated or
+    # hand-edited, and treating it as a token would only produce 401s later.
+    if ($value.Length -lt 32) { return $null }
+    return $value
+}
+
+# The running host republishes its token into gateway.json. When a box is
+# already listening, adopting that token is the only way the desktop and the
+# host agree; minting a new one here would give every command a 401.
+function Get-RunningGatewayToken {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    try {
+        $parsed = [System.IO.File]::ReadAllText($Path) | ConvertFrom-Json
+        $value = [string]$parsed.token
+    } catch {
+        return $null
+    }
+    $value = $value.Trim()
+    if ($value.Length -lt 32) { return $null }
+    return $value
+}
+
+function Resolve-LocalBoxGatewayToken {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [switch]$PreferRunningGateway
+    )
+    $tokenFile = Join-Path $Root 'launcher-gateway-token.txt'
+    $stored = Get-StoredGatewayToken -Path $tokenFile
+    if ($stored) { return $stored }
+    if ($PreferRunningGateway) {
+        $running = Get-RunningGatewayToken -Path (Join-Path $Root 'gateway.json')
+        if ($running) { return (Save-LocalBoxGatewayToken -Path $tokenFile -Token $running) }
+    }
+    return (Save-LocalBoxGatewayToken -Path $tokenFile -Token (New-LocalBoxGatewayToken))
+}
+
 if (Test-Path -LiteralPath $hostCjs) {
     $existing = Get-GatewayOwner
+    # A token the running host already holds wins over a fresh one; otherwise a
+    # second launch would leave the desktop with a credential nobody accepts.
+    $gatewayToken = Resolve-LocalBoxGatewayToken -Root $boxRoot -PreferRunningGateway:([bool]$existing)
     if ($existing) {
         Write-Host "box        : already running (pid $existing)"
     } else {
         # A stale lock from an unclean shutdown would make the next start fail.
         Remove-Item (Join-Path $boxRoot 'host.lock') -Force -ErrorAction SilentlyContinue
         # The host reads its secrets from the box store, not from the environment:
-        # process.env does not survive the hand-off into the agent worker.
+        # process.env does not survive the hand-off into the agent worker. This
+        # file is therefore plaintext by necessity; the ACL below is the only
+        # thing between the decrypted API keys and the agent, which runs as this
+        # same user. See the header note.
         $boxSecretStore = Join-Path $boxRoot 'box-secrets.json'
         $boxSecrets = [ordered]@{ version = 1; secrets = [ordered]@{} }
         foreach ($name in $secrets.Keys) { $boxSecrets.secrets[$name] = $secrets[$name] }
@@ -109,6 +222,7 @@ if (Test-Path -LiteralPath $hostCjs) {
             $boxSecretStore,
             ($boxSecrets | ConvertTo-Json -Depth 6),
             (New-Object System.Text.UTF8Encoding($false)))
+        Protect-LocalBoxSecretFile -Path $boxSecretStore
 
         # `cmd /c` is used because Start-Process -RedirectStandardOutput fails on
         # this machine ("Item has already been added. Key in dictionary: NO_PROXY").

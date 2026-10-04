@@ -23,6 +23,26 @@ import type {
 
 type LiveSession = any;
 
+/** Reactions left by the human in the chat, oldest first, one emoji per entry. */
+const MAX_REACTION_NOTICES = 5;
+const MAX_TRACKED_REACTION_NOTICE_KEYS = 32;
+
+function userReactionsOn(entry: TranscriptEntry): string[] {
+  const reactions = entry.reactions;
+  if (!Array.isArray(reactions)) return [];
+  return reactions.flatMap((raw) => {
+    const reaction = raw as { emoji?: unknown; by?: unknown } | null;
+    if (reaction == null || typeof reaction !== "object") return [];
+    if (reaction.by !== SAND_REACTION_SELF) return [];
+    const emoji = typeof reaction.emoji === "string" ? reaction.emoji.trim() : "";
+    return emoji.length === 0 ? [] : [emoji];
+  });
+}
+
+function reactionNoticeKey(emoji: string): string {
+  return `${SAND_REACTION_SELF}:${emoji}`;
+}
+
 export class WidgetResponses {
   constructor(readonly tm: TranscriptManagerLike) {}
 
@@ -60,6 +80,72 @@ export class WidgetResponses {
       session.db.updateTranscriptEntry(entry.id, markSkipped);
     }
     return { skippedQuestionPrompts, dismissedQuestionPrompts };
+  }
+
+  /**
+   * The reactions the user has put on the agent's OWN sends, as turn context.
+   *
+   * A reaction is stored on the transcript entry and rendered as a pill in the
+   * chat, but nothing on the agent side ever read it back: the conversation
+   * state that feeds the model is built from message blobs, so a tapback on the
+   * agent's message was invisible to the agent forever after. The immediate
+   * wake in `resumeAfterReaction` is not a substitute — it aborts before the
+   * prompt is sent whenever the transcript mirror cannot prepare a checkpoint,
+   * and a wake that dies silently leaves the agent none the wiser.
+   *
+   * This is the same shape and the same call site as
+   * `collectUnansweredQuestionPrompts` — an option merged into `runner.run` and
+   * prepended to the turn — so it needs no parallel mechanism.
+   *
+   * Each reaction is reported once. A reaction removed and re-added later is a
+   * new key and is reported again, so the notice always tracks the live state.
+   */
+  collectUserReactionNotices(session: LiveSession): {
+    userReactionNotices: string[];
+  } {
+    const userReactionNotices: string[] = [];
+    if (session == null) return { userReactionNotices };
+    const isActive = session.id === this.tm.sessions.activeSession?.id;
+    const entries = isActive
+      ? getTranscript()
+      : session.db.getTranscriptEntries();
+    for (const entry of entries) {
+      if (entry.kind !== "send-message") continue;
+      const reactions = userReactionsOn(entry);
+      if (reactions.length === 0) continue;
+      const seen = new Set(
+        Array.isArray(entry.reactionNoticesSeen)
+          ? (entry.reactionNoticesSeen as string[])
+          : [],
+      );
+      const fresh = reactions.filter(
+        (emoji) => !seen.has(reactionNoticeKey(emoji)),
+      );
+      if (fresh.length === 0) continue;
+      const quote = describeReactedMessageQuote(entry);
+      userReactionNotices.push(
+        ...fresh.map(
+          (emoji) =>
+            `The user reacted ${emoji} to your message [${entry.id}]: "${quote}"`,
+        ),
+      );
+      const markSeen = (current: TranscriptEntry): TranscriptEntry => ({
+        ...current,
+        reactionNoticesSeen: [
+          ...reactions.map(reactionNoticeKey),
+          ...seen,
+        ].slice(-MAX_TRACKED_REACTION_NOTICE_KEYS),
+      });
+      if (isActive) {
+        const updated = updateEntry(entry.id, markSeen);
+        if (updated != null)
+          this.tm.roster.emit({ type: "updated", entry: updated });
+      }
+      session.db.updateTranscriptEntry(entry.id, markSeen);
+    }
+    return {
+      userReactionNotices: userReactionNotices.slice(-MAX_REACTION_NOTICES),
+    };
   }
 
   async respondToWidget(
@@ -562,6 +648,13 @@ export class WidgetResponses {
     emoji: string,
     messageQuote: string,
   ): Promise<void> {
+    // Deliberately NOT marking the reaction reported here. This wake is a
+    // courtesy, and it does fail: a hidden turn on a busy agent aborts with
+    // `TranscriptJournalCorruptionError` from the transcript mirror before the
+    // prompt is ever sent. Marking first would swallow the reaction for good -
+    // the marker says "the agent knows", the failed wake means it never found
+    // out. `collectUserReactionNotices` is the channel that cannot fail that
+    // way, so it owns the bookkeeping and this wake stays an extra heads-up.
     await this.tm.boxHandoff.resumeWithHiddenPrompt(
       agentId,
       `[The user reacted ${emoji} to your message: "${messageQuote}". You don't need to reply; act on it only if it's useful (e.g. acknowledge, adjust, or continue).]`,

@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { isSandAgentLimitError } from "../../../shared/agents/agents.js";
-import { errorLogTag } from "../../../shared/errors.js";
+import { errorLogTag, errorMessage } from "../../../shared/errors.js";
 import {
   cloneAgentDir,
   cloneAgentDisplayName,
@@ -28,6 +28,12 @@ import { classifyAgentError } from "./turn-runtime.js";
 import type { TranscriptManagerLike } from "./transcript-hub.js";
 
 export class SandAgentLifecycleError extends Error {}
+/**
+ * One agent the delete could not remove. `error` is the log tag for the host
+ * log; `detail` is the sentence the person deleting the agent reads, and it says
+ * which files the app still holds and where the folder is.
+ */
+interface DeleteFailure { readonly agentId: string; readonly error: string; readonly detail: string }
 interface CreateOptions {
   purpose?: string;
   isKickstartRequested?: boolean;
@@ -350,47 +356,149 @@ export class AgentLifecycle {
   }
 
   async deleteAgent(agentId: string): Promise<any> {
-    return this.tm.deleteAgents([agentId]);
+    const result = await this.tm.deleteAgents([agentId]);
+    // A single delete that left the agent on disk answered `200` with the id in
+    // `failed` and an empty `deleted`, so the caller closed its dialog on an
+    // agent it still had. One target, one answer: either the directory is gone
+    // or the call fails, and the failure says which files are in the way.
+    const failure = (result?.failed ?? []).find(
+      (entry: any) => entry.agentId === agentId,
+    );
+    if (failure != null)
+      throw new SandAgentLifecycleError(
+        `Agent ${agentId} was not deleted: ${failure.detail ?? failure.error}`,
+      );
+    return result;
   }
   async deleteAgents(agentIds: readonly string[]): Promise<any> {
     const ids = new Set(agentIds);
     if (ids.size === 0) return { transcript: getTranscript() };
+    const missing: string[] = [];
+    const present = new Set<string>();
+    for (const id of ids) {
+      if (this.tm.sessionStore.agentDirExists(id)) present.add(id);
+      else missing.push(id);
+    }
+    if (present.size === 0)
+      throw new SandAgentLifecycleError(
+        `No agent directory on disk for ${missing.join(", ")}`,
+      );
+    let result: any;
     try {
-      return await this.runDeleteAgents(ids);
+      result = await this.runDeleteAgents(present);
     } catch (error) {
-      for (const id of ids)
+      for (const id of present)
         if (this.tm.sessionStore.agentDirExists(id))
           this.tm.sessions.deletedAgentIds.delete(id);
       throw error;
     }
+    return missing.length === 0
+      ? result
+      : { ...result, missingAgentIds: missing };
+  }
+  /**
+   * Closes the handles that keep `store.db` and `conversation-blobs.db` open.
+   * `interruptAgentForDeletion` silences the runner and waits for the exclusive
+   * runs, but nothing closed a database handle, so `deleteSession` unlinked files
+   * this process still held open, Windows answered `EBUSY`, and the agent kept
+   * its slot. Handles go before the delete, never after it.
+   */
+  private async closeAgentHandles(agentId: string, session: any): Promise<void> {
+    try {
+      await session?.agentStore?.dispose?.();
+    } catch (error) {
+      console.error(
+        `[sand] agent store dispose failed for ${agentId}: ${errorLogTag(error)}`,
+      );
+    }
+    try {
+      session?.db?.close?.();
+    } catch (error) {
+      console.error(
+        `[sand] store.db close failed for ${agentId}: ${errorLogTag(error)}`,
+      );
+    }
+    const store = this.tm.sessionStore as {
+      releaseSession?(id: string): Promise<void>;
+    };
+    try {
+      await store.releaseSession?.(agentId);
+    } catch (error) {
+      console.error(
+        `[sand] session store release failed for ${agentId}: ${errorLogTag(error)}`,
+      );
+    }
+  }
+  private deletionOutcome(
+    deleted: readonly string[],
+    failed: readonly DeleteFailure[],
+  ): Record<string, unknown> {
+    return { deleted: [...deleted], failed: [...failed] };
   }
   async runDeleteAgents(ids: ReadonlySet<string>): Promise<any> {
     const active = await this.tm.sessions.tryEnsureSession();
     const deletingActive = active != null && ids.has(active.id);
     for (const id of ids) await this.interruptAgentForDeletion(id);
     for (const id of ids) this.tm.trayErrors.clearForAgent(id);
+    const deleted: string[] = [];
+    const failed: DeleteFailure[] = [];
     for (const id of ids) {
       if (id === active?.id) continue;
-      this.tm.runnerRegistry.runners.delete(id);
-      this.tm.sessions.liveSessions.delete(id);
-      this.tm.sessions.pendingSessionOpens.delete(id);
-      await this.tm.sessionStore.deleteSession(id);
-      this.tm.onAgentForgotten?.(id);
-      this.tm.pendingWakeStore?.clearAgent(id);
-      this.tm.boxHandoff.boxHandoffs.delete(id);
-      this.tm.boxHandoff.awaitingSink.clear(id);
-      this.tm.roster.emitAsyncTasksForAgent(id);
+      try {
+        this.tm.runnerRegistry.runners.delete(id);
+        const session = this.tm.sessions.liveSessions.get(id);
+        this.tm.sessions.liveSessions.delete(id);
+        this.tm.sessions.pendingSessionOpens.delete(id);
+        await this.closeAgentHandles(id, session);
+        await this.tm.sessionStore.deleteSession(id);
+        // The id was marked deleted before the unlink and the mark outlived the
+        // directory: the roster skipped the agent for the rest of the run, and a
+        // directory that came back later (`new SandAgentDb` recreates it) was
+        // hidden from the user with no way to remove it. The directory is gone,
+        // so the mark has nothing left to protect.
+        this.tm.sessions.deletedAgentIds.delete(id);
+        this.tm.onAgentForgotten?.(id);
+        this.tm.pendingWakeStore?.clearAgent(id);
+        this.tm.boxHandoff.boxHandoffs.delete(id);
+        this.tm.boxHandoff.awaitingSink.clear(id);
+        this.tm.roster.emitAsyncTasksForAgent(id);
+        deleted.push(id);
+      } catch (error) {
+        failed.push({ agentId: id, error: errorLogTag(error), detail: errorMessage(error) });
+        console.error(
+          `[sand] delete of agent ${id} failed: ${errorLogTag(error)}: ${errorMessage(error)}`,
+        );
+      }
     }
     if (!deletingActive || active == null) {
       await this.tm.roster.emitAgents();
-      return { transcript: getTranscript() };
+      return { transcript: getTranscript(), ...this.deletionOutcome(deleted, failed) };
     }
-    await active.agentStore.dispose();
+    try {
+      return await this.finishDeletingActiveAgent(active, ids, deleted, failed);
+    } catch (error) {
+      failed.push({ agentId: active.id, error: errorLogTag(error), detail: errorMessage(error) });
+      console.error(
+        `[sand] delete of active agent ${active.id} failed: ${errorLogTag(error)}: ${errorMessage(error)}`,
+      );
+      await this.tm.roster.emitAgents();
+      return { transcript: getTranscript(), ...this.deletionOutcome(deleted, failed) };
+    }
+  }
+  private async finishDeletingActiveAgent(
+    active: any,
+    ids: ReadonlySet<string>,
+    deleted: string[],
+    failed: DeleteFailure[],
+  ): Promise<any> {
+    await this.closeAgentHandles(active.id, active);
     this.tm.runnerRegistry.runners.delete(active.id);
     this.tm.sessions.liveSessions.delete(active.id);
     this.tm.sessions.pendingSessionOpens.delete(active.id);
     this.tm.runLifecycle.closeSessionWhenIdle(active);
     await this.tm.sessionStore.deleteSession(active.id);
+    this.tm.sessions.deletedAgentIds.delete(active.id);
+    deleted.push(active.id);
     this.tm.onAgentForgotten?.(active.id);
     this.tm.pendingWakeStore?.clearAgent(active.id);
     this.tm.boxHandoff.boxHandoffs.delete(active.id);
@@ -431,7 +539,7 @@ export class AgentLifecycle {
         entries,
       });
       await this.tm.roster.emitAgents();
-      return { transcript: entries };
+      return { transcript: entries, ...this.deletionOutcome(deleted, failed) };
     }
     try {
       const next = await this.tm.sessionStore.createFallbackSession(
@@ -445,7 +553,7 @@ export class AgentLifecycle {
       this.tm.sessions.loaded = true;
       this.tm.roster.emit({ type: "cleared" });
       await this.tm.roster.emitAgents();
-      return { transcript: getTranscript() };
+      return { transcript: getTranscript(), ...this.deletionOutcome(deleted, failed) };
     } catch (error) {
       if (!isSandAgentLimitError(error)) throw error;
       this.tm.sessions.activeSession = undefined;
@@ -454,7 +562,7 @@ export class AgentLifecycle {
       this.tm.sessions.loaded = false;
       this.tm.roster.emit({ type: "cleared" });
       await this.tm.roster.emitAgents();
-      return { transcript: getTranscript() };
+      return { transcript: getTranscript(), ...this.deletionOutcome(deleted, failed) };
     }
   }
 
@@ -497,16 +605,24 @@ export class AgentLifecycle {
   }
 
   async updateAgent(agentId: string, profile: any): Promise<unknown> {
+    const text = (value: unknown): string | undefined =>
+      typeof value === "string" ? value.trim() : undefined;
+    const avatarShape = text(profile?.avatarShape);
+    const avatarColor = text(profile?.avatarColor);
+    const title = text(profile?.title);
+    const name = text(profile?.name);
+    const description = text(profile?.description);
+    if (!this.tm.sessionStore.agentDirExists(agentId))
+      throw new SandAgentLifecycleError(
+        `Agent ${agentId} no longer exists on disk.`,
+      );
+    const current = this.tm.sessionStore.getAgentProfileText(agentId);
     const trimmed = {
-      ...(profile.avatarShape === undefined
-        ? {}
-        : { avatarShape: profile.avatarShape.trim() }),
-      ...(profile.avatarColor === undefined
-        ? {}
-        : { avatarColor: profile.avatarColor.trim() }),
-      name: profile.name.trim(),
-      description: profile.description.trim(),
-      ...(profile.title === undefined ? {} : { title: profile.title.trim() }),
+      ...(avatarShape === undefined ? {} : { avatarShape }),
+      ...(avatarColor === undefined ? {} : { avatarColor }),
+      name: name ?? current?.name ?? "Grok",
+      description: description ?? current?.description ?? "",
+      ...(title === undefined ? {} : { title }),
     };
     const stamp = this.tm.roster.reserveSnapshotStamp();
     const active = this.tm.sessions.activeSession;

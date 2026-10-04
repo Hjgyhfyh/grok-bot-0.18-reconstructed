@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "dsh": {
+      "command": "node",
+      "args": [
+        "D:\\ТЕСТЫ\\DeepSeek-Harness\\grok-bot-0.18-reconstructed\\local-mcp\\servers\\dsh-agent-mcp-server.mjs"
+      ],
+      "env": {
+        "DSH_ROOT": "C:\\Users\\user\\OneDrive\\Рабочий стол\\Tests-Ai\\Space_Bunny-dsh"
+      }
+    }
+  }
+}

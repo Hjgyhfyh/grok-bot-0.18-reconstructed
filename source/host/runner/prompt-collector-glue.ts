@@ -51,6 +51,7 @@ export interface TurnPromptOptions {
   readonly recentUserMessages?: readonly unknown[];
   readonly skippedQuestionPrompts?: readonly string[];
   readonly dismissedQuestionPrompts?: readonly string[];
+  readonly userReactionNotices?: readonly string[];
 }
 export interface PromptCollectorHost<Context = unknown> {
   readonly ctx?: Context;
@@ -118,6 +119,7 @@ export interface GeneratedTurnPromptOptions {
   readonly recentUserMessages?: readonly { readonly id: string; readonly text: string; readonly richText?: string }[];
   readonly skippedQuestionPrompts?: readonly string[];
   readonly dismissedQuestionPrompts?: readonly string[];
+  readonly userReactionNotices?: readonly string[];
 }
 
 export interface GeneratedTurnActionAssembly {
@@ -128,6 +130,22 @@ export interface GeneratedTurnActionAssembly {
 
 function messageText(content: PromptMessage["content"]): string {
   return typeof content === "string" ? content : content.map((part) => part.text ?? "").join("\n");
+}
+
+/**
+ * Renders the user's reactions to the agent's own messages as turn context.
+ *
+ * These are the agent's own reads of the chat: a pill in the UI said nothing to
+ * the model, so "what did the user think of that" had no answer at all. The
+ * heading keeps them separate from an unanswered question, and the wording stays
+ * advisory — a tapback is feedback, not an order.
+ */
+export function renderUserReactionNotices(notices: readonly string[]): string {
+  return [
+    "Reactions from the user to your own messages:",
+    ...notices.map((notice) => `- ${notice}`),
+    "No reply is required. Act on these only if they change something useful.",
+  ].join("\n");
 }
 
 export function createPromptCollectorGlue<Context = unknown>(host: PromptCollectorHost<Context>) {
@@ -360,6 +378,8 @@ export function createPromptCollectorGlue<Context = unknown>(host: PromptCollect
     const prepended = [...await host.collectPrependUserMessages?.(options.recentUserMessages ?? [], options.messageId) ?? []];
     const unanswered = [...(options.skippedQuestionPrompts ?? []), ...(options.dismissedQuestionPrompts ?? [])];
     if (unanswered.length > 0) prepended.push({ text: `Unanswered questions:\n${unanswered.map((question) => `- ${question}`).join("\n")}` });
+    if ((options.userReactionNotices ?? []).length > 0)
+      prepended.push({ text: renderUserReactionNotices(options.userReactionNotices!) });
     const userMessage = {
       text, messageId: options.messageId ?? "",
       ...(richText == null || richText.length === 0 ? {} : { richText }),
@@ -413,6 +433,8 @@ export function createPromptCollectorGlue<Context = unknown>(host: PromptCollect
       : host.traceSendPhase(args.runCtx, "collectPrependUserMessages", collect));
     const unanswered = [...(options.skippedQuestionPrompts ?? []), ...(options.dismissedQuestionPrompts ?? [])];
     if (unanswered.length > 0) prepended.push(new UserMessage({ text: `Unanswered questions:\n${unanswered.map((question) => `- ${question}`).join("\n")}` }));
+    if ((options.userReactionNotices ?? []).length > 0)
+      prepended.push(new UserMessage({ text: renderUserReactionNotices(options.userReactionNotices!) }));
     const userMessage = new UserMessage({
       text,
       messageId: options.messageId ?? "",

@@ -54,6 +54,28 @@ const NOT_SIGNED_IN_ROW_AFTER = '(p="Local",b="Using your own endpoint")';
 // A signed-in account still wins: the `authId ?? email` branch is untouched.
 const ACCOUNT_SLOT_BEFORE = 'function dde(n){if(n.kind!=="logged-in")return null;const e=n.authId??n.email;return e==null||e.length===0?null:e}';
 const ACCOUNT_SLOT_AFTER = 'function dde(n){if(n.kind!=="logged-in")return "local";const e=n.authId??n.email;return e==null||e.length===0?"local":e}';
+// A branched entry whose thread root is outside the loaded transcript window. The renderer
+// loaded only the newest tail (`X0t=500`) and, unlike the host, never asks for a thread
+// by id, so it cannot tell "my root is older than the window" from "my root is gone".
+// `N_n` answered that ambiguity by deleting the entry: `mayHoldOlderHistory` made it skip
+// `i.push(c)`, which is both the main feed and the thread summary. A message the user had
+// just sent therefore vanished from the screen with no chip, no row and nothing to click,
+// and the agent's branched reply went with it. The host resolves the same question the
+// other way round (`getMainTranscriptEntries` in source/shared/transcript.ts hides a
+// branched entry only once `resolveBranchRoot` actually found its root), so the orphaned
+// entry is kept here too. It renders as an ordinary row with its reply quote; the moment
+// "load older" brings the root in, `N_n` folds it back into its thread by itself.
+const ORPHANED_BRANCH_BEFORE = 'if(u==null){if(t){r=!0;continue}i.push(c);continue}';
+const ORPHANED_BRANCH_AFTER = 'if(u==null){r=!0;i.push(c);continue}';
+// The open thread is dropped whenever its root id is not in the loaded entry map. The entry
+// map is built from the same partial tail, so one transcript re-install was enough to close
+// a live thread; `WGe(u, A)` still walks the branched children of a root it cannot see, so
+// the thread itself was showing its messages correctly while this line threw the view away.
+// The close is kept for the one case where it is genuinely right — a complete window in
+// which the root really is not there — and is skipped whenever older history is still on
+// offer, because then absence proves nothing.
+const THREAD_CLOSE_BEFORE = '!d&&I!=null&&!Y.has(I)&&P(null),!d&&A!=null&&!Y.has(A)&&E(null)';
+const THREAD_CLOSE_AFTER = '!d&&I!=null&&!Y.has(I)&&P(null),!d&&!f&&A!=null&&!Y.has(A)&&E(null)';
 export const COMPONENT_SOURCE = String.raw`
 const RRouterProviders=[
   {value:"claude-code",label:"Claude Code",description:"Use your existing Claude Code sign-in and Grok Bot's connected plugins.",kind:"local",localKey:"claude-code"},
@@ -121,6 +143,12 @@ export function patchOriginalAccountSlot(source) {
   return replaceExactlyOnce(source, ACCOUNT_SLOT_BEFORE, ACCOUNT_SLOT_AFTER, "account slot");
 }
 
+export function patchOriginalThreadSurfaces(source) {
+  let patched = replaceExactlyOnce(source, ORPHANED_BRANCH_BEFORE, ORPHANED_BRANCH_AFTER, "orphaned branch entry");
+  patched = replaceExactlyOnce(patched, THREAD_CLOSE_BEFORE, THREAD_CLOSE_AFTER, "open-thread close guard");
+  return patched;
+}
+
 export async function applyOriginalRendererRouterPatch({ stageRoot }) {
   const assetsRoot = path.join(stageRoot, "dist", "renderer", "assets");
   const registryCandidates = [];
@@ -147,7 +175,7 @@ export async function applyOriginalRendererRouterPatch({ stageRoot }) {
   }
   const changes = [];
   for (const [role, candidate, transforms] of [
-    ["registry", registryCandidates[0], [patchOriginalSettingsRegistry, patchOriginalSignInGate, patchOriginalAccountSlot]],
+    ["registry", registryCandidates[0], [patchOriginalSettingsRegistry, patchOriginalSignInGate, patchOriginalAccountSlot, patchOriginalThreadSurfaces]],
     ["panel", panelCandidates[0], [patchOriginalSettingsPanel, patchOriginalAccountRow]],
   ]) {
     const patched = transforms.reduce((source, transform) => transform(source), candidate.source);
@@ -163,8 +191,8 @@ export async function applyOriginalRendererRouterPatch({ stageRoot }) {
     schemaVersion: 1,
     mode: "original-renderer-settings-extension",
     chunks: changes,
-    features: ["settings-router-provider", "settings-local-docker-vm", "usage-current-provider", "skip-signin-gate", "shell-during-boot-check", "no-account-nag", "local-roster-without-account", "endpoint-model-picker", "no-cursor-provider"],
-    transformations: ["settings-registry", "router-panel", "usage-panel", "component-source-injection", "signin-gate", "boot-check-gate", "account-chip-label", "account-row-label", "account-slot"],
+    features: ["settings-router-provider", "settings-local-docker-vm", "usage-current-provider", "skip-signin-gate", "shell-during-boot-check", "no-account-nag", "local-roster-without-account", "endpoint-model-picker", "no-cursor-provider", "thread-orphan-stays-visible", "thread-survives-off-window-root"],
+    transformations: ["settings-registry", "router-panel", "usage-panel", "component-source-injection", "signin-gate", "boot-check-gate", "account-chip-label", "account-row-label", "account-slot", "orphaned-branch-entry", "open-thread-close-guard"],
   };
   const provenancePath = path.join(stageRoot, "dist", "renderer-router-extension.json");
   await writeFile(provenancePath, `${JSON.stringify(record, null, 2)}\n`);

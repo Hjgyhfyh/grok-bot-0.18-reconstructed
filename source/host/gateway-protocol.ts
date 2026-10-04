@@ -2,7 +2,12 @@
 type GatewayApi = any;
 export function parseCommandArgs(body: string): unknown { return body.length > 0 ? JSON.parse(body) : {}; }
 export const SAND_GATEWAY_COMMANDS = {
-  getTranscript: (api: GatewayApi) => api.getTranscript(),
+  // This entry used to read `(api: GatewayApi) => api.getTranscript()`, the only command in the
+  // table that never declared `body`. The dispatcher hands every handler the parsed request, so
+  // that signature discarded the agent id before the API saw it, the API answered for whichever
+  // session was active, and three different ids returned three byte-identical transcripts. It
+  // forwards `parseCommandArgs(body)` like every entry below it.
+  getTranscript: (api: GatewayApi, body: string) => api.getTranscript(parseCommandArgs(body)),
   getAgentTranscript: (api: GatewayApi, body: string) => api.getAgentTranscript(parseCommandArgs(body)),
   getAgentTranscriptPage: (api: GatewayApi, body: string) => api.getAgentTranscriptPage(parseCommandArgs(body)),
   openAgentWindowed: (api: GatewayApi, body: string) => api.openAgentWindowed(parseCommandArgs(body)),

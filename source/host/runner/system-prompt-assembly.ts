@@ -21,9 +21,12 @@ import {
   type ProvenancedMemory,
 } from "./sand-memory.js";
 import {
+  buildSandBaseSystemPrompt,
+  resolveSandToolCapabilities,
   SAND_CLOUD_AGENTS_DISABLED_PROMPT_SECTION,
   SAND_MCP_MULTI_ACCOUNT_PROMPT_SECTION,
   SAND_SYSTEM_PROMPT_CLOUD_AGENTS_DISABLED,
+  type SandToolCapabilities,
 } from "./system-prompt.js";
 import { renderAutomationsSystemPrompt, type AutomationRecord } from "../automations/automation.js";
 import { renderTimeZoneSystemPrompt } from "../../shared/timezone.js";
@@ -36,6 +39,98 @@ import type { ConnectorManifest } from "../../shared/channels.js";
 
 export function modelVisibleLocation(location: string | null | undefined): string | null {
   return location == null ? null : toModelVisiblePath(location);
+}
+
+/**
+ * The tool names this fix keeps out of the prompt, per family. Every name that a
+ * section may promise has to be listed here, or that section keeps describing a
+ * tool the turn does not carry.
+ *
+ * Sections rendered outside this file (the box section describes CopyToBox and
+ * CopyFromBox in detail) pass through `omitUnavailableToolLines`, so one
+ * capability check governs every place the prompt names an optional tool rather
+ * than only the base prompt.
+ */
+const UNAVAILABLE_TOOL_NAMES: ReadonlyArray<
+  readonly [keyof SandToolCapabilities, readonly string[]]
+> = [
+  ["screenshot", ["Screenshot"]],
+  // The box desktop as a whole: `Computer` and `request_box_help` are gated by
+  // the same `remoteBoxHasDesktop` as `Screenshot`, and the reconstructed box
+  // has no monitor, so all three disappear together. Kept as its own family so
+  // a caller with no toolset to consult keeps the resolved object unchanged.
+  ["boxDesktop", ["Computer", "request_box_help"]],
+  ["generateImage", ["GenerateImage"]],
+  ["fileTransfer", ["CopyToBox", "CopyFromBox"]],
+  ["mcpTools", ["GetMcpTools", "CallMcpTool"]],
+  ["subagentManagement", ["CheckSubagent", "MessageSubagent", "StopSubagent"]],
+  // The twelve MCP/plugin administration tools are one family: they all write to
+  // the user's Cursor account, so they arrive together or not at all.
+  ["mcpManagement", [
+    "SearchPlugins", "GetPlugin", "InstallPlugin", "UninstallPlugin", "AddMcpServer",
+    "UninstallMcpServer", "GetMcpServerStatus", "SetMcpInstructions",
+    "RestartMcpServers", "AuthenticateMcpServer", "RemoveMcpAccount", "RenameMcpAccount",
+  ]],
+  ["cloudAgent", ["CloudAgent"]],
+];
+
+/** Tool names the prompt must never describe for a turn with these capabilities. */
+export function unavailableToolNames(capabilities: SandToolCapabilities): readonly string[] {
+  // "Not true" rather than "exactly false": the account-gated families
+  // (`mcpManagement`, `cloudAgent`, `boxDesktop`) report absence rather than
+  // `false` when a caller has no resolver, and a family the turn cannot prove it
+  // has is a family whose names must not reach the prompt. Reading absence as
+  // "present" is exactly how the desktop section survived a monitor-less box.
+  return UNAVAILABLE_TOOL_NAMES
+    .filter(([family]) => capabilities[family] !== true)
+    .flatMap(([, names]) => names);
+}
+
+/**
+ * Extra bullets to drop with a family, keyed by the family that owns them.
+ *
+ * Some bullets describe a family without naming a tool ("Both transfers default
+ * to your single connected computer"). Keeping those while the tools are gone
+ * leaves a section describing transfers the turn cannot perform, so they are
+ * listed explicitly rather than matched on a name.
+ */
+const UNAVAILABLE_TOOL_BULLET_PREFIXES: ReadonlyArray<
+  readonly [keyof SandToolCapabilities, readonly string[]]
+> = [
+  ["fileTransfer", ["- Both transfers default"]],
+];
+
+/**
+ * Drops the bullet lines of an already-rendered section that document a tool the
+ * turn does not have.
+ *
+ * Only lines that both read as a bullet and either mention a missing tool or
+ * belong to a missing family are removed. Prose that merely passes over a tool
+ * name ("a path on your box is not on the user's machine") stays, because
+ * deleting a whole paragraph over one word would throw away guidance that is
+ * still true.
+ */
+export function omitUnavailableToolLines(
+  section: string,
+  capabilities: SandToolCapabilities,
+): string {
+  if (section.length === 0) return section;
+  const missing = new Set(unavailableToolNames(capabilities));
+  const prefixes = UNAVAILABLE_TOOL_BULLET_PREFIXES
+    .filter(([family]) => capabilities[family] !== true)
+    .flatMap(([, values]) => values);
+  if (missing.size === 0 && prefixes.length === 0) return section;
+  return section
+    .split("\n")
+    .filter((line) => {
+      if (!/^\s*[-*]\s/.test(line)) return true;
+      if (prefixes.some((prefix) => line.startsWith(prefix))) return false;
+      for (const name of missing) {
+        if (line.includes(name)) return false;
+      }
+      return true;
+    })
+    .join("\n");
 }
 
 export interface AgentProfileForPrompt extends AgentProfileIdentity {
@@ -88,6 +183,20 @@ export interface SystemPromptAssemblyDependencies {
   readonly isSpotlightEnabled?: () => boolean;
   readonly isMultitaskEnabled?: () => boolean;
   readonly multitaskSection?: string;
+  /**
+   * Whether a named tool is in the toolset THIS turn produced.
+   *
+   * The base prompt used to describe every optional tool family
+   * unconditionally, so a turn carrying none of them still promised
+   * GetMcpTools, CopyToBox, Screenshot and the rest, and the model either
+   * invented them or denied having tools at all. This is the same coupling
+   * `isMultitaskEnabled` uses for the multitask section: one gate decides both
+   * the tool and the prompt text about it.
+   *
+   * Left undefined, the prompt assumes NO optional family, because a tool that
+   * was never proven present must not be described.
+   */
+  readonly isToolAvailable?: (name: string) => boolean;
   readonly mcpManagement: () => unknown;
   readonly isMcpMultiAccountEnabled?: () => boolean;
   readonly isCloudAgentsDisabledByTeam?: () => boolean;
@@ -95,6 +204,13 @@ export interface SystemPromptAssemblyDependencies {
   readonly mcpDiscoveryStatusSection: () => string | null;
   readonly remoteBoxSection: () => string;
   readonly computerSection: () => string | null;
+  /**
+   * Whether `/home/box/reference/*.md` exists on this box. The reconstructed
+   * build writes those docs through `path.join`, so on Windows they land under
+   * `C:\home\box\reference` and no box mount exposes them; without this the
+   * prompt sent the model to Read files that are not there.
+   */
+  readonly isReferenceDocsAvailable?: () => boolean;
 }
 
 function profileSection(profile: AgentProfileForPrompt | null, sharedRoom: boolean): string | null {
@@ -248,7 +364,18 @@ export function createSystemPromptAssembly(deps: SystemPromptAssemblyDependencie
 
   function getSystemPrompt(snapshot?: AgentProfilePromptSnapshot): string {
     const cloudDisabled = deps.isCloudAgentsDisabledByTeam?.() === true;
-    const base = !deps.isSystemPromptOverridden && cloudDisabled ? SAND_SYSTEM_PROMPT_CLOUD_AGENTS_DISABLED : deps.basePrompt;
+    const capabilities = resolveSandToolCapabilities(deps.isToolAvailable);
+    // A caller-supplied base prompt is the user's own text and is never rewritten.
+    // The two bundled variants are re-rendered so their optional-tool guidance
+    // matches the toolset this turn actually produced.
+    const bundled = deps.isSystemPromptOverridden
+      ? undefined
+      : buildSandBaseSystemPrompt({
+        cloudAgentsEnabled: !cloudDisabled,
+        tools: capabilities,
+        referenceDocsAvailable: deps.isReferenceDocsAvailable?.() === true,
+      });
+    const base = bundled ?? (!deps.isSystemPromptOverridden && cloudDisabled ? SAND_SYSTEM_PROMPT_CLOUD_AGENTS_DISABLED : deps.basePrompt);
     const sections = [base];
     if (deps.isSpotlightEnabled?.() !== false) sections.push(spotlightPromptSection({ canSendMessage: !deps.isSubagentRunner }));
     const profile = deps.isSharedRoomRunner ? profileSection(resolveProfileForPrompt(), true) : snapshot?.profileSection ?? profileSection(resolveProfileForPrompt(), false);
@@ -261,7 +388,15 @@ export function createSystemPromptAssembly(deps: SystemPromptAssemblyDependencie
     if (!deps.isSubagentRunner && deps.mcpManagement() != null && deps.isMcpMultiAccountEnabled?.() === true) add(SAND_MCP_MULTI_ACCOUNT_PROMPT_SECTION);
     add(getTimeZoneSection());
     add(getMemorySection()); add(getAutomationsSection()); add(getWorkflowsSection()); add(getChannelsSection()); add(getAgentDirectorySection());
-    add(deps.mcpCustomInstructionsSection()); add(deps.mcpDiscoveryStatusSection()); add(deps.remoteBoxSection()); add(deps.computerSection());
+    add(deps.mcpCustomInstructionsSection()); add(deps.mcpDiscoveryStatusSection());
+    add(omitUnavailableToolLines(deps.remoteBoxSection(), capabilities));
+    // The desktop section is dropped whole, not line by line. Line filtering
+    // only removes bullets that name a missing tool, and this section's header
+    // plus its computerUse/browserUse delegation prose name none — so the
+    // filtered result still taught dispatching subagents that cannot exist.
+    // The one real predicate is whether the box has a monitor at all, and
+    // `boxDesktop` carries exactly that answer.
+    if (capabilities.boxDesktop !== false) add(deps.computerSection());
     return sections.join("\n\n");
   }
 

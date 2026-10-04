@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { createContext, type Context } from "../../packages/context/core.js";
@@ -11,7 +12,25 @@ import { SAND_BOX_DISPLAY_HEADER, SAND_BOX_FORK_ROUTER_PORT, SAND_BOX_MAX_WINDOW
 
 export const EXEC_DAEMON_PORT = 1337;
 export const VNC_PORT = SAND_BOX_PRIMARY_NOVNC_PORT;
-export const DEFAULT_AUTH_TOKEN = "local";
+/**
+ * The bearer credential both sides of the loopback box speak.
+ *
+ * `exec-daemon-process.ts` starts the daemon with this value and hands it to the
+ * child through SAND_BOX_EXEC_DAEMON_AUTH_TOKEN; `LoopbackSandBox` below dials
+ * with the same value. They must therefore agree, and the constant is computed
+ * once per host process so both callers read the identical string. The old
+ * value was the literal "local", published in this repository, which made
+ * executing commands on the user's machine a public capability. When the
+ * variable is set, it wins, so an operator can pin a known credential; when it
+ * is not, a random 32-byte token is minted and the daemon that receives it is
+ * the only party that knows it.
+ */
+export function resolveDefaultBoxAuthToken(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = env.SAND_BOX_EXEC_DAEMON_AUTH_TOKEN?.trim();
+  return configured != null && configured.length > 0 ? configured : randomBytes(32).toString("base64url");
+}
+
+export const DEFAULT_AUTH_TOKEN = resolveDefaultBoxAuthToken();
 export const BOX_TERMINALS_FOLDER = "/root/.cursor/projects/workspace/terminals";
 export const DAEMON_READY_TIMEOUT_MS = 90_000;
 export const DAEMON_WATCHDOG_INTERVAL_MS = 30_000;

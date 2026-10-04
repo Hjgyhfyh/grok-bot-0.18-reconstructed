@@ -17,7 +17,13 @@ import {
 import {
   runtimeConfigFromDisplay,
   validateMarketplacePluginId,
+  type DisplayServer,
 } from "./mcp-display-runtime.js";
+import {
+  createLocalMcpServerSource,
+  localMcpServerIdForName,
+  type LocalMcpServerSource,
+} from "./local-mcp-config-provider.js";
 import { SandMcpInstructionsAndToggles } from "./mcp-instructions-and-toggles.js";
 import { SandMcpListingSummaries } from "./mcp-listing-summaries.js";
 import { validateMcpServerId } from "./mcp-server-id.js";
@@ -55,6 +61,13 @@ export class SandMcpManager {
   private readonly instructions: SandMcpInstructionsAndToggles;
   private readonly slots: SandMcpAccountSlotLifecycle;
   private readonly catalog: SandMcpCatalogFlow;
+  /**
+   * The user's local stdio servers, read from disk and never written.
+   *
+   * Shared with {@link SandMcpDefinitionSource} so both can never disagree about
+   * what is installed. Injected only by tests; production builds the default.
+   */
+  private readonly localServers: LocalMcpServerSource;
   constructor(private readonly options: any) {
     this.settingsStore = options.settingsStore ?? EMPTY_SETTINGS;
     this.boxRuntime = options.boxRuntime;
@@ -62,6 +75,7 @@ export class SandMcpManager {
     this.accountWriter = options.accountMcpWriter;
     this.effectivePluginsProvider = options.effectivePluginsProvider;
     this.accountServersProvider = options.accountServersProvider;
+    this.localServers = options.localMcpServers ?? createLocalMcpServerSource();
     this.accountDisplayConfigProvider =
       options.accountServersProvider == null
         ? options.accountDisplayConfigProvider
@@ -71,6 +85,7 @@ export class SandMcpManager {
       options.accountServersProvider == null
         ? options.accountConfigProvider
         : async () => runtimeConfigFromDisplay(await this.loadAccountServers()),
+      () => this.localServers.servers(),
     );
     this.authWatches = new SandMcpAuthWatchLifecycle({
       backendMcpExec: this.backendMcpExec,
@@ -121,6 +136,81 @@ export class SandMcpManager {
       resetPushState: () => this.boxRuntime?.resetPushState(),
     });
   }
+  /**
+   * The account display configuration with the user's local stdio servers added.
+   *
+   * Why the rows are added HERE and not only to the definition source: the
+   * definition source is what gets pushed to the computer, but the per-server
+   * settings (`getMcpDisabledToolsByServerId`, `getRawMcpCustomInstructionByServerId`)
+   * are keyed by `DisplayServer.id` read out of `lastAccountDisplayConfig`
+   * (`./tools-discovery.ts:90-102`). A server present only in the pushed config
+   * has live tools and no row, so its toggles and instructions silently do
+   * nothing, and `GetMcpServerStatus` keeps answering "No MCP servers are
+   * installed" while the agent can already call the tools. One row per local
+   * server fixes both at once, because every other read goes through this object.
+   *
+   * The account row WINS on a name collision: an account server is authenticated,
+   * managed by the account API and removable through it, and a local file must not
+   * shadow it with a process it would also start.
+   *
+   * Idempotent: re-merging an already merged display returns it untouched, which is
+   * what lets `lastDisplay` be cached and re-merged on every read.
+   */
+  private withLocalServers(display: any): any {
+    const local = this.localServers.servers();
+    const names = Object.keys(local).sort();
+    if (names.length === 0) return display;
+    const servers: any[] = display?.servers ?? [];
+    const takenIds = new Set<string>(servers.map((server: any) => server.id));
+    const takenNames = new Set<string>(
+      servers.map((server: any) => server.serverIdentifier ?? server.name),
+    );
+    const rows: DisplayServer[] = [];
+    for (const name of names) {
+      const config = local[name];
+      if (config == null || takenNames.has(name)) continue;
+      const id = localMcpServerIdForName(name, takenIds);
+      takenIds.add(id);
+      takenNames.add(name);
+      rows.push({
+        id,
+        name,
+        serverIdentifier: name,
+        config: { command: config.command, ...(config.args === undefined ? {} : { args: [...config.args] }), ...(config.env === undefined ? {} : { env: { ...config.env } }) },
+        isTeamServer: false,
+        disabledByTeamAdminPolicy: false,
+      });
+    }
+    if (rows.length === 0) return display;
+    return { ...display, servers: [...servers, ...rows] };
+  }
+
+  /**
+   * What the manager returns when the account list is empty or unreadable.
+   *
+   * Without local servers this is `null`, byte for byte what the account-only
+   * code returned, so a machine with no local configuration behaves exactly as
+   * before. With them, the definition source is adopted too, so the local stdio
+   * configurations reach the computer even though the account read produced
+   * nothing — `clearLastKnownAccountConfig()` above has just emptied that cache.
+   */
+  private localOnlyDisplayConfig(): any {
+    if (Object.keys(this.localServers.servers()).length === 0) return null;
+    const display = this.withLocalServers({ servers: [] });
+    this.definitionSource.adoptAccountConfig(runtimeConfigFromDisplay(display));
+    return display;
+  }
+
+  /** Local stdio entries, read from the user's file. Exposed for diagnostics. */
+  localMcpServersView(): Readonly<Record<string, { readonly command: string }>> {
+    return this.localServers.servers();
+  }
+
+  /** The file the local entries came from. Shown to the user when one is refused. */
+  localMcpConfigPathView(): string {
+    return this.localServers.path;
+  }
+
   private loadAccountServers(): Promise<any> {
     if (this.accountPromise != null) return this.accountPromise;
     const generation = ++this.generation,
@@ -134,7 +224,7 @@ export class SandMcpManager {
           if (generation !== this.generation) return cached;
           if (display == null) {
             this.definitionSource.clearLastKnownAccountConfig();
-            return null;
+            return this.localOnlyDisplayConfig();
           }
           if (
             display.cacheScope !== undefined &&
@@ -152,10 +242,15 @@ export class SandMcpManager {
             this.definitionSource.clearCache();
           }
           if (display.unavailable === true) {
-            if (cached == null) this.accountPromise = undefined;
+            if (cached == null) {
+              this.accountPromise = undefined;
+              return this.localOnlyDisplayConfig();
+            }
             return cached;
           }
-          const resolved = mergeUnresolvedAccountServers(display, cached);
+          const resolved = this.withLocalServers(
+            mergeUnresolvedAccountServers(display, cached),
+          );
           this.lastDisplay = resolved;
           this.definitionSource.adoptAccountConfig(
             runtimeConfigFromDisplay(resolved),
@@ -196,7 +291,13 @@ export class SandMcpManager {
     this.authWatches.setAuthCompletionObserver(observer);
   }
   async listServers() {
-    const display = await this.accountDisplayConfigProvider?.();
+    // `withLocalServers` is what puts the local rows into `lastDisplay`, which
+    // `GetMcpServerStatus` renders and `tools-discovery` keys settings by. With no
+    // local configuration it returns its argument unchanged, so the account-only
+    // path is bit-for-bit the one that shipped.
+    const display = this.withLocalServers(
+      await this.accountDisplayConfigProvider?.(),
+    );
     if (display != null) this.lastDisplay = display;
     const effectiveDisplay =
         display ??
@@ -504,6 +605,7 @@ export class SandMcpManager {
   refreshAccountConfigInBackground(): void {
     this.generation += 1;
     this.accountPromise = undefined;
+    this.localServers.invalidate();
     this.definitionSource.refreshInBackground();
   }
   authenticateServer(...args: any[]) {
@@ -521,7 +623,7 @@ export class SandMcpManager {
   ) {
     const id = validateMcpServerId(raw);
     if (options?.requireFreshRead && this.accountServersProvider != null) {
-      const display = await this.accountServersProvider();
+      const display = this.withLocalServers(await this.accountServersProvider());
       if (display == null || display.unavailable)
         throw new SandMcpConfigError("account display config unavailable");
       return display.servers.find((server: any) => server.id === id);
@@ -533,7 +635,9 @@ export class SandMcpManager {
     }
     let display = null;
     try {
-      display = await this.accountDisplayConfigProvider();
+      display = this.withLocalServers(
+        await this.accountDisplayConfigProvider(),
+      );
     } catch (error) {
       if (options?.requireFreshRead) throw error;
     }
@@ -555,6 +659,9 @@ export class SandMcpManager {
   async reload(): Promise<void> {
     this.generation += 1;
     this.accountPromise = undefined;
+    // `RestartMcpServers` is how a user tells Grok Bot they edited the file by
+    // hand, so the re-read must not wait out the memo.
+    this.localServers.invalidate();
     this.definitionSource.clearCache();
     this.boxRuntime?.invalidateToolsCache();
     this.boxRuntime?.resetPushState();

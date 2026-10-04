@@ -1,4 +1,4 @@
-import { FirstTokenStallError, isRetryableProviderError, isTransientStreamError, resolveFirstTokenStallDeadlineMs, resolveOverloadStreamRetryPolicy, runWithTransientRetry, shouldRetryTurnAttempt, type RetryPolicy } from "./transient-stream-error.js";
+import { FirstTokenStallError, isRetryableProviderError, isTransientStreamError, resolveFirstTokenStallDeadlineMs, resolveFirstTokenStallMaxDeadlineMs, resolveOverloadStreamRetryPolicy, runWithTransientRetry, shouldRetryTurnAttempt, type RetryPolicy } from "./transient-stream-error.js";
 
 export interface StreamAttemptHost<Context, Checkpoint, State> {
   readonly ctx: { readonly canceled: boolean; withCancel(): readonly [Context, (reason: { intentional: boolean; reason: string }) => void] };
@@ -20,6 +20,12 @@ export function createStreamAttempt<Context, Checkpoint, State>(host: StreamAtte
   const inactive = {}, activeRef: { value: object } = { value: inactive };
   let retriesPerformed = 0;
 
+  // A checkpoint failure that raced with a stream failure is a cause, never the reported
+  // reason: replacing the provider's own error with a persistence error is what let a 500 be
+  // classified as a non-retryable disk problem.
+  const keepStreamCause = (error: unknown, checkpointFailure: unknown): unknown =>
+    checkpointFailure == null || !(error instanceof Error) || error.cause != null ? error : (error.cause = checkpointFailure, error);
+
   const runStreamOnce = async (): Promise<State> => {
     host.setStreamOutputProduced(false); attemptResumeCheckpoint = undefined;
     const [attemptCtx, cancelAttempt] = host.ctx.withCancel();
@@ -38,21 +44,31 @@ export function createStreamAttempt<Context, Checkpoint, State>(host: StreamAtte
     const base = resolveFirstTokenStallDeadlineMs();
     if (base <= 0) {
       try { const state = await stream; if (checkpointFailure != null) throw checkpointFailure; return state; }
-      catch (error) { throw checkpointFailure ?? error; } finally { settle(); }
+      catch (error) { throw keepStreamCause(error, checkpointFailure); } finally { settle(); }
     }
-    const deadlineMs = base * 2 ** retriesPerformed;
+    // The deadline doubles per retry (150s, 300s, 600s). Uncapped, the third attempt outlived
+    // the run lease: the lease expired mid-ladder and the late `endSessionRun` was swallowed,
+    // so a still-running turn was recorded as finished.
+    const maxDeadlineMs = resolveFirstTokenStallMaxDeadlineMs();
+    const deadlineMs = maxDeadlineMs > 0 ? Math.min(base * 2 ** retriesPerformed, maxDeadlineMs) : base * 2 ** retriesPerformed;
     return new Promise<State>((resolve, reject) => {
       let settled = false, deadlineFired = false;
       const onDeadline = (): void => {
         if (settled || host.getStreamOutputProduced()) return;
         settled = true; deadlineFired = true; settle(); cancelAttempt({ intentional: false, reason: "first-token stall" });
-        void Promise.allSettled(operations).then((results) => reject(checkpointFailure ?? results.find((result) => result.status === "rejected")?.reason ?? new FirstTokenStallError(deadlineMs)));
+        // The rejection waits for the abandoned stream to actually finish. Rejecting first left
+        // an orphan that was still able to run `SendMessage` while the next attempt started, so
+        // one stalled turn could deliver two answers.
+        void Promise.allSettled(operations).then((operationResults) =>
+          Promise.allSettled([stream]).then(() => {
+            reject(checkpointFailure ?? operationResults.find((result) => result.status === "rejected")?.reason ?? new FirstTokenStallError(deadlineMs));
+          }));
       };
       const timer = host.createDeadlineTimer(onDeadline, deadlineMs);
       const disarm = (): void => { settled = true; timer.cancel(); host.clearDeadlineHookIf(disarm, reset); };
       const reset = (): void => { if (!settled && !host.getStreamOutputProduced()) timer.restart(); };
       host.setDeadlineHooks(disarm, reset);
-      void stream.then((state) => { if (deadlineFired) return; disarm(); settle(); checkpointFailure == null ? resolve(state) : reject(checkpointFailure); }, (error) => { if (deadlineFired) return; disarm(); settle(); reject(checkpointFailure ?? error); });
+      void stream.then((state) => { if (deadlineFired) return; disarm(); settle(); checkpointFailure == null ? resolve(state) : reject(checkpointFailure); }, (error) => { if (deadlineFired) return; disarm(); settle(); reject(keepStreamCause(error, checkpointFailure)); });
     });
   };
 

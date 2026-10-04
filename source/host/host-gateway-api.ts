@@ -3,6 +3,7 @@ import {
   parseCoordinatorAgentThreadRequest,
   parseCoordinatorTranscriptWindowRequest,
 } from "../shared/rpc/coordinator.js";
+import { errorLogTag } from "../shared/errors.js";
 
 export const HOST_CAPABILITIES = [
   "orderedReplicasV1",
@@ -138,6 +139,51 @@ export function createHostGatewayApi(
     return await method(sharing, name)(args);
   };
 
+  /**
+   * Runs the bookkeeping that follows a delete. Each step used to run in a bare
+   * loop, so the first failing step abandoned every agent that had not been
+   * reached: two targets where one was locked deleted neither handoff, neither
+   * schedule, neither box. Failures are collected per agent and returned with the
+   * result instead of replacing a completed delete with an error.
+   */
+  const forgetDeletedAgent = async (
+    agentId: string,
+  ): Promise<{ agentId: string; error: string }[]> => {
+    const failures: { agentId: string; error: string }[] = [];
+    const record = (step: string, error: unknown) => {
+      failures.push({ agentId, error: `${step}: ${errorLogTag(error)}` });
+    };
+    try {
+      method(deps.extensions.api("session"), "forgetHandoff")(agentId);
+    } catch (error) {
+      record("forgetHandoff", error);
+    }
+    try {
+      await method(automations, "deleteAgentSchedules")(agentId);
+    } catch (error) {
+      record("deleteAgentSchedules", error);
+    }
+    try {
+      await deps.releaseAgentBox(agentId);
+    } catch (error) {
+      record("releaseAgentBox", error);
+    }
+    try {
+      deps.hostEvents.emit({
+        kind: "notification-agent-forgotten",
+        agentId,
+      });
+    } catch (error) {
+      record("emit", error);
+    }
+    try {
+      deps.forgetLocalToolPermission(agentId);
+    } catch (error) {
+      record("forgetLocalToolPermission", error);
+    }
+    return failures;
+  };
+
   const listRoutedMcpTools = async () => {
     const extension = deps.extensions.api("mcp");
     const mcp = extension.mcp;
@@ -163,7 +209,22 @@ export function createHostGatewayApi(
   };
 
   return {
-    getTranscript: () => method(manager, "ensureLoaded")(),
+    // This method used to be `() => method(manager, "ensureLoaded")()`, which dropped its
+    // argument and answered for whichever session happened to be active. Three different agent
+    // ids then produced three byte-identical transcripts, so a probe could not tell one
+    // conversation from another and a caller that believed it had asked about agent B was told
+    // about agent A. An id names the conversation; only a call with no id at all is a question
+    // about the active one.
+    getTranscript: (args: any) => {
+      const agentId = typeof args?.agentId === "string" && args.agentId.length > 0
+        ? args.agentId
+        : typeof args?.id === "string" && args.id.length > 0
+          ? args.id
+          : "";
+      return agentId.length === 0
+        ? method(manager, "ensureLoaded")()
+        : method(manager, "getAgentTranscript")(agentId);
+    },
     getAgentTranscript: (args: any) =>
       method(manager, "getAgentTranscript")(args.id),
     getAgentTranscriptPage: (args: any) =>
@@ -303,43 +364,45 @@ export function createHostGatewayApi(
     updateAgent: (args: any) =>
       method(manager, "updateAgent")(args.id, args.profile),
     deleteAgent: async (args: any) => {
-      await method(sharing, "noteAgentDeleted")(args.id);
-      const result = await method(manager, "deleteAgent")(args.id);
-      method(deps.extensions.api("session"), "forgetHandoff")(args.id);
-      await method(automations, "deleteAgentSchedules")(args.id).catch(
+      await method(sharing, "noteAgentDeleted")(args.id).catch(
         () => undefined
       );
-      await deps.releaseAgentBox(args.id);
-      deps.hostEvents.emit({
-        kind: "notification-agent-forgotten",
-        agentId: args.id
-      });
-      deps.forgetLocalToolPermission(args.id);
-      return result;
+      const result = await method(manager, "deleteAgent")(args.id);
+      const cleanupFailures = await forgetDeletedAgent(args.id);
+      return cleanupFailures.length === 0
+        ? result
+        : { ...result, cleanupFailures };
     },
     deleteAgents: async (args: any) => {
-      for (const id of args.ids) {
-        await method(sharing, "noteAgentDeleted")(id);
+      const ids: string[] = Array.isArray(args.ids) ? args.ids : [];
+      const cleanupFailures: { agentId: string; error: string }[] = [];
+      for (const id of ids) {
+        try {
+          await method(sharing, "noteAgentDeleted")(id);
+        } catch (error) {
+          cleanupFailures.push({
+            agentId: id,
+            error: `noteAgentDeleted: ${errorLogTag(error)}`,
+          });
+        }
       }
-      const result = await method(manager, "deleteAgents")(args.ids);
-      for (const id of args.ids) {
-        method(deps.extensions.api("session"), "forgetHandoff")(id);
-        await method(automations, "deleteAgentSchedules")(id).catch(
-          () => undefined
-        );
-        await deps.releaseAgentBox(id);
-        deps.hostEvents.emit({
-          kind: "notification-agent-forgotten",
-          agentId: id
-        });
-        deps.forgetLocalToolPermission(id);
-      }
-      return result;
+      const result = await method(manager, "deleteAgents")(ids);
+      for (const id of ids) cleanupFailures.push(...(await forgetDeletedAgent(id)));
+      return cleanupFailures.length === 0
+        ? result
+        : { ...result, cleanupFailures };
     },
     duplicateAgent: (args: any) => method(manager, "cloneAgent")(args.id),
     setAgentUnread: (args: any) =>
       method(manager, "setAgentUnread")(args.id, args.isUnread, args.atMs),
-    setAgentNotificationsEnabled: async () => undefined,
+    /**
+     * Was `async () => undefined`: the request body `{ id, isEnabled }` was
+     * parsed by the protocol layer and then dropped, so the notification switch
+     * in the sidebar resolved successfully while changing nothing. It now
+     * forwards to the same host call its neighbour uses.
+     */
+    setAgentNotificationsEnabled: (args: any) =>
+      method(manager, "setAgentNotifyOnUpdates")(args.id, args.isEnabled),
     setAgentNotifyOnUpdates: (args: any) =>
       method(manager, "setAgentNotifyOnUpdates")(args.id, args.isEnabled),
     setAgentHiddenFromSidebar: (args: any) =>

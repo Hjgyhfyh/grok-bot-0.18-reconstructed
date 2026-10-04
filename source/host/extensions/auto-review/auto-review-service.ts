@@ -6,6 +6,26 @@ import { SAND_AUTO_REVIEW_AWAITING_TAB_ID, SandAutoReviewAwaitingBridge, type Sa
 export function parseLocalAutoReviewMode(value: unknown): SandAutoReviewMode | undefined { return value === "off" || value === "shadow" || value === "enforce" ? value : undefined; }
 export const SETTLED_APPROVAL_MEMORY = 256;
 
+/**
+ * True when some credential source says this host can actually reach the
+ * classifier. Both probes are optional: a host that supplies neither is treated
+ * as authorized, because a missing probe is not evidence of a missing account.
+ */
+export function hasAutoReviewClassifierBootstrap(candidate: unknown): boolean {
+  if (candidate === null || typeof candidate !== "object") return false;
+  const holder = candidate as {
+    readonly hasAuthenticatedStatsigBootstrap?: () => boolean;
+    readonly peekAccessToken?: () => string | null;
+    readonly getLastRenewalEvent?: () => { readonly credential?: unknown } | undefined;
+  };
+  try {
+    if (typeof holder.hasAuthenticatedStatsigBootstrap === "function" && holder.hasAuthenticatedStatsigBootstrap() === false) return false;
+    if (typeof holder.peekAccessToken === "function") return holder.peekAccessToken() !== null;
+    if (typeof holder.getLastRenewalEvent === "function" && holder.getLastRenewalEvent() != null) return true;
+  } catch {}
+  return true;
+}
+
 export interface AutoReviewUpdateSink { (update: unknown): void }
 export interface AutoReviewServiceDeps<Classifier = unknown, Auth = unknown> {
   readonly auth: Auth;
@@ -46,7 +66,16 @@ export class AutoReviewService<Classifier = unknown, Auth = unknown> {
   async sweepStaleAwaitingBadges(listAgentIds: () => Promise<readonly string[]>, ifSinceBefore: number): Promise<void> { try { for (const agentId of await listAgentIds()) this.deps.awaitingSink.clearForTab(agentId, SAND_AUTO_REVIEW_AWAITING_TAB_ID, { ifSinceBefore }); } catch {} }
   #ownerOf(requestId: string): SandAutoReviewController | undefined { for (const [controller] of this.#pendingControllers) if (controller.getPendingApprovals().some((approval) => approval.id === requestId)) return controller; return undefined; }
   #rememberSettled(id: string): void { this.#settledApprovalIds.add(id); if (this.#settledApprovalIds.size <= SETTLED_APPROVAL_MEMORY) return; const oldest = this.#settledApprovalIds.values().next(); if (!oldest.done) this.#settledApprovalIds.delete(oldest.value); }
-  #resolveModes() { return resolveSandAutoReviewModes({ settingsEnabled: this.deps.settings.getAutoReviewInstructions().isEnabled, enforceEnabled: this.deps.experiments.checkFeatureGate("sand_auto_review"), ...(this.deps.localMode === undefined ? {} : { localOverride: this.deps.localMode }) }); }
+  #resolveModes() {
+    // `classifySandAutoReview` is a cloud RPC on `aiserver.v1.DashboardService`
+    // and needs an access token. Without one it throws on every call, so
+    // enforcing here means "refuse every action" dressed as a safety feature:
+    // Auto-review never reaches a verdict, it only ever produces dead ends.
+    // The whole subsystem stays off until an authorized bootstrap exists, which
+    // is the default shape of this build on a machine without an account.
+    if (!hasAutoReviewClassifierBootstrap(this.deps.experiments) || !hasAutoReviewClassifierBootstrap(this.deps.auth)) return resolveSandAutoReviewModes({ settingsEnabled: false, enforceEnabled: false, ...(this.deps.localMode === undefined ? {} : { localOverride: this.deps.localMode }) });
+    return resolveSandAutoReviewModes({ settingsEnabled: this.deps.settings.getAutoReviewInstructions().isEnabled, enforceEnabled: this.deps.experiments.checkFeatureGate("sand_auto_review"), ...(this.deps.localMode === undefined ? {} : { localOverride: this.deps.localMode }) });
+  }
   #handleApprovalEvent(onUpdate: AutoReviewUpdateSink, event: SandAutoReviewEvent): void {
     const approval = event.approval; this.deps.telemetry.reportAutoReviewApproval({ eventType: event.type, conversationId: approval.agentId, approvalId: approval.id, surface: approval.surface, status: approval.status, ageMs: this.#now() - approval.createdAtMs, ...(approval.expiresAtMs === undefined ? {} : { ttlMs: approval.expiresAtMs - approval.createdAtMs }), ...(event.type === "expired" ? { cause: event.cause } : {}) });
     if (event.type === "created") { onUpdate({ type: "send-message", message: { type: "auto-review-approval", approval: { requestId: approval.id, surface: approval.surface, summary: approval.summary, reason: approval.reason, status: "pending", ...(approval.command === undefined ? {} : { command: approval.command }), ...(approval.proposedRule === undefined ? {} : { proposedRule: approval.proposedRule }) } }, timestampMs: this.#now() }); return; }

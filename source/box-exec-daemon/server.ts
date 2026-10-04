@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { appendFile, lstat, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -79,7 +80,25 @@ const BoxExecService = {
 
 export const BOX_EXEC_DAEMON_HOST = "127.0.0.1";
 export const BOX_EXEC_DAEMON_PORT = 1337;
-export const BOX_EXEC_DAEMON_AUTH_TOKEN = "local";
+
+/**
+ * The daemon's bearer credential.
+ *
+ * It used to be the literal "local", which made command execution on this
+ * machine available to anyone who had read a public repository: a live probe
+ * answered 401 without a header and 404 with `Authorization: Bearer local`,
+ * and 404 is what a *correct* token returns on a route the daemon does not
+ * serve. The only holder of the credential must be the starter, and it already
+ * exports one through SAND_BOX_EXEC_DAEMON_AUTH_TOKEN. When that variable is
+ * absent the daemon mints its own random token, which no client can guess: the
+ * daemon then refuses every caller rather than accepting every caller.
+ */
+export function resolveBoxExecDaemonAuthToken(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = env.SAND_BOX_EXEC_DAEMON_AUTH_TOKEN?.trim();
+  return configured != null && configured.length > 0 ? configured : randomBytes(32).toString("base64url");
+}
+
+export const BOX_EXEC_DAEMON_AUTH_TOKEN = resolveBoxExecDaemonAuthToken();
 export const BOX_TERMINAL_VIRTUAL_PREFIX = "/root/.cursor/projects/workspace/terminals/";
 
 export interface BoxExecDaemonOptions {

@@ -16,6 +16,10 @@ import {
 } from "../../../shared/node/cursor-backend/cursor-inference.js";
 import { SandMcpManager } from "../../../shared/node/mcp/mcp-manager.js";
 import {
+  isLocalMcpServerId,
+  LOCAL_MCP_CONFIG_HINT,
+} from "../../../shared/node/mcp/local-mcp-config-provider.js";
+import {
   createMcpToolsDiscovery,
   SandMcpExecutor,
 } from "../../../shared/node/mcp/tools-discovery.js";
@@ -34,7 +38,7 @@ export interface EffectivePlugin { pluginId: string; installMode?: string; isEna
 export interface ServerState { servers: McpServerSummary[] }
 export interface PluginSkillsPort { sync(trigger: string): Promise<unknown[]>; status(): unknown; removeLiveReferences?(sourceUrls: readonly string[]): void }
 
-export function toInstalledServer(summary: McpServerSummary): Record<string, unknown> { return { id: summary.id, name: summary.name, serverIdentifier: summary.serverIdentifier, accountKey: summary.accountKey, ...(summary.pluginId == null ? {} : { pluginId: summary.pluginId }), isTeamServer: summary.isTeamServer, status: summary.status, ...(summary.statusDetail == null ? {} : { statusDetail: summary.statusDetail }), transport: summary.transport, toolCount: summary.toolCount, ...(summary.disabledToolCount == null ? {} : { disabledToolCount: summary.disabledToolCount }), customInstructions: summary.customInstructions }; }
+export function toInstalledServer(summary: McpServerSummary): Record<string, unknown> { return { id: summary.id, name: summary.name, serverIdentifier: summary.serverIdentifier, accountKey: summary.accountKey, ...(summary.pluginId == null ? {} : { pluginId: summary.pluginId }), isTeamServer: summary.isTeamServer, status: summary.status, ...(summary.statusDetail == null ? {} : { statusDetail: summary.statusDetail }), transport: summary.transport, toolCount: summary.toolCount, ...(summary.disabledToolCount == null ? {} : { disabledToolCount: summary.disabledToolCount }), customInstructions: summary.customInstructions, ...(isLocalMcpServerId(summary.id) ? { isLocal: true, managedBy: "local-file", configFile: LOCAL_MCP_CONFIG_HINT } : {}) }; }
 export function toInstalledServers(state: ServerState): Record<string, unknown>[] { return state.servers.map(toInstalledServer); }
 export function toCatalogFields(fields?: readonly CatalogField[] | null): Array<Required<CatalogField>> { return (fields ?? []).map((field) => ({ key: field.key, label: field.label, hint: field.hint, isRequired: field.isRequired === true, isSecret: field.isSecret === true })); }
 export function toAuthResult(result: { status: string; serverName: string; authorizationUrl?: string; message?: string }): Record<string, unknown> { if (result.status === "started") return { kind: "started", authorizationUrl: result.authorizationUrl, serverName: result.serverName }; if (result.status === "already-authenticated") return { kind: "already-authenticated", serverName: result.serverName }; if (result.status === "not-configured") return { kind: "not-configured", serverName: result.serverName }; return { kind: result.status, message: result.message, serverName: result.serverName }; }
@@ -43,6 +47,13 @@ export function toPluginSummary(view: CatalogPlugin, effectivePlugins: readonly 
   return { pluginId: view.id, name: view.name, displayName: view.displayName, description: view.description, category: view.category, isInstalled: installed, ...(installed ? { installMode: effective?.installMode ?? "unknown" } : {}), connectorCount: view.connectors?.length ?? 1, skills: (view.skills ?? []).map(({ name, description }) => ({ name, description })) };
 }
 export function syncPluginSkillsInBackground(pluginSkills: PluginSkillsPort | undefined, trigger: string): void { void pluginSkills?.sync(trigger).catch(() => {}); }
+
+/**
+ * How long `probeLocalStdioServer` waits for one handshake and one `tools/list`.
+ * Shorter than the client's own default: a probe that has not answered in ten
+ * seconds is a probe the user is waiting on.
+ */
+const LOCAL_STDIO_PROBE_TIMEOUT_MS = 10_000;
 
 export interface CreateHostMcpOptions {
   accountConfigProvider?: () => Promise<unknown>;
@@ -86,6 +97,8 @@ interface McpManagerRuntime {
   definitionSourceView(): unknown;
   lastAccountDisplayConfigView(): unknown;
   settingsStoreView(): unknown;
+  localMcpServersView(): Readonly<Record<string, { readonly command: string }>>;
+  localMcpConfigPathView(): string;
   dispose(): void | Promise<void>;
 }
 export function createHostMcp(deps: CreateHostMcpOptions): McpHostPort {
@@ -148,7 +161,30 @@ export function createHostMcp(deps: CreateHostMcpOptions): McpHostPort {
     removeAccount: async ({ serverId, accountKey }: { serverId: string; accountKey: string }) => toInstalledServers(await mutate(() => manager.removeAccount(serverId, accountKey)))
   };
   return {
-    mcp: { getTools: (ctx: unknown) => discovery.getToolsForTurnStart(ctx), listTools: async (ctx: unknown) => { const connected = await manager.listConnectedBackendTools(), discovered = await discovery.getTools(ctx), byName = new Map<string, any>(); for (const tool of [...connected, ...discovered] as any[]) if (!byName.has(tool.name)) byName.set(tool.name, tool); return [...byName.values()]; }, createExecutor: (persistImage: unknown, spillLargeText: unknown, auditIdentity: unknown) => new SandMcpExecutor(discovery, persistImage, spillLargeText, auditIdentity), refreshAccountConfig: () => manager.refreshAccountConfigInBackground(), createStateExecutor: () => createSandMcpStateExecutor({ getTools: (ctx: unknown) => discovery.getTools(ctx) }), getCustomInstructions: () => manager.getMcpCustomInstructions(), resolveToolTransport: (id: string) => discovery.resolveProviderTransport(id), resolveNeedsAuthSlot: async (id: string) => { const summary = (await manager.listServers()).servers.find((server: McpServerSummary) => server.serverIdentifier === id && server.status === "needsAuth"); return summary == null ? null : { serverId: summary.id, serverName: summary.name }; } },
+    mcp: { getTools: (ctx: unknown) => discovery.getToolsForTurnStart(ctx), listTools: async (ctx: unknown) => { const connected = await manager.listConnectedBackendTools(), discovered = await discovery.getTools(ctx), byName = new Map<string, any>(); for (const tool of [...connected, ...discovered] as any[]) if (!byName.has(tool.name)) byName.set(tool.name, tool); return [...byName.values()]; }, createExecutor: (persistImage: unknown, spillLargeText: unknown, auditIdentity: unknown) => new SandMcpExecutor(discovery, persistImage, spillLargeText, auditIdentity), refreshAccountConfig: () => manager.refreshAccountConfigInBackground(), createStateExecutor: () => createSandMcpStateExecutor({ getTools: (ctx: unknown) => discovery.getTools(ctx) }), getCustomInstructions: () => manager.getMcpCustomInstructions(), resolveToolTransport: (id: string) => discovery.resolveProviderTransport(id), resolveNeedsAuthSlot: async (id: string) => { const summary = (await manager.listServers()).servers.find((server: McpServerSummary) => server.serverIdentifier === id && server.status === "needsAuth"); return summary == null ? null : { serverId: summary.id, serverName: summary.name }; },
+      /**
+       * Starts ONE local stdio server named in the user's own file, completes the
+       * handshake and lists its tools, then closes it. Read only: the file is
+       * never written, and nothing here adds, changes or removes a server.
+       *
+       * This is the only place in the shipped product that runs a local MCP
+       * server inside the host. It exists because the client had to live in the
+       * bundle — `local-mcp/mcp-stdio-client.mjs` sits outside `source/` and never
+       * reached `app.asar` — and because "does my notes server start at all?" is
+       * the first question a user asks when a server does not appear.
+       */
+      probeLocalStdioServer: async (name: string): Promise<{ ok: boolean; server: string; reason?: string; toolCount?: number; tools?: string[] }> => {
+        const entry = manager.localMcpServersView()[name];
+        if (entry == null) return { ok: false, server: name, reason: `no local stdio server named "${name}" in ${manager.localMcpConfigPathView()}` };
+        const { connectStdioServer } = await import("../../../shared/node/mcp/mcp-stdio-client.js");
+        const client = await connectStdioServer(entry as { command: string }, { clientName: "grokbot-local-mcp-probe", timeoutMs: LOCAL_STDIO_PROBE_TIMEOUT_MS });
+        try {
+          const tools = await client.listTools();
+          return { ok: true, server: name, toolCount: tools.length, tools: tools.map((tool) => tool.name) };
+        } finally {
+          await client.close();
+        }
+      } },
     management,
     setSettingsStore: (settings: unknown) => manager.setSettingsStore(settings),
     listBoxServers: (ids, options) => discovery.listBoxServers([...ids], options),

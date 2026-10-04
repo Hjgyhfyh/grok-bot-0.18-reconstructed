@@ -237,6 +237,13 @@ export class SendPipeline {
         options.replyToId,
         options.isFork === true,
         readTranscript,
+        // The in-memory cache can be empty for the very agent it claims to describe, so
+        // a thread root the renderer is looking at has to be confirmed against the store
+        // before the reply is downgraded to an ordinary message in the main feed.
+        (id) =>
+          typeof session.db?.getEntryById === "function"
+            ? (session.db.getEntryById(id) as TranscriptEntry | null)
+            : null,
       );
       const names = options.attachmentNames ?? [];
       const batchId =
