@@ -89,6 +89,22 @@ export function validateArguments(schema: any, args: Record<string, unknown>): s
   return problems;
 }
 
+/** One entry of an MCP `resources/list` result, as the protocol sends it. */
+export interface McpResourceDescription {
+  readonly uri: string;
+  readonly name?: string;
+  readonly description?: string;
+  readonly mimeType?: string;
+}
+
+/** One entry of an MCP `resources/read` result, as the protocol sends it. */
+export interface McpResourceContents {
+  readonly uri: string;
+  readonly mimeType?: string;
+  readonly text?: string;
+  readonly blob?: string;
+}
+
 export interface McpToolDescription {
   readonly name: string;
   readonly description?: string;
@@ -99,12 +115,32 @@ export interface StdioMcpClientOptions {
   readonly clientName?: string;
   readonly clientVersion?: string;
   readonly timeoutMs?: number;
+  /**
+   * Environment the child inherits before `server.env` is applied.
+   *
+   * The daemon owns an environment it can rewrite at runtime through
+   * `UpdateEnvironmentVariables`; passing it here is what makes a stdio server see
+   * the same variables a `Shell` command on that box would see. Unset, the client
+   * falls back to `process.env`, which is what the standalone CLI wants.
+   */
+  readonly baseEnv?: NodeJS.ProcessEnv;
 }
 
 /** A connected stdio MCP server. `close()` is idempotent. */
 export interface StdioMcpClient {
   listTools(): Promise<McpToolDescription[]>;
   callTool(name: string, args?: Record<string, unknown>): Promise<any>;
+  /**
+   * MCP `resources/list`.
+   *
+   * The box daemon has to answer `ListMcpResourcesExecArgs`, and a server that
+   * exposes no resources answers with an empty list rather than an error — that
+   * difference is what tells "this server has nothing" apart from "this route is
+   * broken", so the caller needs the method rather than a hardcoded empty array.
+   */
+  listResources(): Promise<McpResourceDescription[]>;
+  /** MCP `resources/read`. Rejects with the server's own JSON-RPC error text. */
+  readResource(uri: string): Promise<McpResourceContents[]>;
   close(): Promise<void>;
 }
 
@@ -122,17 +158,21 @@ class StdioMcpClientImpl implements StdioMcpClient {
   private nextId = 1;
   private closed = false;
   private stderr = "";
+  private readonly baseEnv: NodeJS.ProcessEnv;
 
   constructor(
     private readonly server: LocalStdioServerConfig,
     private readonly timeoutMs: number,
-  ) {}
+    baseEnv: NodeJS.ProcessEnv = process.env,
+  ) {
+    this.baseEnv = baseEnv;
+  }
 
   start(): Promise<void> {
     return new Promise((resolve, reject) => {
       const child = spawn(this.server.command, [...(this.server.args ?? [])], {
         stdio: ["pipe", "pipe", "pipe"],
-        env: buildChildEnv(this.server.env),
+        env: buildChildEnv(this.server.env, this.baseEnv),
         windowsHide: true,
       });
       this.child = child;
@@ -218,6 +258,15 @@ class StdioMcpClientImpl implements StdioMcpClient {
     return this.request("tools/call", { name, arguments: args });
   }
 
+  async listResources(): Promise<McpResourceDescription[]> {
+    return (await this.request("resources/list", {})).resources ?? [];
+  }
+
+  async readResource(uri: string): Promise<McpResourceContents[]> {
+    const result = await this.request("resources/read", { uri });
+    return result?.contents ?? [];
+  }
+
   async close(): Promise<void> {
     this.closed = true;
     this.failAll(new Error("MCP client closed"));
@@ -261,7 +310,7 @@ export async function connectStdioServer(
   if (typeof server?.command !== "string" || server.command.length === 0) {
     throw new Error('stdio MCP config requires a non-empty "command" string');
   }
-  const client = new StdioMcpClientImpl(server, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const client = new StdioMcpClientImpl(server, options.timeoutMs ?? DEFAULT_TIMEOUT_MS, options.baseEnv);
   await client.start();
   try {
     await client.request("initialize", {

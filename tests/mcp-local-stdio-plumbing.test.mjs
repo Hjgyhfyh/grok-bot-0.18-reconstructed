@@ -106,15 +106,29 @@ test("the settings key that looks like MCP configuration is read by nothing that
   );
 });
 
-test("the box endpoint that would run a stdio server discards the configuration it is given", () => {
+test("the box endpoint that runs a stdio server actually reads the configuration it is given", () => {
   const server = readFileSync(path.join(repoRoot, "source", "box-exec-daemon", "server.ts"), "utf8");
   const matches = server.match(/loadMcpServers:\s*async[^,\n]*/g) ?? [];
-  assert.ok(matches.length > 0, "the guard found no loadMcpServers handler and cannot prove the endpoint is a stub");
+  assert.ok(matches.length > 0, "the guard found no loadMcpServers handler and cannot judge what it does with a request");
   assert.ok(
-    matches.some((handler) => !/request|configJson|mcpConfig/.test(handler)),
-    "the loadMcpServers handler now reads its request, so the stub is gone and this test is stale",
+    matches.every((handler) => /request|configJson|mcpConfig/.test(handler)),
+    "a loadMcpServers handler ignores its request, so a configured stdio server is never started",
   );
-  assert.match(server, /new LoadMcpServersResponse\(\s*\)/, "the handler no longer answers with an empty response");
+  assert.doesNotMatch(
+    server,
+    /loadMcpServers:\s*async[^,\n]*new LoadMcpServersResponse/,
+    "the handler still answers with an empty response, so the endpoint reports success while starting nothing",
+  );
+});
+
+test("every MCP message the host can send is answered by the daemon instead of rejected", () => {
+  const server = readFileSync(path.join(repoRoot, "source", "box-exec-daemon", "server.ts"), "utf8");
+  const cases = server.match(/case\s+"[a-zA-Z]+"/g) ?? [];
+  const answered = new Set(cases.map((c) => c.replace(/case\s+"|"/g, "")));
+  // The host discovers, lists, calls, and reads MCP resources; each needs a branch.
+  for (const kind of ["mcpArgs", "mcpStateExecArgs", "listMcpResourcesExecArgs", "readMcpResourceExecArgs"]) {
+    assert.ok(answered.has(kind), `${kind} has no branch, so the daemon answers it with "Unsupported ExecServerMessage case"`);
+  }
 });
 
 test("the agent-exec MCP module contains no process spawning, so no stdio server can be started", () => {

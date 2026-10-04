@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { isMessageAddress } from "../../../shared/message-reference.js";
 import { sandDualSurfaceToolTelemetry } from "../../../shared/agents/agent-tool-names.js";
 import { SAND_REACTION_AGENT } from "../../../shared/transcript.js";
@@ -20,12 +21,14 @@ import {
   type HostTrace,
 } from "../../send-trace-host.js";
 import { brandedEnumOf, brandedErrno } from "../../../shared/errors/bounded.js";
-import { SandError } from "../../../shared/errors/registry.js";
+import { SandError, sandErrorWireCode } from "../../../shared/errors/registry.js";
 import { findSystemErrno } from "../../../shared/system-errno.js";
 import {
   describeAgentRunError,
   findBackendConnectError,
+  PROVIDER_OVERLOAD_ERROR_DETAIL,
   PROVIDER_OVERLOAD_ERROR_TITLE,
+  type BackendConnectError,
 } from "./agent-run-error.js";
 import {
   createSendMessageEntry,
@@ -130,8 +133,42 @@ export function recordTurnQueueWaitSpan(args: {
   } catch {}
 }
 
+/**
+ * `ConnectError.findDetails()` dereferences its argument before it ever looks at the error's
+ * own details (`@connectrpc/connect` 1.x, `connect-error.js:93`), so calling it with no registry
+ * throws `TypeError: Cannot use 'in' operator …` — for every `ConnectError`, with or without
+ * details. `abstract-user-message-action-handler.ts:2129` throws exactly one of those for a
+ * cancelled turn, and `runTurn`'s catch reads the code on its next line: the handler that was
+ * supposed to report the turn threw a second, different error instead, and the turn died
+ * without a reason on the one path where the user already had one.
+ *
+ * The proper fix belongs in `agent-run-error.ts`, which owns `isConnectError`; until it has an
+ * owner, every reader on this side refuses to let the probe take the whole error path down.
+ */
+function findBackendConnectErrorSafely(error: unknown): BackendConnectError | null {
+  try {
+    return findBackendConnectError(error, false);
+  } catch {
+    return null;
+  }
+}
+
+/** The same probe through `describeAgentRunError`, which walks the details twice. */
+export function describeAgentRunFailure(error: unknown): Record<string, unknown> {
+  try {
+    return describeAgentRunError(error);
+  } catch {
+    return {
+      detail:
+        error instanceof Error
+          ? error.message
+          : String(error),
+    };
+  }
+}
+
 export function connectCodeOf(error: unknown): string | undefined {
-  const connectError = findBackendConnectError(error, false);
+  const connectError = findBackendConnectErrorSafely(error);
   if (connectError == null || typeof connectError.code !== "number") {
     return undefined;
   }
@@ -211,6 +248,270 @@ export function classifyAgentError(error: unknown): Record<string, unknown> {
   return SandError.agentUnclassified();
 }
 
+// ---------------------------------------------------------------------------
+// Why a turn said nothing.
+//
+// A turn that dies on the provider used to leave nothing behind at all. The action
+// handler throws `response.error` out of the step, `stream-attempt.ts` rethrows it,
+// the runner lets it through, and the only record was a console line and an error
+// tray entry that a later message pushed off screen. Fourteen user messages and no
+// answers left the user with nothing to act on.
+//
+// The text below is therefore composed from a closed table of sentences plus three
+// bounded facts: an HTTP status, a `Retry-After` count and a registry error code. The
+// provider's own message never enters it. `APICallError` (ai 4.3.17) carries
+// `requestBodyValues` — the whole prompt — plus `url`, `responseHeaders` and a stack
+// whose arguments can hold the credential, so anything copied out of the error
+// object is a leak waiting to happen. Selecting a sentence by shape cannot leak,
+// because nothing that came off the wire is ever read.
+// ---------------------------------------------------------------------------
+
+export const PROVIDER_FAILURE_NOTICE = "provider_failure";
+export const EMPTY_DELIVERY_NOTICE = "empty_delivery";
+export const TURN_NOTICE_ID_PREFIX = "notice-turn-";
+
+/** A user-visible reason, plus the machine code it was derived from. */
+export interface TurnFailureNotice {
+  readonly text: string;
+  readonly errorCode?: string;
+}
+
+function noticeKindSuffix(noticeKind: string): string {
+  return noticeKind.replace(/[^a-z0-9]+/g, "");
+}
+
+const USER_ABORT_MESSAGE = "User aborted request";
+// `Code.Canceled` in `@connectrpc/connect`, i.e. the first entry of `CONNECT_CODE_NAMES`.
+const CANCELED_CONNECT_CODE = 1;
+// `OPENAI_COMPATIBLE_API_KEY` ends in `API_KEY` and has no word boundary before it,
+// so the name is matched without one on purpose.
+const API_KEY_NAME = /API[_ -]?KEY/i;
+const MISSING_CREDENTIAL_WORD =
+  /\b(missing|needs|need|required|absent|not set|not configured)\b/i;
+
+/** Walks `cause` and `errors[]` once, with cycle protection. */
+function walkFailureNodes(
+  error: unknown,
+  visit: (node: Record<string, any>) => void,
+): void {
+  const seen = new Set<unknown>();
+  const stack: unknown[] = [error];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (current == null || typeof current !== "object" || seen.has(current))
+      continue;
+    seen.add(current);
+    const node = current as Record<string, any>;
+    visit(node);
+    stack.push(node.cause);
+    if (Array.isArray(node.errors)) stack.push(...node.errors);
+  }
+}
+
+/**
+ * The HTTP status an OpenAI-compatible provider answered with. `APICallError` keeps
+ * it on `statusCode`; a couple of transports spell it `status`.
+ */
+export function providerHttpStatusOf(error: unknown): number | undefined {
+  let status: number | undefined;
+  walkFailureNodes(error, (node) => {
+    if (status !== undefined) return;
+    const raw = node.statusCode ?? node.status;
+    const value = typeof raw === "number" ? raw : Number(raw);
+    if (Number.isInteger(value) && value >= 100 && value <= 599)
+      status = value;
+  });
+  return status;
+}
+
+/**
+ * A turn the user stopped is not a failure to explain: they already know. `408` and `409` are
+ * deliberately absent from the test — those are provider deadlines, not a local cancel.
+ *
+ * `ConnectError` rewrites its own message (`[canceled] User aborted request`) and keeps the
+ * original in `rawMessage`, so both spellings are read. Its numeric `code` is read directly
+ * rather than through `findBackendConnectError`, because the probe that decodes it throws on a
+ * detail-less `ConnectError` and the one error that must never be misreported is this one.
+ */
+export function isUserCancelledTurn(error: unknown): boolean {
+  let cancelled = false;
+  walkFailureNodes(error, (node) => {
+    if (cancelled) return;
+    if (
+      node.name === "AbortError" ||
+      node.message === USER_ABORT_MESSAGE ||
+      node.rawMessage === USER_ABORT_MESSAGE ||
+      (typeof node.findDetails === "function" &&
+        node.code === CANCELED_CONNECT_CODE)
+    )
+      cancelled = true;
+  });
+  return cancelled;
+}
+
+/**
+ * A credential that was never supplied, as opposed to one the provider refused. The
+ * shape test never reads the key: only the words around it, and only when no HTTP
+ * status arrived at all, because a 401 about a key is a different sentence.
+ */
+export function isMissingProviderCredential(error: unknown): boolean {
+  if (providerHttpStatusOf(error) !== undefined) return false;
+  let missing = false;
+  walkFailureNodes(error, (node) => {
+    if (missing) return;
+    const message = typeof node.message === "string" ? node.message : "";
+    if (API_KEY_NAME.test(message) && MISSING_CREDENTIAL_WORD.test(message))
+      missing = true;
+  });
+  return missing;
+}
+
+function readHeader(headers: unknown, name: string): string | undefined {
+  if (headers == null || typeof headers !== "object") return undefined;
+  const getter = (headers as { get?: unknown }).get;
+  const raw =
+    typeof getter === "function"
+      ? (getter as (key: string) => unknown).call(headers, name)
+      : (headers as Record<string, unknown>)[name];
+  return typeof raw === "string" ? raw : undefined;
+}
+
+/** Seconds the provider asked the client to wait, as a whole number. */
+function retryAfterSecondsOf(error: unknown): number | undefined {
+  const fromBackend = serverRetryAfterMsFromError(error);
+  if (fromBackend !== undefined)
+    return Math.max(1, Math.round(fromBackend / 1_000));
+  let seconds: number | undefined;
+  walkFailureNodes(error, (node) => {
+    if (seconds !== undefined) return;
+    const parsed = Number(readHeader(node.responseHeaders, "retry-after"));
+    if (Number.isFinite(parsed) && parsed >= 0)
+      seconds = Math.min(Math.round(parsed), 3_600);
+  });
+  return seconds;
+}
+
+/**
+ * A title the backend itself wrote. Only one short single line is taken: a title carrying a
+ * line break or a control character is not a title, and accepting one would let a stack or a
+ * pasted request body ride along in a field the renderer prints as a sentence.
+ */
+function curatedBackendTitleOf(error: unknown): string | undefined {
+  const connectError = findBackendConnectErrorSafely(error);
+  if (connectError == null) return undefined;
+  let title: string | undefined;
+  try {
+    title = connectError.findDetails()[0]?.details?.title?.trim();
+  } catch {
+    return undefined;
+  }
+  return title != null &&
+    title.length > 0 &&
+    !/[\r\n\u0000-\u001f\u007f]/.test(title)
+    ? title.slice(0, 120)
+    : undefined;
+}
+
+/**
+ * The sentence the agent writes into its own transcript when a turn dies on the
+ * provider. Returns `undefined` only when the turn was stopped by the user.
+ */
+export function describeProviderTurnFailure(
+  error: unknown,
+): TurnFailureNotice | undefined {
+  if (isUserCancelledTurn(error)) return undefined;
+  const status = providerHttpStatusOf(error);
+  const backendTitle = curatedBackendTitleOf(error);
+  let title: string;
+  let detail: string;
+  if (status === undefined && backendTitle === undefined && isMissingProviderCredential(error)) {
+    title = "No API key is configured for the model provider.";
+    detail =
+      "Add the key in Settings → Router and send the message again. The key itself is not shown here.";
+  } else if (status === 401) {
+    title = "The model provider refused the API key (HTTP 401).";
+    detail =
+      "The key for this provider is missing, wrong or expired. Fix it in Settings → Router and send the message again. The key itself is not shown here.";
+  } else if (status === 403) {
+    title = "The model provider refused this request (HTTP 403).";
+    detail =
+      "The configured key is not allowed to use this model. Change the key or the model in Settings → Router.";
+  } else if (status === 404) {
+    title = "The model provider has no such model or endpoint (HTTP 404).";
+    detail =
+      "The base URL or the model id in Settings → Router does not exist on this provider.";
+  } else if (status === 429) {
+    const waitSeconds = retryAfterSecondsOf(error);
+    title = "The model provider is rate limiting this key (HTTP 429).";
+    detail =
+      waitSeconds === undefined
+        ? "Too many requests reached the provider. Sending the message again after a short wait usually works."
+        : `Too many requests reached the provider, which asked to wait about ${waitSeconds}s. Sending the message again after that usually works.`;
+  } else if (status === 400 || status === 422) {
+    title = `The model provider refused the request (HTTP ${status}).`;
+    detail =
+      "The provider rejected the request itself. A shorter conversation or a different model usually helps.";
+  } else if (status !== undefined && status >= 500) {
+    title = `The model provider failed with a server error (HTTP ${status}).`;
+    detail =
+      "The fault is on the provider side. Sending the message again usually works.";
+  } else if (isFirstTokenStallError(error)) {
+    title = "The model provider stopped responding.";
+    detail =
+      "No answer arrived within the time limit. Sending the message again usually works.";
+  } else if (isContextOverflowDeadEnd(error)) {
+    title = "This conversation no longer fits the model's context window.";
+    detail =
+      "Start a new chat, or ask the agent to summarise the earlier turns before continuing.";
+  } else if (isConversationTooLargeRefusal(error)) {
+    title = "This conversation is too large for the provider to accept.";
+    detail =
+      "Start a new chat to continue; this one has passed the size the agent is allowed to send.";
+  } else if (isProviderCapacityError(error)) {
+    title = PROVIDER_OVERLOAD_ERROR_TITLE;
+    detail = PROVIDER_OVERLOAD_ERROR_DETAIL;
+  } else if (isTransientStreamError(error)) {
+    title =
+      "The connection to the model provider broke before the answer finished.";
+    detail =
+      "Nothing usable arrived from the provider. Sending the message again usually works.";
+  } else if (status !== undefined) {
+    title = `The model provider refused the request (HTTP ${status}).`;
+    detail =
+      "The provider answered with an error instead of a reply. Sending the message again usually works.";
+  } else if (backendTitle !== undefined) {
+    title = backendTitle;
+    detail =
+      "The backend refused this turn. The error tray carries the full report and any fix it offers.";
+  } else {
+    title = "This turn failed before the agent could answer.";
+    detail =
+      "The failure was not a model provider request this build can name. Sending the message again usually works.";
+  }
+  return {
+    text: `${title} ${detail}`,
+    errorCode: sandErrorWireCode(classifyAgentError(error)),
+  };
+}
+
+/**
+ * A turn that ran to its end and still delivered nothing. Nothing threw here — the
+ * reply-nudge ladder already ran and the agent never called SendMessage — so this
+ * is the only place the user can be told the difference between a provider that
+ * answered with nothing and an agent that answered itself.
+ */
+export function describeEmptyDeliveryNotice(
+  streamOutputProduced: boolean,
+): TurnFailureNotice {
+  return streamOutputProduced
+    ? {
+        text: "The agent finished this turn without sending an answer. It produced output but never called SendMessage, so nothing reached this chat. Sending the message again usually works.",
+      }
+    : {
+        text: "The model provider answered with nothing. The request completed but no text came back, so this chat has no reply. Sending the message again usually works.",
+      };
+}
+
 type CardPredicate = (entry: TranscriptEntry) => boolean;
 type CardUpdate = (entry: TranscriptEntry) => TranscriptEntry;
 
@@ -233,6 +534,33 @@ export class TurnRuntime {
   readonly pendingToolCallStarts = new Map<string, Map<string, number>>();
 
   constructor(readonly tm: TranscriptManagerLike) {}
+
+  /**
+   * Writes one `notice` row — the kind the renderer already draws as a note inside the
+   * conversation, so the reason lands where the user is already waiting instead of in a
+   * tray that scrolls away. The active agent goes through `appendEntry`, which updates
+   * the live transcript and persists in one step; any other agent is written straight to
+   * its own `store.db`, which is the same split `shared-rooms.ts` uses for its notices.
+   */
+  recordTurnNotice(
+    session: LiveTranscriptSession,
+    notice: TurnFailureNotice & { readonly noticeKind: string },
+  ): void {
+    const entry: TranscriptEntry = {
+      kind: "notice",
+      id: `${TURN_NOTICE_ID_PREFIX}${noticeKindSuffix(notice.noticeKind)}-${randomUUID()}`,
+      text: notice.text,
+      timestampMs: Date.now(),
+      noticeKind: notice.noticeKind,
+      ...(notice.errorCode == null ? {} : { errorCode: notice.errorCode }),
+    };
+    if (this.tm.sessions.activeSession?.id === session.id) {
+      this.tm.appendEntry(entry);
+      return;
+    }
+    session.db.appendTranscriptEntry(entry);
+    void this.tm.roster.emitAgentUpdate(session.id);
+  }
 
   settleCardStatus(args: {
     runSession?: LiveTranscriptSession | null;
@@ -472,6 +800,14 @@ export class TurnRuntime {
               ackOutstanding:
                 this.tm.ackObligationStore?.get(session.id) != null,
             });
+            // Telemetry is not a place the user reads. A provider that answers with an
+            // empty 200 or a body that is not an event stream throws nothing at all, so
+            // this is the only path that can say "the provider answered with nothing"
+            // instead of leaving the message unanswered.
+            this.recordTurnNotice(session, {
+              ...describeEmptyDeliveryNotice(settled.streamOutputProduced),
+              noticeKind: EMPTY_DELIVERY_NOTICE,
+            });
           }
         }
         turn.finalize(
@@ -493,8 +829,17 @@ export class TurnRuntime {
           sandErrorDetail(error),
         );
         markTurnTraceError(turnTrace, error);
+        // The tray is a global notification that the next message pushes off screen; the
+        // agent's own history is where the user comes looking for why this turn said
+        // nothing. Written before the tray so a tray failure cannot lose the reason.
+        const notice = describeProviderTurnFailure(error);
+        if (notice != null)
+          this.recordTurnNotice(session, {
+            ...notice,
+            noticeKind: PROVIDER_FAILURE_NOTICE,
+          });
         if (epoch === this.tm.sendPipeline.currentTurnEpoch(session)) {
-          const description = describeAgentRunError(error);
+          const description = describeAgentRunFailure(error);
           const requestId = session.db.getRequestIds().at(-1)?.id;
           this.tm.trayErrors.pushError({
             agentId: session.id,

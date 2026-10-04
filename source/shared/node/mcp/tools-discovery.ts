@@ -432,19 +432,51 @@ export function createMcpToolsDiscovery(
     getTools: async (_ctx?: unknown) =>
       filterDisabledTools(await getToolsRaw()),
     getToolsRaw,
+    /**
+     * The tool list a turn starts with, and therefore the only thing that
+     * decides whether `GetMcpTools` and `CallMcpTool` exist for that turn.
+     *
+     * A turn cannot recover from being told "there is nothing here": the pair is
+     * built from this list and its absence is final for the turn
+     * (`turn-toolset.ts:908`). So the list is resolved, not merely sampled.
+     * Reading the cache without ever obtaining it is what lost the user's local
+     * stdio servers: only the settings surface and the routed listing awaited a
+     * resolution, so the first turn found the cache cold, started a resolution,
+     * read the empty result of that same call and answered "no MCP servers" —
+     * while `listTools` on this same object returned six live tools. No turn ever
+     * warms the cache, so every turn answered the same way.
+     */
     getToolsForTurnStart: async (_ctx?: unknown) => {
       const serverNames = peekDiscoveryServerNames();
       if (serverNames === undefined) {
-        scheduleColdStartWarm();
-        return [];
+        // The account's servers are unknown, which is not the same claim as
+        // "there are no servers": a stdio server from the user's own file is
+        // known without any account read. Returning `[]` here is what told a
+        // signed-out machine with a working notes server that it had none.
+        const stdioServerNames = core.definitionSource.peekStdioServerNames();
+        if (stdioServerNames === undefined || stdioServerNames.length === 0) {
+          scheduleColdStartWarm();
+          return [];
+        }
+        return filterDisabledTools(await getToolsRaw());
       }
       const key = toolServerSetKey(serverNames);
       if (key === "") {
         dropSettledCacheForEmptyServerSet();
         return [];
       }
-      if (!toolsEntryUsable(key)) startToolsResolution(key, true);
-      return filterDisabledTools(currentToolsForKey(key) ?? []);
+      if (toolsEntryUsable(key)) {
+        const cached = currentToolsForKey(key);
+        if (cached !== undefined) return filterDisabledTools(cached);
+      } else {
+        startToolsResolution(key, true);
+      }
+      // Awaiting the resolution this turn started is the same read `getToolsRaw`
+      // performs, bounded by the same discovery deadline. A failure still ends as
+      // an empty list: `startToolsResolution` reports it and drops the entry, so
+      // a box that cannot be reached degrades to the old behaviour instead of
+      // taking the turn down.
+      return filterDisabledTools(await getToolsRaw());
     },
     async listBoxServers(
       serverIdentifiers: string[],
