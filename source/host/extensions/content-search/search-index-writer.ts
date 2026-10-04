@@ -20,20 +20,69 @@ function messageOf(entry: IndexEntry) { if (entry.kind === "message" && entry.to
 function mediaFileName(fileName: string | undefined, urlOrPath: string): string { const trimmed = fileName?.trim(); if (trimmed != null && trimmed.length > 0) return trimmed; let subject = urlOrPath; try { subject = new URL(urlOrPath).pathname; } catch {} try { subject = decodeURIComponent(subject); } catch {} return basename(subject); }
 function mediaOf(entry: IndexEntry) { let fileName: string, urlOrPath: string, width: number | null = null, height: number | null = null; if (entry.kind === "user-attachment" && typeof entry.file_path === "string") { urlOrPath = entry.file_path; fileName = mediaFileName(entry.file_name, urlOrPath); width = wholeDimension(entry.width); height = wholeDimension(entry.height); } else if (entry.kind === "send-message" && entry.message?.type === "attachment" && typeof entry.message.url === "string") { urlOrPath = entry.message.url; fileName = mediaFileName(entry.message.file_name, urlOrPath); } else return null; if (fileName.length === 0) return null; return { entryId: entry.id, fileName, ext: extname(fileName).toLowerCase(), mime: imageMimeFromPath(fileName) ?? videoMimeFromPath(fileName) ?? audioMimeFromPath(fileName) ?? null, kind: classifyAttachment({ fileName, urlOrPath }) as AttachmentKind, timestampMs: wholeMs(entry.timestampMs), width, height }; }
 export class SandSearchIndexWriter {
-  private readonly statements: Statements; private readonly storeConnections = new Map<string, DatabaseSync>();
+  private readonly statements: Statements;
   constructor(private readonly db: DatabaseSync, private readonly agentsRootDir: string) { this.statements = prepareStatements(db); }
-  close(): void { for (const db of this.storeConnections.values()) try { db.close(); } catch {} this.storeConnections.clear(); }
+  /**
+   * Nothing to release. Every `store.db` this writer touches is opened and closed
+   * inside the call that reads it — see `withStore`.
+   *
+   * It used to keep a `Map<string, DatabaseSync>` of open connections and evict
+   * one when a `clear-agent` job for that agent arrived. Measured on a live box
+   * carrying fifty agents: after `reconcile()`, forty-eight of the fifty
+   * `store.db` files were held open by the host process, and the set of held ids
+   * was exactly the set of rows in `search-index.db`. That is the only reason an
+   * agent could not be deleted while the box was running: `node:sqlite` opens a
+   * file without `FILE_SHARE_DELETE`, so Windows refuses to unlink it and `rm`
+   * left `store.db`, `store.db-wal` and `store.db-shm` behind. The writer is a
+   * `worker_thread` of the same process, so the handle is the box's own.
+   */
+  close(): void {}
   runJob(job: SearchIndexJob): void { switch (job.kind) { case "upsert-entries": this.upsertEntries(job.agentId, job.entries); break; case "delete-entry": this.deleteEntry(job.agentId, job.entryId); break; case "clear-agent": this.clearAgent(job.agentId); break; case "reindex-agents": for (const id of job.agentIds) this.reindexAgent(id); break; case "reconcile": this.reconcile(); } }
   private storeDbPath(id: string): string { return join(this.agentsRootDir, id, STORE_FILENAME); }
-  private evict(id: string): void { const db = this.storeConnections.get(id); this.storeConnections.delete(id); try { db?.close(); } catch {} }
-  private store(id: string): DatabaseSync | null { const cached = this.storeConnections.get(id); if (cached != null) return cached; const path = this.storeDbPath(id); if (!existsSync(path)) return null; try { const db = new DatabaseSync(path, { readOnly: true }); db.exec(`PRAGMA busy_timeout = ${DB_BUSY_TIMEOUT_MS}`); this.storeConnections.set(id, db); return db; } catch { return null; } }
-  private fingerprint(id: string): string | null { const db = this.store(id); if (db == null) return null; try { const row = db.prepare("SELECT COUNT(*) AS count, COALESCE(MAX(seq), 0) AS maxSeq FROM transcript_entries").get() as { count?: unknown; maxSeq?: unknown } | undefined; return typeof row?.count === "number" && typeof row.maxSeq === "number" ? `${row.count}:${row.maxSeq}` : null; } catch { this.evict(id); return null; } }
+  /**
+   * Runs `read` against the agent's `store.db` with the connection open for
+   * exactly that call.
+   *
+   * A read-only `node:sqlite` handle keeps the file undeletable on Windows, and
+   * this writer runs in a worker thread of the host process, so holding one
+   * across calls holds the agent's directory on disk. `reconcile` pays for that
+   * with one open per agent instead of one cached connection per agent; on the
+   * measured box that is fifty short-lived opens against fifty permanent locks.
+   */
+  private withStore<T>(id: string, read: (db: DatabaseSync) => T, whenAbsent: T): T {
+    const path = this.storeDbPath(id);
+    if (!existsSync(path)) return whenAbsent;
+    let db: DatabaseSync;
+    try { db = new DatabaseSync(path, { readOnly: true }); db.exec(`PRAGMA busy_timeout = ${DB_BUSY_TIMEOUT_MS}`); }
+    catch { return whenAbsent; }
+    try { return read(db); }
+    finally { try { db.close(); } catch {} }
+  }
+  private fingerprint(id: string): string | null {
+    return this.withStore(id, (db) => {
+      try {
+        const row = db.prepare("SELECT COUNT(*) AS count, COALESCE(MAX(seq), 0) AS maxSeq FROM transcript_entries").get() as { count?: unknown; maxSeq?: unknown } | undefined;
+        return typeof row?.count === "number" && typeof row.maxSeq === "number" ? `${row.count}:${row.maxSeq}` : null;
+      } catch { return null; }
+    }, null);
+  }
   private transaction(run: () => void): void { this.db.exec("BEGIN IMMEDIATE"); try { run(); this.db.exec("COMMIT"); } catch (error) { try { this.db.exec("ROLLBACK"); } catch {} throw error; } }
   private apply(agentId: string, entry: IndexEntry): void { const message = messageOf(entry), media = mediaOf(entry); if (message == null) this.statements.deleteMessage.run(agentId, entry.id); else this.statements.upsertMessage.run(agentId, message.entryId, message.role, message.timestampMs, message.body); if (media == null) this.statements.deleteMedia.run(agentId, entry.id); else this.statements.upsertMedia.run(agentId, media.entryId, media.fileName, media.ext, media.mime, media.kind, media.timestampMs, media.width, media.height); }
   private refresh(id: string): void { const value = this.fingerprint(id); value == null ? this.statements.deleteFingerprint.run(id) : this.statements.upsertFingerprint.run(id, value); }
   upsertEntries(id: string, entries: readonly IndexEntry[]): void { if (entries.length === 0) return; this.transaction(() => { for (const entry of entries) this.apply(id, entry); this.refresh(id); }); }
   deleteEntry(id: string, entryId: string): void { this.transaction(() => { this.statements.deleteMessage.run(id, entryId); this.statements.deleteMedia.run(id, entryId); this.refresh(id); }); }
-  clearAgent(id: string): void { this.evict(id); this.transaction(() => { this.statements.deleteAgentMessages.run(id); this.statements.deleteAgentMedia.run(id); this.statements.deleteFingerprint.run(id); }); this.db.exec(`PRAGMA incremental_vacuum(${INCREMENTAL_VACUUM_PAGES})`); }
-  reindexAgent(id: string): void { this.evict(id); if (!existsSync(this.storeDbPath(id))) { this.clearAgent(id); return; } const db = this.store(id); if (db == null) return; let rows: { seq?: unknown; entry?: unknown }[]; try { rows = db.prepare("SELECT seq, entry FROM transcript_entries ORDER BY seq").all() as { seq?: unknown; entry?: unknown }[]; } catch { this.evict(id); return; } let maxSeq = 0; const entries: IndexEntry[] = []; for (const row of rows) { if (typeof row.seq === "number") maxSeq = Math.max(maxSeq, row.seq); if (typeof row.entry !== "string") continue; try { const value = JSON.parse(row.entry) as Partial<IndexEntry>; if (typeof value.id === "string" && typeof value.kind === "string") entries.push(value as IndexEntry); } catch {} } this.transaction(() => { this.statements.deleteAgentMessages.run(id); this.statements.deleteAgentMedia.run(id); for (const entry of entries) this.apply(id, entry); this.statements.upsertFingerprint.run(id, `${rows.length}:${maxSeq}`); }); this.db.exec(`PRAGMA incremental_vacuum(${INCREMENTAL_VACUUM_PAGES})`); }
+  clearAgent(id: string): void { this.transaction(() => { this.statements.deleteAgentMessages.run(id); this.statements.deleteAgentMedia.run(id); this.statements.deleteFingerprint.run(id); }); this.db.exec(`PRAGMA incremental_vacuum(${INCREMENTAL_VACUUM_PAGES})`); }
+  reindexAgent(id: string): void {
+    if (!existsSync(this.storeDbPath(id))) { this.clearAgent(id); return; }
+    const snapshot = this.withStore(id, (db) => readTranscriptRows(db), null);
+    if (snapshot == null) return;
+    const entries: IndexEntry[] = [];
+    for (const row of snapshot.rows) { if (typeof row.entry !== "string") continue; try { const value = JSON.parse(row.entry) as Partial<IndexEntry>; if (typeof value.id === "string" && typeof value.kind === "string") entries.push(value as IndexEntry); } catch {} }
+    this.transaction(() => { this.statements.deleteAgentMessages.run(id); this.statements.deleteAgentMedia.run(id); for (const entry of entries) this.apply(id, entry); this.statements.upsertFingerprint.run(id, `${snapshot.count}:${snapshot.maxSeq}`); });
+    this.db.exec(`PRAGMA incremental_vacuum(${INCREMENTAL_VACUUM_PAGES})`);
+  }
   reconcile(): void { let ids: string[]; try { ids = readdirSync(this.agentsRootDir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name); } catch { ids = []; } const onDisk = new Set(ids); for (const row of this.statements.listIndexedAgentIds.all() as { agentId?: unknown }[]) if (typeof row.agentId === "string" && !onDisk.has(row.agentId)) this.clearAgent(row.agentId); for (const id of ids) { if (!existsSync(this.storeDbPath(id))) continue; const current = this.fingerprint(id), indexed = this.statements.readFingerprint.get(id) as { fingerprint?: unknown } | undefined; if (current != null && indexed?.fingerprint !== current) this.reindexAgent(id); } writeReconcileDone(this.db); }
 }
+
+interface TranscriptRowSnapshot { readonly count: number; readonly maxSeq: number; readonly rows: ReadonlyArray<{ seq?: unknown; entry?: unknown }> }
+function readTranscriptRows(db: DatabaseSync): TranscriptRowSnapshot { const rows = db.prepare("SELECT seq, entry FROM transcript_entries ORDER BY seq").all() as { seq?: unknown; entry?: unknown }[]; let maxSeq = 0; for (const row of rows) if (typeof row.seq === "number") maxSeq = Math.max(maxSeq, row.seq); return { count: rows.length, maxSeq, rows }; }

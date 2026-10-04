@@ -51,13 +51,28 @@ async function bundle(entries) {
 }
 
 const { loaded, dispose } = await bundle([
+  ["host", "extensions", "session", "agent-db.ts"],
   ["host", "extensions", "session", "agent-session.ts"],
   ["host", "extensions", "session", "session-materialization.ts"],
   ["host", "extensions", "transcript", "agent-lifecycle.ts"],
 ]);
+const { ensureAgentDbDirectory } = loaded["agent-db.mjs"];
 const { SandAgentSessionStore } = loaded["agent-session.mjs"];
 const { SandSessionMaterialization, MAX_AGENTS_PER_USER } = loaded["session-materialization.mjs"];
 const { AgentLifecycle, SandAgentLifecycleError } = loaded["agent-lifecycle.mjs"];
+
+/**
+ * Opening a store no longer creates the directory it reads from, so minting has
+ * to. The production host does this in a subclass of the materialization
+ * (`extensions/session/production.ts`); this is the same line, so the cap is
+ * still decided by the real materialization rather than by a stub.
+ */
+class ExplicitDirectoryMaterialization extends SandSessionMaterialization {
+  async materializeSession(agentId, profile, origin, purpose) {
+    ensureAgentDbDirectory(path.join(this.host.rootDir, agentId, "store.db"));
+    return await super.materializeSession(agentId, profile, origin, purpose);
+  }
+}
 
 test.after(() => dispose());
 
@@ -81,7 +96,7 @@ function dropRoot(base) {
  */
 function makeStore(rootDir) {
   const store = new SandAgentSessionStore(rootDir);
-  store.materialization = new SandSessionMaterialization({
+  store.materialization = new ExplicitDirectoryMaterialization({
     ctx: {},
     rootDir,
     createBlobWorkerPool: () => ({ connections: new Map() }),
@@ -172,12 +187,15 @@ test("a late read of a deleted agent's database does not keep a cap slot", async
       "the delete left the agent on disk, so the rest of this test proves nothing");
 
     // One late read of the database of an agent that no longer exists. This is
-    // what an in-flight roster pass or a queued unread marker does.
-    await store.markAgentViewed(deletedId);
-    assert.equal(existsSync(path.join(rootDir, deletedId)), true,
-      "the late read was expected to rebuild the directory; without it this test is empty");
-    assert.deepEqual(await readdir(path.join(rootDir, deletedId)), ["store.db"],
-      "the rebuilt directory did not come back as the leftover this defect leaves behind");
+    // what an in-flight roster pass or a queued unread marker does. The store
+    // used to `mkdirSync` its directory first, so the read handed back a fresh,
+    // empty database inside a brand new directory that held a cap slot nobody
+    // could see or delete.
+    await store.markAgentViewed(deletedId).catch(() => {});
+    assert.equal(existsSync(path.join(rootDir, deletedId)), false,
+      "reading the store of a deleted agent rebuilt its directory, so the cap slot it held was never freed");
+    assert.deepEqual(await readdir(rootDir), [],
+      "the leftover this defect leaves behind is a directory holding exactly one empty store.db");
 
     const deleted = new Set([deletedId]);
     store.setBeingDeletedPredicate((agentId) => deleted.has(agentId));

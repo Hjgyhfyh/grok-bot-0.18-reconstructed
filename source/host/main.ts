@@ -204,12 +204,37 @@ export async function main(
   }
 
   const crashGuards = deps.installProcessCrashGuards({ scope: "sand-host" });
-  const lockResult = await deps.acquireHostLock();
+
+  // `acquireHostLock` and `createHost` used to run OUTSIDE the try/catch below.
+  // `acquireHostLock` writes this process's own pid into `<root>\host.lock`, so
+  // a throw from either one killed the process on an unhandled rejection with
+  // nothing in `[sand-host]` output, no `reportProcessCrash`, and a lock file
+  // left naming a pid that is gone. The launcher hides that for its own start
+  // path by deleting `host.lock` first; a direct `node host-main.cjs` start has
+  // no such cover, and the next start then has to evict a host that no longer
+  // exists. Both steps now report and end the process with a defined code, and
+  // the lock is released on the one path that can have taken it.
+  let lockResult: HostLockResult;
+  try {
+    lockResult = await deps.acquireHostLock();
+  } catch (error) {
+    log.error("[sand-host] fatal startup failure: could not take the sandbox lock:", error);
+    processControl.exit(1);
+    return;
+  }
   reportLockOutcome(lockResult, deps.getSandRootDir(), log);
 
   const hostLock = lockResult.lock;
   let boxExecDaemon: OwnedBoxExecDaemon | undefined;
-  const host = deps.createHost();
+  let host: HostMainHost;
+  try {
+    host = deps.createHost();
+  } catch (error) {
+    log.error("[sand-host] fatal startup failure: could not build the host:", error);
+    hostLock.release();
+    processControl.exit(1);
+    return;
+  }
   crashGuards.setReporter((error, kind) => {
     host.reportProcessCrash(error, kind);
   });

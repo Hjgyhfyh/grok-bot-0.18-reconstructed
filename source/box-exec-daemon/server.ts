@@ -333,14 +333,21 @@ function thrown(id: number, error: unknown, errorCode = "BOX_EXEC_DAEMON_ERROR")
  * `{"command":"cmd","args":["/c", …]}` and no check in this file would help,
  * because the check has to run before the process exists.
  *
- * WHAT IS STILL CHECKED HERE, AND WHY IT IS NOT ENOUGH ON ITS OWN. Every absolute
- * path in `command`/`args` is resolved and run past `assertRealPathAllowed`, so a
- * script outside the workspace roots is refused and reported as a per-server
- * `error` instead of being started. That stops the accidental case, a config left
- * pointing at a file nobody re-checked. It does not stop a bare executable name:
- * `{"command":"cmd"}` resolves through PATH and is not a path, so it is allowed.
- * Closing that gap, and reaching anything outside the roots on purpose, is a
- * change to the sandbox model and needs a decision of its own, not a daemon edit.
+ * WHAT IS CHECKED HERE. Every absolute path in `command`/`args` — and every token
+ * carrying a `..` segment, which used to skip the check entirely — is resolved and
+ * run past `assertRealPathAllowed`, so a script outside the workspace roots is
+ * refused and reported as a per-server `error` instead of being started.
+ *
+ * WHAT WAS STILL MISSING, AND IS NOT. `{"command":"cmd"}` resolved through PATH,
+ * is not a path, and was started. The whole defence rested on the model being
+ * unable to write the configuration, which is one property, checked in another
+ * process, and true only for as long as that writer path stays shut.
+ * `checkMcpLaunchAllowed` now also requires that a program named by PATH has its
+ * script named by path, and refuses a command processor by name. It deliberately
+ * does NOT refuse bare names as such: the user's own file runs servers as
+ * `{"command":"node","args":["<box-workspace>\\mcp-servers\\…"]}`, and breaking
+ * that would trade a real hole for a fake one. The rest of what is still open is
+ * written down at `checkMcpLaunchAllowed` rather than left implied.
  *
  * SECRETS. `env` values are the supported way to hand a server a token and they
  * travel as plaintext JSON from the host. No value from `env` is logged, returned,
@@ -371,9 +378,19 @@ interface LiveMcpServer {
   errorMessage?: string;
 }
 
-/** The environment values of one configuration, the only secrets that exist here. */
+/**
+ * The `env` values of a configuration, the only secrets that exist here.
+ *
+ * Also used for an entry that has not become a live server yet: a refusal is
+ * built before `LiveMcpServer` exists, and it quotes tokens out of the file, so
+ * it must be redacted with the same list.
+ */
+function configSecrets(config: LocalStdioServerConfig): string[] {
+  return Object.values(config.env ?? {}).map((value) => String(value));
+}
+
 function secretsOf(server: LiveMcpServer): string[] {
-  return Object.values(server.config?.env ?? {}).map(value => String(value));
+  return server.config == null ? [] : configSecrets(server.config);
 }
 
 /**
@@ -397,11 +414,40 @@ function redactSecrets(text: string, secrets: readonly string[]): string {
  *
  * `{"command": "node", "args": ["mcp/server.mjs"]}` is a bare name and is not
  * checkable; `{"command": "C:\\Windows\\System32\\cmd.exe"}` is and is.
+ *
+ * WHAT CHANGED. A token carrying a `..` segment used to answer `false` here and
+ * skip `assertRealPathAllowed` entirely, so `{"command":"node","args":["..\\..\\..\\..\\Users\\me\\.ssh\\id_rsa"]}` was never resolved and never
+ * refused. A `..` segment is a path whatever else the token is, so it now counts.
  */
 function looksLikePathArgument(token: string): boolean {
   if (path.isAbsolute(token)) return true;
   if (/^[A-Za-z]:[\\/]/.test(token)) return true;
-  return token.replace(/\\/g, "/").startsWith("/");
+  const slashed = token.replace(/\\/g, "/");
+  if (slashed.startsWith("/")) return true;
+  return slashed.split("/").some((segment) => segment === "..");
+}
+
+/**
+ * Programs that cannot be a stdio MCP server, and are only ever the first half of
+ * `{"command": "cmd", "args": ["/c", …]}`.
+ *
+ * WHY A LIST AND NOT A SHAPE. The daemon does not need these to be complete. A
+ * stdio MCP server answers the MCP handshake on stdin and stdout; a command
+ * processor does not, so an entry naming one can do nothing except run the string
+ * in `args`. That makes every entry in this list an escape attempt and nothing
+ * else, which is why they are refused even when the entry is otherwise well
+ * formed. What the list cannot do is stop `node -e`, and it is not meant to: see
+ * {@link checkMcpLaunchAllowed} for the rule that closes that shape.
+ */
+const COMMAND_PROCESSOR_NAMES: ReadonlySet<string> = new Set([
+  "bash", "cmd", "command", "command.com", "cscript", "dash", "fish", "ksh",
+  "mshta", "powershell", "pwsh", "regsvr32", "rundll32", "sh", "sh.exe", "wscript", "wsl", "zsh",
+]);
+
+/** The name of a program, without its directory and without `.exe`, lowercased. */
+function programNameOf(token: string): string {
+  const base = path.basename(token.replace(/\\/g, "/")).toLowerCase();
+  return base.endsWith(".exe") ? base.slice(0, -4) : base;
 }
 
 /** `realpath` when the target exists, the plain resolution when it does not. */
@@ -1055,14 +1101,46 @@ class BoxExecRuntime {
   }
 
   /**
-   * Runs a configured script path past the roots this daemon was given.
+   * Decides whether one configured stdio entry may be started, and says why not.
    *
-   * See the block comment at the top of this section: this is the containment that
-   * exists today, and it is genuinely partial. A bare executable name is not a path
-   * and is resolved through PATH, so it is not checked. Widening or removing this
-   * is a change to the sandbox model and needs a decision of its own.
+   * Two rules, in this order.
+   *
+   * 1. `command` MAY NOT BE A COMMAND PROCESSOR. `{"command":"cmd"}` was the hole:
+   *    it is not a path, it resolved through PATH, and it started. This runs first
+   *    because it is the only rule that can explain the entry: `cmd /c …` also
+   *    trips rule 2 on its `/c`, and a user told their script escapes the roots
+   *    would go looking in the wrong place.
+   *
+   * 2. EVERY PATH-LIKE TOKEN IS CONTAINED, AND A PROGRAM NAMED BY PATH MUST HAVE
+   *    ITS SCRIPT NAMED BY PATH. The containment half is unchanged: each absolute
+   *    path, and each token carrying a `..` segment, is resolved and run past
+   *    `assertRealPathAllowed`. The second half is new, and it is deliberately NOT
+   *    "refuse every bare name". The shipped product runs servers exactly that way —
+   *    `{"command":"node","args":["<box-workspace>\\mcp-servers\\dsh-agent-mcp-server.mjs"]}`
+   *    is the shape the user's own file has, and refusing it would break working
+   *    configuration to punish a name that was never the defect.
+   *
+   *    So the daemon insists on the part that can actually be checked: when the
+   *    program is a PATH name, its script must be an explicit path, and the
+   *    containment half has already proved that path is inside the roots. One
+   *    requirement closes every interpreter escape, because an inline program is
+   *    never a path: `node -e …`, `python -c …`, and `cmd /c …`. A program given by
+   *    absolute path is left exactly as it was.
+   *
+   * WHAT IS STILL NOT SOLVED, STATED PLAINLY. The operating system, not the
+   * daemon, decides which file a bare name means, and a program outside
+   * {@link COMMAND_PROCESSOR_NAMES} that is itself an escape hatch is not caught
+   * by the shape rule. Closing that needs an explicit allowlist of launchable
+   * programs — a capability decision about the sandbox model, not a daemon edit.
+   *
+   * Every message returned here quotes tokens out of the user's file, so it is
+   * passed through {@link redactSecrets} with the entry's own `env` values before
+   * it leaves this method. `env` is never printed here.
    */
   private async checkMcpLaunchAllowed(config: LocalStdioServerConfig): Promise<string | undefined> {
+    if (COMMAND_PROCESSOR_NAMES.has(programNameOf(config.command))) {
+      return redactSecrets(`This MCP server was refused and is not running: "${config.command}" is a command processor, and a stdio MCP server cannot be one, because everything in "args" would be handed to it as a command line. Name the program by its full path, or name a runtime and give the script's full path as the first argument.`, configSecrets(config));
+    }
     for (const token of [config.command, ...(config.args ?? [])]) {
       if (!looksLikePathArgument(token)) continue;
       const target = await canonicalPath(token);
@@ -1070,9 +1148,15 @@ class BoxExecRuntime {
         this.assertRealPathAllowed(target, token);
       } catch (error) {
         if (error instanceof PathRejectedError) {
-          return `This MCP server was refused and is not running: ${error.message}. A script outside the box workspace root and terminals directory is not started. Copy it inside the roots, or ask for the daemon to be given more allowed roots.`;
+          return redactSecrets(`This MCP server was refused and is not running: ${error.message}. A script outside the box workspace root and terminals directory is not started. Copy it inside the roots, or ask for the daemon to be given more allowed roots.`, configSecrets(config));
         }
         throw error;
+      }
+    }
+    if (!looksLikePathArgument(config.command)) {
+      const args = config.args ?? [];
+      if (args.length === 0 || !looksLikePathArgument(args[0] as string)) {
+        return redactSecrets(`This MCP server was refused and is not running: "${config.command}" is not a path, so it is looked up on PATH, and nothing in this entry names the script it is supposed to run. Give "args" the script's full path first, inside the box workspace root.`, configSecrets(config));
       }
     }
     return undefined;

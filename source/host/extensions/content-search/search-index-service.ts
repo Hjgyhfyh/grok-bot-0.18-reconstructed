@@ -32,6 +32,17 @@ export interface SearchIndexJobFailure {
 
 export type SearchIndexJobResult = { readonly ok: true } | SearchIndexJobFailure;
 
+/**
+ * How far the index has got with letting one agent go: the tail of the queue at
+ * the moment its `clear-agent` job was appended, and whether that tail has
+ * settled. A settled tail means the job answered — it says nothing about whether
+ * the answer was `ok`, because a delete must not hang on a job that failed.
+ */
+interface AgentClearTail {
+  readonly tail: Promise<void>;
+  released: boolean;
+}
+
 export interface SearchIndexJobPort {
   post(job: SearchIndexJob): Promise<SearchIndexJobResult>;
   terminate(): Promise<void>;
@@ -173,6 +184,7 @@ export class SandSearchIndexService {
   private workerRespawnCount = 0;
   private failedJobReconcileCount = 0;
   private jobTail: Promise<void> = Promise.resolve();
+  private readonly agentClearTails = new Map<string, AgentClearTail>();
 
   constructor(options: {
     readonly indexDbPath: string;
@@ -290,6 +302,45 @@ export class SandSearchIndexService {
 
   whenIdle(): Promise<void> {
     return this.jobTail;
+  }
+
+  /**
+   * Resolves when the search index has finished letting one agent go.
+   *
+   * The relationship used to be one-way. `agentRemoved` enqueues a
+   * `clear-agent` job and returns, so `deleteSession` had no way to learn when
+   * the index was done and the unlink ran against a worker that might still be
+   * reading that agent's files. What made the delete work anyway was a race with
+   * a retry window: publish `agent-removed` first, then `rm` with `maxRetries`,
+   * and hope the worker catches up inside the budget. It did — measured, a handle
+   * released 100 ms into an `rm` finished the unlink at 153 ms — but "it
+   * usually wins a race" is not the same as "the delete waits for the thing it
+   * depends on".
+   *
+   * This is that wait, and it is scoped to this service on purpose. Making
+   * `publishTranscriptMutation` awaitable would make a delete wait on every
+   * subscriber of every mutation kind, so one slow listener anywhere would stall
+   * every delete. The dependency is one specific job on one specific queue.
+   *
+   * With the writer no longer holding a `store.db` between calls there is
+   * nothing left for the race to lose, so awaiting this is a formality that costs
+   * one already-queued job — which is what makes the retry window removable
+   * rather than load-bearing.
+   *
+   * Требует владельца `source/host/extensions/content-search/extension.ts`:
+   * expose `whenAgentReleased: (agentId) => index.whenAgentCleared(agentId)` on
+   * the extension api; and `source/host/extensions/session/agent-session.ts`:
+   * in `removeAgentDirOrFail`, `await` it between publishing `agent-removed` and
+   * the unlink, then drop the retry window to a single `rm`.
+   */
+  whenAgentCleared(agentId: string): Promise<void> {
+    return this.agentClearTails.get(agentId)?.tail ?? Promise.resolve();
+  }
+
+  /** True when no `clear-agent` job for this agent is still queued or running. */
+  isAgentReleased(agentId: string): boolean {
+    const record = this.agentClearTails.get(agentId);
+    return record == null || record.released;
   }
 
   async dispose(): Promise<void> {
@@ -436,12 +487,25 @@ export class SandSearchIndexService {
   }
 
   private enqueue(job: SearchIndexJob): void {
-    if (this.isDisposed || this.isUnavailable || this.db == null) return;
+    if (this.isDisposed || this.isUnavailable || this.db == null) {
+      // Nothing will ever run, so nothing is pending: an ack for a job that was
+      // dropped has to answer rather than hang, or a delete would wait forever.
+      if (job.kind === "clear-agent")
+        this.agentClearTails.set(job.agentId, { tail: Promise.resolve(), released: true });
+      return;
+    }
     this.jobTail = this.jobTail
       .then(() => this.runJob(job))
       .catch((error) => {
         this.report({ kind: "dispatch_failed", errorClass: errorLogTag(error) });
       });
+    if (job.kind === "clear-agent") {
+      const record: AgentClearTail = { tail: this.jobTail, released: false };
+      this.agentClearTails.set(job.agentId, record);
+      void record.tail.then(() => {
+        record.released = true;
+      });
+    }
   }
 
   private async runJob(job: SearchIndexJob): Promise<void> {

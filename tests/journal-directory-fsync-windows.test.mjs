@@ -69,7 +69,7 @@ const { loaded, dispose } = await bundle([
   ["host", "extensions", "session", "agent-db.ts"],
 ]);
 const { FileTranscriptMirror } = loaded["transcript-mirror.mjs"];
-const { SandAgentDb } = loaded["agent-db.mjs"];
+const { SandAgentDb, ensureAgentDbDirectory } = loaded["agent-db.mjs"];
 
 test.after(() => dispose());
 
@@ -181,6 +181,9 @@ test("a user message and an agent reply both survive a round trip through a thre
   const dbPath = path.join(sandRoot, "agent", "store.db");
   try {
     const rootId = "t1s0";
+    // Opening a store never creates the directory it reads from; minting one
+    // says so out loud, so this test has to as well.
+    ensureAgentDbDirectory(dbPath);
     const db = new SandAgentDb(dbPath);
     db.appendTranscriptEntry({ kind: "message", id: "t0u", role: "user", content: "root question", timestampMs: 1 });
     db.appendTranscriptEntry({ kind: "send-message", id: rootId, message: { type: "text", content: "root answer" }, timestampMs: 2 });

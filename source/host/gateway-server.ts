@@ -45,7 +45,17 @@ function handleBridgeResponses(bridge: GatewayServerDeps["localExec"] | GatewayS
 
 export async function handleRequest(deps: GatewayServerDeps, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? "/", "http://127.0.0.1"); if (rejectUntrustedBrowserRequest(deps, req, res)) return;
-  if (req.method === "GET" && url.pathname === GATEWAY_HEALTH_PATH) { const health = deps.getHealth(); return respondJson(res, { ok: true, pid: process.pid, isBusy: health.isBusy, ...(health.busyOnlyAwaitingApproval === undefined ? {} : { busyOnlyAwaitingApproval: health.busyOnlyAwaitingApproval }), activeAgentId: health.activeAgentId, startedAt: deps.startedAt, lastBusyAtMs: health.lastBusyAtMs }); }
+  // This handler stays ABOVE the bearer check on purpose: `fetchHealth` in
+  // source/node-agent-coordinator/gateway/host-supervisor.ts probes /health with
+  // no Authorization header, and requiring the token here would turn every
+  // reachability report into a 401. That is also why the answer must not carry
+  // identifiers. One token governs ~124 commands and lives in plaintext in
+  // <root>\gateway.json, so anything running as this user -- including the agent
+  // -- can reach loopback; `pid` said which process to signal and
+  // `activeAgentId` said which agent to target, both before presenting any
+  // credential. `ok`, `isBusy` and `startedAt` are what "alive or busy" needs,
+  // and no consumer in this repository reads the two that were removed.
+  if (req.method === "GET" && url.pathname === GATEWAY_HEALTH_PATH) { const health = deps.getHealth(); return respondJson(res, { ok: true, isBusy: health.isBusy, ...(health.busyOnlyAwaitingApproval === undefined ? {} : { busyOnlyAwaitingApproval: health.busyOnlyAwaitingApproval }), startedAt: deps.startedAt, lastBusyAtMs: health.lastBusyAtMs }); }
   const events = req.method === "GET" && url.pathname === GATEWAY_EVENTS_PATH; const prepare = req.method === "POST" && url.pathname === GATEWAY_PREPARE_UPGRADE_PATH; const avatar = req.method === "GET" && url.pathname.startsWith(`${GATEWAY_AVATARS_PATH}/`); const localRequests = req.method === "GET" && url.pathname === GATEWAY_LOCAL_EXEC_REQUESTS_PATH; const localResponses = req.method === "POST" && url.pathname === GATEWAY_LOCAL_EXEC_RESPONSES_PATH; const webRequests = req.method === "GET" && url.pathname === GATEWAY_WEBAUTHN_REQUESTS_PATH; const webResponses = req.method === "POST" && url.pathname === GATEWAY_WEBAUTHN_RESPONSES_PATH; const command = req.method === "POST" && url.pathname.startsWith(`${GATEWAY_API_PREFIX}/`);
   if (!(events || prepare || avatar || localRequests || localResponses || webRequests || webResponses || command)) return respondError(res, 404, `not found: ${req.method} ${url.pathname}`);
   if ((localRequests || localResponses) && deps.authToken == null) return respondError(res, 401, "local-exec requires gateway authentication"); if ((webRequests || webResponses) && deps.authToken == null) return respondError(res, 401, "webauthn requires gateway authentication"); if (deps.authToken != null && !isAuthorized(req, deps.authToken)) return respondError(res, 401, "unauthorized");

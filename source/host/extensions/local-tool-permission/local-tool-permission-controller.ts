@@ -16,6 +16,15 @@ export const SAND_LOCAL_TOOL_REFUSED_ACTION_MEMORY_PER_AGENT = 512;
 export const SAND_LOCAL_TOOL_FORGOTTEN_AGENT_MEMORY = 256;
 export const SAND_LOCAL_TOOL_TARGET_MAX_CHARS = 10_000;
 export const SAND_LOCAL_TOOLS_ASK_CANCELLED_MESSAGE = "The request to use the user's computer was cancelled before the user answered.";
+/**
+ * Refusal for a request that names nothing.
+ *
+ * An empty target cannot be checked, cannot be shown to the user and cannot be
+ * run. It used to survive every mode: `authorize` in `always` answered
+ * `{allowed:true}` before the target was looked at, and in `ask` mode the user
+ * was asked to approve a blank box.
+ */
+export const SAND_LOCAL_TOOLS_TARGET_REQUIRED_MESSAGE = "That request names no command and no file, so there is nothing to approve and nothing to run. Use your own computer instead (Shell, Read, AwaitShell), or send a request that says what it acts on.";
 
 export type SandLocalToolResolution = "allow-once" | "deny" | "always" | "never";
 export type SandLocalToolRequestStatus = "pending" | "allowed" | "denied" | "always" | "never" | "expired";
@@ -43,8 +52,20 @@ export class SandLocalToolPermissionController {
   permission(): SandLocalToolPermission { return this.options.getPermission(); }
   blockedReason(): string | undefined { return this.permission() === "never" ? SAND_LOCAL_TOOLS_DISABLED_MESSAGE : undefined; }
   requiresApproval(): boolean { return this.permission() === "ask"; }
-  async awaitDesktopStandingDecision(args: { readonly agentId: string; readonly toolCallId: string; readonly command?: string; readonly description?: string; readonly signal?: AbortSignal }): Promise<SandLocalToolDecision> { const permission = this.permission(); if (permission === "never") return { allowed: false, reason: SAND_LOCAL_TOOLS_DISABLED_MESSAGE }; if (permission === "always") return { allowed: true }; return this.authorize({ agentId: args.agentId, toolCallId: args.toolCallId, action: "run-command", directionEpoch: this.directionEpoch(args.agentId) }, { action: "run-command", target: args.command ?? "", ...(args.description == null || args.description.length === 0 ? {} : { description: args.description }), ...(args.signal === undefined ? {} : { signal: args.signal }) }); }
-  async authorize(scope: SandLocalToolScope | undefined, request: SandLocalToolRequest): Promise<SandLocalToolDecision> { const permission = this.permission(); if (permission === "never") return { allowed: false, reason: SAND_LOCAL_TOOLS_DISABLED_MESSAGE }; if (scope !== undefined) { const refusal = this.refusalFor(scope, request); if (refusal !== undefined) return { allowed: false, reason: refusal }; } if (permission === "always" && !this.predatesStandingGrant(scope)) return { allowed: true }; if (scope === undefined) return { allowed: false, reason: SAND_LOCAL_TOOLS_UNAPPROVED_MESSAGE }; if (scope.toolCallId === undefined) { const attached = this.findApprovalForResource(scope.agentId, request.attachToResourcePath); return attached === undefined ? { allowed: false, reason: SAND_LOCAL_TOOLS_UNAPPROVED_MESSAGE } : { allowed: true, approvalId: attached.id }; } return this.ask(scope as SandLocalToolScope & { toolCallId: string }, request); }
+  /**
+   * What is wrong with the request's target, whatever the permission setting is.
+   *
+   * A target is checked against the settings the user's machine can survive, not
+   * against the answer to "should we ask?". Both rules here existed before, but
+   * both lived inside `ask`, which only runs when the setting is `ask`: with
+   * `always` in `settings.json` the controller returned `{allowed:true}` at the
+   * top of `authorize` and never reached them, so the setting decided both that
+   * the action was allowed AND that it was safe to allow. `always` is a statement
+   * about the question, not a licence to skip the checks.
+   */
+  targetRefusal(request: SandLocalToolRequest): string | undefined { if (request.target.length > SAND_LOCAL_TOOL_TARGET_MAX_CHARS) return SAND_LOCAL_TOOLS_TARGET_TOO_LARGE_MESSAGE; if (request.target.trim().length === 0) return SAND_LOCAL_TOOLS_TARGET_REQUIRED_MESSAGE; return undefined; }
+  async awaitDesktopStandingDecision(args: { readonly agentId: string; readonly toolCallId: string; readonly command?: string; readonly description?: string; readonly signal?: AbortSignal }): Promise<SandLocalToolDecision> { const permission = this.permission(); if (permission === "never") return { allowed: false, reason: SAND_LOCAL_TOOLS_DISABLED_MESSAGE }; const request: SandLocalToolRequest = { action: "run-command", target: args.command ?? "", ...(args.description == null || args.description.length === 0 ? {} : { description: args.description }) }; const target = this.targetRefusal(request); if (target !== undefined) return { allowed: false, reason: target }; if (permission === "always") return { allowed: true }; return this.authorize({ agentId: args.agentId, toolCallId: args.toolCallId, action: "run-command", directionEpoch: this.directionEpoch(args.agentId) }, { ...request, ...(args.signal === undefined ? {} : { signal: args.signal }) }); }
+  async authorize(scope: SandLocalToolScope | undefined, request: SandLocalToolRequest): Promise<SandLocalToolDecision> { const permission = this.permission(); if (permission === "never") return { allowed: false, reason: SAND_LOCAL_TOOLS_DISABLED_MESSAGE }; const target = this.targetRefusal(request); if (target !== undefined) return { allowed: false, reason: target }; if (scope !== undefined) { const refusal = this.refusalFor(scope, request); if (refusal !== undefined) return { allowed: false, reason: refusal }; } if (permission === "always" && !this.predatesStandingGrant(scope)) return { allowed: true }; if (scope === undefined) return { allowed: false, reason: SAND_LOCAL_TOOLS_UNAPPROVED_MESSAGE }; if (scope.toolCallId === undefined) { const attached = this.findApprovalForResource(scope.agentId, request.attachToResourcePath); return attached === undefined ? { allowed: false, reason: SAND_LOCAL_TOOLS_UNAPPROVED_MESSAGE } : { allowed: true, approvalId: attached.id }; } return this.ask(scope as SandLocalToolScope & { toolCallId: string }, request); }
   completeScope(scope?: SandLocalToolScope): void { if (scope?.toolCallId === undefined) return; for (const approval of [...this.approvalsById.values()]) if (approval.agentId === scope.agentId && approval.toolCallId === scope.toolCallId && !approval.outlivesScope) this.retireApproval(approval.id); }
   beginTurn(agentId: string): void { this.forgottenAgents.delete(agentId); this.directionEpochs.set(agentId, this.directionEpoch(agentId) + 1); for (const approval of [...this.approvalsById.values()]) if (approval.agentId === agentId) this.retireApproval(approval.id); for (const pending of [...this.pendingByKey.values()]) if (pending.request.agentId === agentId) this.settle(pending, "expired", { allowed: false, reason: SAND_LOCAL_TOOLS_ASK_EXPIRED_MESSAGE }); }
   directionEpoch(agentId: string): number { return this.directionEpochs.get(agentId) ?? 0; }
@@ -75,8 +96,8 @@ export class SandLocalToolPermissionController {
     if (this.options.hasLiveComputer?.(scope.agentId) === false) return { allowed: false, reason: SAND_NO_LOCAL_MACHINE_MESSAGE };
     const scopeApproved = scope.action !== undefined && [...this.approvalsById.values()].some((approval) => approval.agentId === scope.agentId && approval.toolCallId === scope.toolCallId && approval.action === scope.action);
     if (scope.action !== undefined && scope.action !== request.action && !scopeApproved) return { allowed: false, reason: SAND_LOCAL_TOOLS_PREPARATORY_MESSAGE };
-    if (request.signal?.aborted === true) return { allowed: false, reason: SAND_LOCAL_TOOLS_ASK_CANCELLED_MESSAGE };
-    if (request.target.length > SAND_LOCAL_TOOL_TARGET_MAX_CHARS) return { allowed: false, reason: SAND_LOCAL_TOOLS_TARGET_TOO_LARGE_MESSAGE };
+    // The target itself was already checked by `targetRefusal` before this point, so it does not run again here: the setting decides whether the user is asked, never whether the request is well formed.
+if (request.signal?.aborted === true) return { allowed: false, reason: SAND_LOCAL_TOOLS_ASK_CANCELLED_MESSAGE };
     const key = askKey(scope, request); const existing = this.pendingByKey.get(key); if (existing !== undefined) return this.join(existing, request.signal);
     const createdAtMs = this.now(); const description = request.description?.trim(); const resourcePath = normalizeLocalToolResourcePath(request.resourcePath);
     const pending: Pending = { request: { id: this.options.randomId?.() ?? randomBytes(32).toString("hex"), agentId: scope.agentId, action: request.action, target: request.target, status: "pending", createdAtMs, expiresAtMs: createdAtMs + this.askTtlMs, ...(description == null || description.length === 0 ? {} : { description }) }, waiters: new Set(), expiryAbort: new AbortController(), toolCallId: scope.toolCallId, ...(resourcePath === undefined ? {} : { resourcePath }), outlivesScope: request.outlivesScope === true, directionEpoch: this.scopeEpoch(scope) };

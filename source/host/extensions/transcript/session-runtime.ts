@@ -44,6 +44,84 @@ function raisesUserActivity(entry: TranscriptEntry): boolean {
   return entry.fromAgent == null;
 }
 
+/**
+ * How long a delete that has produced no answer of its own is allowed to keep
+ * its mark.
+ *
+ * The delete itself is bounded and slow: `drainExclusiveRuns` waits for turns
+ * in flight, and `deleteSession` retries the unlink twice. Sixty seconds is far
+ * above that, and far below "the rest of the process" — which is what an
+ * unanswered mark used to mean.
+ */
+export const DELETED_AGENT_MARK_GRACE_MS = 60_000;
+
+/**
+ * The set of agents this host is deleting.
+ *
+ * The whole lifecycle:
+ *
+ *   - `add` — `interruptAgentForDeletion` runs this before it touches anything,
+ *     so from that moment the runner is silenced, the roster hides the agent,
+ *     `resolveBackgroundSession` refuses it and the session store treats its
+ *     directory as a leftover. The mark is a claim, not a fact.
+ *   - `delete` — `agent-lifecycle.ts` calls it after `deleteSession` answered,
+ *     and in the `catch` of a `deleteAgents` that threw. The mark is gone at
+ *     once; nothing has to wait for it.
+ *   - never — a delete that fails per agent is recorded in `failed` and does not
+ *     throw from `runDeleteAgents`, so `deleteAgent` throws from outside the
+ *     loop and no `delete` ever runs. That path is why `has` cannot simply
+ *     believe the set.
+ *
+ * So `has` re-validates the claim instead of trusting it. The directory is the
+ * fact: if it is gone, `isAgentGone` already answers from `agentExists` and the
+ * mark is redundant. If it is still there, the mark only means "a delete was
+ * requested", and a claim the host cannot prove expires instead of sticking —
+ * otherwise one failed delete hides an agent the user can still see, refuses
+ * background work for it, and lets the next cap check remove its directory.
+ * Re-adding the same id re-arms the claim, so deleting an agent twice in a row
+ * works.
+ *
+ * Требует владельца `source/host/extensions/transcript/agent-lifecycle.ts`:
+ * call `deletedAgentIds.delete(id)` on the per-agent `catch` in
+ * `runDeleteAgents` (next to the `failed.push`) so a failed delete answers
+ * immediately instead of waiting out the grace. The grace is the backstop, not
+ * the plan.
+ */
+export class DeletedAgentMarks extends Set<string> {
+  private readonly armedAt = new Map<string, number>();
+
+  constructor(
+    private readonly agentExists: (agentId: string) => boolean,
+    private readonly now: () => number = Date.now,
+    private readonly graceMs: number = DELETED_AGENT_MARK_GRACE_MS,
+  ) {
+    super();
+  }
+
+  override add(agentId: string): this {
+    this.armedAt.set(agentId, this.now());
+    return super.add(agentId);
+  }
+
+  override delete(agentId: string): boolean {
+    this.armedAt.delete(agentId);
+    return super.delete(agentId);
+  }
+
+  override clear(): void {
+    this.armedAt.clear();
+    super.clear();
+  }
+
+  override has(agentId: string): boolean {
+    if (!super.has(agentId)) return false;
+    if (!this.agentExists(agentId)) return false;
+    const armedAt = this.armedAt.get(agentId);
+    if (armedAt === undefined) return false;
+    return this.now() - armedAt < this.graceMs;
+  }
+}
+
 export class SessionRuntime {
   activeSession: LiveTranscriptSession | undefined;
   loaded = false;
@@ -55,12 +133,20 @@ export class SessionRuntime {
     string,
     Promise<LiveTranscriptSession>
   >();
-  readonly deletedAgentIds = new Set<string>();
+  readonly deletedAgentIds: DeletedAgentMarks;
   windowedActivationTail: Promise<void> = Promise.resolve();
   windowedActivationAbort: AbortController | null = null;
   pendingActivationAgentId: string | null = null;
 
-  constructor(readonly tm: TranscriptManagerLike) {}
+  constructor(readonly tm: TranscriptManagerLike) {
+    const sessionStore = tm?.sessionStore as
+      | { agentExists?: (agentId: string) => boolean }
+      | undefined;
+    this.deletedAgentIds = new DeletedAgentMarks(
+      // A host without `agentExists` cannot disprove a mark, so the mark stands.
+      (agentId) => sessionStore?.agentExists?.(agentId) !== false,
+    );
+  }
 
   async settledOpen(
     pending: Promise<LiveTranscriptSession> | undefined,

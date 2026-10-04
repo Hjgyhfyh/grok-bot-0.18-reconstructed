@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { getMainTranscriptEntries } from "../../../shared/transcript.js";
@@ -59,6 +59,38 @@ export interface AgentDbOptions extends DbRecoveryOptions {
   onBusyError?(operation: string, error: Error): void;
 }
 
+/** The agent directory of `dbPath` does not exist, so there is nothing to open. */
+export class SandAgentDirectoryMissingError extends Error {
+  constructor(readonly dbPath: string, readonly agentDir: string) {
+    super(
+      `Agent directory ${agentDir} does not exist; call ensureAgentDbDirectory(${dbPath}) before opening a store for a new agent`,
+    );
+    this.name = "SandAgentDirectoryMissingError";
+  }
+}
+
+/**
+ * Creates the directory that holds one agent's `store.db`.
+ *
+ * This used to be a side effect of `new SandAgentDb(...)`, which ran
+ * `mkdirSync(dirname(dbPath), { recursive: true })` before it opened anything.
+ * SQLite then created a fresh, empty `store.db` inside the new directory and the
+ * constructor seeded default metadata into it, so any late read of a deleted
+ * agent's database rebuilt the agent: measured on a live box, delete the agent,
+ * the directory is gone, read `store.db` once, the directory is back with
+ * exactly `store.db` in it and `listAgents` still shows nothing. That directory
+ * held a slot of the fifty-agent cap that the user could neither see nor delete.
+ *
+ * Creating an agent is an explicit act now. Callers that only read an existing
+ * agent never create anything, and a caller that names an agent which is not on
+ * disk gets `SandAgentDirectoryMissingError` instead of a blank agent.
+ */
+export function ensureAgentDbDirectory(dbPath: string): string {
+  const agentDir = dirname(resolve(dbPath));
+  mkdirSync(agentDir, { recursive: true });
+  return agentDir;
+}
+
 const KV = {
   metadata: "metadata", profile: "sandProfile", unread: "unreadState",
   awaiting: "awaitingUserResponse", requestIds: "requestIds", latestRequestId: "latestRequestId",
@@ -86,7 +118,8 @@ export class SandAgentDb {
   constructor(readonly dbPath: string, readonly options: AgentDbOptions = {}) {
     this.agentDirName = basename(dirname(dbPath));
     this.resolvedDbPath = resolve(dbPath);
-    mkdirSync(dirname(dbPath), { recursive: true });
+    const agentDir = dirname(this.resolvedDbPath);
+    if (!existsSync(agentDir)) throw new SandAgentDirectoryMissingError(this.resolvedDbPath, agentDir);
     const hasOtherLiveHandles = liveDbHandleCount(this.resolvedDbPath) > 0;
     this.db = openConfiguredDb(dbPath, this.agentDirName, options, hasOtherLiveHandles);
     this.statements = prepareStatements(this.db);

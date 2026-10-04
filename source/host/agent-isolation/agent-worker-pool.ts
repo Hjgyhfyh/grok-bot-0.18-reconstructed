@@ -277,6 +277,7 @@ export class AgentWorkerPool {
   readonly connections = new Map<string, AgentWorkerConnection>();
   readonly activeOps = new Map<string, number>();
   sweepTimer: NodeJS.Timeout | null = null;
+  private readonly agentIdsByBlobDbPath = new Map<string, string>();
 
   constructor(options: AgentWorkerPoolOptions = {}) {
     this.workerEntryPath = options.workerEntryPath ?? defaultWorkerEntryPath();
@@ -303,14 +304,10 @@ export class AgentWorkerPool {
     const connection = new AgentWorkerConnection(
       this.workerEntryPath,
       boot,
-      self => {
-        if (this.connections.get(blobDbPath) === self) {
-          this.connections.delete(blobDbPath);
-          if (this.connections.size === 0) this.stopSweep();
-        }
-      }
+      self => this.forgetConnection(blobDbPath, self)
     );
     this.connections.set(blobDbPath, connection);
+    this.agentIdsByBlobDbPath.set(blobDbPath, agentId);
     this.startSweep();
     await connection.init(boot);
     console.log(
@@ -472,11 +469,58 @@ export class AgentWorkerPool {
     }
   }
 
+  /**
+   * Forgets a connection and, with it, the agent it belonged to.
+   *
+   * Every place that drops a connection goes through here, because the agent
+   * index has to leave at exactly the moment the connection does. A stale entry
+   * would make `closeAgentWorker` ask a thread to close twice; a missing one
+   * would make it answer "this agent has no worker" while the worker is still
+   * holding that agent's `conversation-blobs.db` open, which is what keeps a
+   * deleted agent's directory on disk with `EBUSY` on Windows.
+   */
+  private forgetConnection(blobDbPath: string, expected?: AgentWorkerConnection): void {
+    if (expected != null && this.connections.get(blobDbPath) !== expected) return;
+    this.connections.delete(blobDbPath);
+    this.agentIdsByBlobDbPath.delete(blobDbPath);
+    if (this.connections.size === 0) this.stopSweep();
+  }
+
+  /** The `conversation-blobs.db` a live worker owns for this agent, if any. */
+  blobDbPathForAgent(agentId: string): string | undefined {
+    for (const [blobDbPath, owner] of this.agentIdsByBlobDbPath) {
+      if (owner === agentId) return blobDbPath;
+    }
+    return undefined;
+  }
+
+  /**
+   * Closes the worker that owns one agent's `conversation-blobs.db`.
+   *
+   * The pool keys its workers by database path, so closing one agent's worker
+   * used to mean reaching into the public `connections` map and re-deriving the
+   * key from the agent directory — an untyped read of a field whose rename would
+   * break the call silently, at runtime, in the one code path that has to run
+   * before an unlink on Windows. Answering by agent id keeps that key scheme
+   * inside the pool, where it belongs.
+   *
+   * Returns whether there was a worker to close.
+   *
+   * Требует владельца `source/host/extensions/session/agent-session.ts`:
+   * `releaseBlobWorker` should call `pool.closeAgentWorker(agentId)` instead of
+   * `connections.get(...)` / `connections.delete(...)` / `connection.close()`.
+   */
+  async closeAgentWorker(agentId: string): Promise<boolean> {
+    const blobDbPath = this.blobDbPathForAgent(agentId);
+    if (blobDbPath == null) return false;
+    await this.closeStore(blobDbPath);
+    return true;
+  }
+
   async closeStore(blobDbPath: string): Promise<void> {
     const connection = this.connections.get(blobDbPath);
     if (connection == null) return;
-    this.connections.delete(blobDbPath);
-    if (this.connections.size === 0) this.stopSweep();
+    this.forgetConnection(blobDbPath, connection);
     await connection.close();
   }
 
@@ -484,6 +528,7 @@ export class AgentWorkerPool {
     this.stopSweep();
     const all = [...this.connections.values()];
     this.connections.clear();
+    this.agentIdsByBlobDbPath.clear();
     await Promise.all(all.map(connection => connection.close()));
   }
 
@@ -517,7 +562,7 @@ export class AgentWorkerPool {
     if (victimPath == null) return;
     const victim = this.connections.get(victimPath);
     if (victim == null) return;
-    this.connections.delete(victimPath);
+    this.forgetConnection(victimPath, victim);
     void victim.close();
   }
 
@@ -540,7 +585,7 @@ export class AgentWorkerPool {
     for (const [blobDbPath, connection] of [...this.connections]) {
       if (this.isRetained(blobDbPath)) continue;
       if (now - connection.activityAt() < this.idleTimeoutMs) continue;
-      this.connections.delete(blobDbPath);
+      this.forgetConnection(blobDbPath, connection);
       void connection.close();
     }
     if (this.connections.size === 0) this.stopSweep();

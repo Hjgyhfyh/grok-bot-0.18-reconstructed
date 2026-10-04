@@ -31,14 +31,30 @@ import type { CapableBox } from "../../box/box-capabilities.js";
 import { createSandMcpStateExecutor } from "../../ports/mcp-state-executor.js";
 import { createBoxSandMcpExec } from "./box-mcp-exec.js";
 
-export interface McpServerSummary { id: string; name: string; serverIdentifier: string; accountKey: string; pluginId?: string | null; isTeamServer: boolean; status: string; statusDetail?: string; transport: string; toolCount: number; disabledToolCount?: number; customInstructions: string }
+export interface McpServerSummary { id: string; name: string; serverIdentifier: string; accountKey: string; pluginId?: string | null; isTeamServer: boolean; status: string; statusDetail?: string; transport: string; toolCount: number; disabledToolCount?: number; customInstructions: string; /**
+ * True when this row was read from the user's own local MCP file rather than from
+ * an account. Decided by the listing (`mcp-listing-summaries.ts`), where the server
+ * identity is known, instead of being re-derived here from the identifier alone.
+ */
+readonly isLocal?: boolean }
 export interface CatalogField { key: string; label: string; hint: string; isRequired?: boolean; isSecret?: boolean }
 export interface CatalogPlugin { id: string; name: string; displayName?: string; description?: string; category?: string; fields?: CatalogField[]; connectors?: unknown[]; skills?: Array<{ name: string; description?: string; sourceUrl?: string }> }
 export interface EffectivePlugin { pluginId: string; installMode?: string; isEnabled: boolean; hasTeamConfiguredVariables?: boolean }
 export interface ServerState { servers: McpServerSummary[] }
 export interface PluginSkillsPort { sync(trigger: string): Promise<unknown[]>; status(): unknown; removeLiveReferences?(sourceUrls: readonly string[]): void }
 
-export function toInstalledServer(summary: McpServerSummary): Record<string, unknown> { return { id: summary.id, name: summary.name, serverIdentifier: summary.serverIdentifier, accountKey: summary.accountKey, ...(summary.pluginId == null ? {} : { pluginId: summary.pluginId }), isTeamServer: summary.isTeamServer, status: summary.status, ...(summary.statusDetail == null ? {} : { statusDetail: summary.statusDetail }), transport: summary.transport, toolCount: summary.toolCount, ...(summary.disabledToolCount == null ? {} : { disabledToolCount: summary.disabledToolCount }), customInstructions: summary.customInstructions, ...(isLocalMcpServerId(summary.id) ? { isLocal: true, managedBy: "local-file", configFile: LOCAL_MCP_CONFIG_HINT } : {}) }; }
+/**
+ * One summary as the installed-server row the model and the management tools read.
+ *
+ * WHAT CHANGED. The `isLocal` flag was decided here and only here, by re-running
+ * `isLocalMcpServerId(summary.id)`. The relay stopped one hop short: the summary
+ * that produced the row carried no such field, so a row reaching this function
+ * from anything other than the manager's own listing had no way to say where it
+ * came from and silently read as account-owned. Two independent signals now decide
+ * it — the flag the listing set, and the identifier band as the fallback — so a row
+ * from either source is right and a row from neither is honestly not local.
+ */
+export function toInstalledServer(summary: McpServerSummary): Record<string, unknown> { const local = summary.isLocal === true || isLocalMcpServerId(summary.id); return { id: summary.id, name: summary.name, serverIdentifier: summary.serverIdentifier, accountKey: summary.accountKey, ...(summary.pluginId == null ? {} : { pluginId: summary.pluginId }), isTeamServer: summary.isTeamServer, status: summary.status, ...(summary.statusDetail == null ? {} : { statusDetail: summary.statusDetail }), transport: summary.transport, toolCount: summary.toolCount, ...(summary.disabledToolCount == null ? {} : { disabledToolCount: summary.disabledToolCount }), customInstructions: summary.customInstructions, ...(local ? { isLocal: true, managedBy: "local-file", configFile: LOCAL_MCP_CONFIG_HINT } : {}) }; }
 export function toInstalledServers(state: ServerState): Record<string, unknown>[] { return state.servers.map(toInstalledServer); }
 export function toCatalogFields(fields?: readonly CatalogField[] | null): Array<Required<CatalogField>> { return (fields ?? []).map((field) => ({ key: field.key, label: field.label, hint: field.hint, isRequired: field.isRequired === true, isSecret: field.isSecret === true })); }
 export function toAuthResult(result: { status: string; serverName: string; authorizationUrl?: string; message?: string }): Record<string, unknown> { if (result.status === "started") return { kind: "started", authorizationUrl: result.authorizationUrl, serverName: result.serverName }; if (result.status === "already-authenticated") return { kind: "already-authenticated", serverName: result.serverName }; if (result.status === "not-configured") return { kind: "not-configured", serverName: result.serverName }; return { kind: result.status, message: result.message, serverName: result.serverName }; }
