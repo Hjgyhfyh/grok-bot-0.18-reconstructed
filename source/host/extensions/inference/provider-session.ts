@@ -381,6 +381,27 @@ function routedStreamTextParams(ctx: unknown, options?: RoutedStreamCallOptions)
   };
 }
 
+/**
+ * The cache read count the provider actually reported, or 0 when it reported none.
+ *
+ * `@ai-sdk/openai` 1.3.24 does parse `usage.prompt_tokens_details.cached_tokens` off the
+ * stream, but AI SDK v4's `result.usage` has no field to put it in: the usage object
+ * carries only `promptTokens`, `completionTokens` and `totalTokens`, and the cached count
+ * is parked at `result.providerMetadata.openai.cachedPromptTokens`. The two OpenAI-compatible
+ * executors below built their usage record from `result.usage` alone and therefore wrote a
+ * hardcoded `cacheReadTokens: 0`, which is what the Router usage panel displayed forever.
+ *
+ * `cache_write_tokens` has no OpenAI-compatible equivalent at all — automatic prompt caching
+ * reports reads only — so `cacheWriteTokens` stays 0 by fact, not by omission.
+ */
+function cachedPromptTokens(providerMetadata: unknown): number {
+  if (typeof providerMetadata !== "object" || providerMetadata == null) return 0;
+  const openai: unknown = (providerMetadata as { openai?: unknown }).openai;
+  if (typeof openai !== "object" || openai == null) return 0;
+  const value: unknown = (openai as { cachedPromptTokens?: unknown }).cachedPromptTokens;
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
 function openRouterExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void, ctx?: unknown, options?: RoutedStreamCallOptions) {
   const id = process.env.SAND_OPENROUTER_MODEL?.trim() || "openai/gpt-5.2";
   const model: LanguageModelV1 = createOpenAI({
@@ -395,7 +416,7 @@ function openRouterExecutor(messages: readonly ProviderMessage[], invocationId: 
   }).chat(id as any);
   const tools = toToolSet(definitions, executeTool);
   const result = streamText({ model, system: GROK_ROUTER_SYSTEM_PROMPT, messages: messages as CoreMessage[], ...(tools === undefined ? {} : { tools }), toolCallStreaming: true, maxSteps: tools === undefined ? 1 : 8, ...routedStreamTextParams(ctx, options) });
-  const extendedUsage = result.usage.then(value => ({ inputTokens: value.promptTokens, outputTokens: value.completionTokens, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: resolveRoutedContextWindow(id) }));
+  const extendedUsage = Promise.all([result.usage, result.providerMetadata]).then(([value, providerMetadata]) => ({ inputTokens: value.promptTokens, outputTokens: value.completionTokens, cacheReadTokens: cachedPromptTokens(providerMetadata), cacheWriteTokens: 0, maxTokens: resolveRoutedContextWindow(id) }));
   if (onUsage != null) void extendedUsage.then(onUsage);
   return { fullStream: result.fullStream, response: result.response, usage: result.usage, extendedUsage, providerMetadata: result.providerMetadata, invocationId: Promise.resolve(invocationId) };
 }
@@ -420,7 +441,7 @@ function customExecutor(messages: readonly ProviderMessage[], invocationId: stri
   }).chat(endpoint.modelId as any);
   const tools = toToolSet(definitions, executeTool);
   const result = streamText({ model, system: GROK_ROUTER_SYSTEM_PROMPT, messages: messages as CoreMessage[], ...(tools === undefined ? {} : { tools }), toolCallStreaming: true, maxSteps: tools === undefined ? 1 : 8, ...routedStreamTextParams(ctx, options) });
-  const extendedUsage = result.usage.then(value => ({ inputTokens: value.promptTokens, outputTokens: value.completionTokens, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: resolveRoutedContextWindow(endpoint.modelId) }));
+  const extendedUsage = Promise.all([result.usage, result.providerMetadata]).then(([value, providerMetadata]) => ({ inputTokens: value.promptTokens, outputTokens: value.completionTokens, cacheReadTokens: cachedPromptTokens(providerMetadata), cacheWriteTokens: 0, maxTokens: resolveRoutedContextWindow(endpoint.modelId) }));
   if (onUsage != null) void extendedUsage.then(onUsage);
   return { fullStream: result.fullStream, response: result.response, usage: result.usage, extendedUsage, providerMetadata: result.providerMetadata, invocationId: Promise.resolve(invocationId) };
 }

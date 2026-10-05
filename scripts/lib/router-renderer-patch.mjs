@@ -45,6 +45,32 @@ const NOT_SIGNED_IN_CHIP_AFTER = 'name:e.kind==="logging-in"?"Signing in":"Local
 // to connect an account; with a custom endpoint that instruction is simply wrong.
 const NOT_SIGNED_IN_ROW_BEFORE = '(p="Not signed in",b="Connect your Cursor account to Grok Bot")';
 const NOT_SIGNED_IN_ROW_AFTER = '(p="Local",b="Using your own endpoint")';
+// The chat composer still told the user to sign in before they were allowed to
+// type. Its resting placeholder had four states and the signed-out one was the
+// only instruction left on the first screen of the app:
+//
+//   s ? (reply ? <reply placeholder> : text ? "Add a message, or hit send." : U)
+//     : "Sign in to Cursor in settings, then ask anything."
+//
+// `s` is `isCursorSignedIn`, which nothing in this build ever sets true: the
+// account-chip patch above deliberately leaves `isSignedIn:!1` alone, because
+// faking it is forbidden. So this last branch was the only branch ever taken,
+// and it named a Cursor sign-in as the precondition for asking a question that
+// this build answers without one. The other three sign-in patches made the
+// account chip, the settings row and the boot gate stop asking; the composer
+// was the screen the user is actually looking at, and it was missed.
+//
+// The fix removes the branch rather than rewording it. Dropping `s?...:` leaves
+// both states on the one expression a signed-in user already gets, so the
+// resting placeholder is `U` — the caller's placeholder, or `x1t`, the shipped
+// default "Ask anything, or drop a file." No copy is invented here: the string
+// that appears is one the renderer already ships, on the branch that was
+// already reachable. `s` stays in the memo's dependency list, so the memo slots
+// keep their indices and no other `e[n]` shifts.
+const COMPOSER_PLACEHOLDER_BEFORE =
+  ':s?y!=null?x9n(y):l.length>0?"Add a message, or hit send.":U:"Sign in to Cursor in settings, then ask anything."';
+const COMPOSER_PLACEHOLDER_AFTER =
+  ':y!=null?x9n(y):l.length>0?"Add a message, or hit send.":U';
 // The roster is fetched only when this mapper produces a non-empty account slot. Signed out it
 // produced null, so `roster.connect()` — the one and only caller of listAgents — never ran, and
 // the sidebar read "No saved agents yet." while the host sat there with a working local agent
@@ -218,6 +244,7 @@ export function patchOriginalSettingsPanel(source) {
 export function patchOriginalSignInGate(source) {
   let patched = replaceExactlyOnce(source, SIGNIN_GATE_BEFORE, SIGNIN_GATE_AFTER, "sign-in gate");
   patched = replaceExactlyOnce(patched, NOT_SIGNED_IN_CHIP_BEFORE, NOT_SIGNED_IN_CHIP_AFTER, "account chip label");
+  patched = replaceExactlyOnce(patched, COMPOSER_PLACEHOLDER_BEFORE, COMPOSER_PLACEHOLDER_AFTER, "composer placeholder");
   return patched;
 }
 
@@ -292,8 +319,8 @@ export async function applyOriginalRendererRouterPatch({ stageRoot }) {
     schemaVersion: 1,
     mode: "original-renderer-settings-extension",
     chunks: changes,
-    features: ["settings-router-provider", "settings-local-docker-vm", "usage-current-provider", "skip-signin-gate", "shell-during-boot-check", "no-account-nag", "local-roster-without-account", "endpoint-model-picker", "no-cursor-provider", "thread-orphan-stays-visible", "thread-survives-off-window-root", "agent-instructions-field"],
-    transformations: ["settings-registry", "router-panel", "usage-panel", "component-source-injection", "signin-gate", "boot-check-gate", "account-chip-label", "account-row-label", "account-slot", "orphaned-branch-entry", "open-thread-close-guard", "agent-instructions-component-injection", "agent-instructions-field"],
+    features: ["settings-router-provider", "settings-local-docker-vm", "usage-current-provider", "skip-signin-gate", "shell-during-boot-check", "no-account-nag", "local-roster-without-account", "endpoint-model-picker", "no-cursor-provider", "thread-orphan-stays-visible", "thread-survives-off-window-root", "agent-instructions-field", "composer-needs-no-cursor-signin"],
+    transformations: ["settings-registry", "router-panel", "usage-panel", "component-source-injection", "signin-gate", "boot-check-gate", "account-chip-label", "account-row-label", "account-slot", "orphaned-branch-entry", "open-thread-close-guard", "agent-instructions-component-injection", "agent-instructions-field", "composer-placeholder"],
   };
   const provenancePath = path.join(stageRoot, "dist", "renderer-router-extension.json");
   await writeFile(provenancePath, `${JSON.stringify(record, null, 2)}\n`);
