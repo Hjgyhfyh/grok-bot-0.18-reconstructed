@@ -45,6 +45,50 @@ const NOT_SIGNED_IN_CHIP_AFTER = 'name:e.kind==="logging-in"?"Signing in":"Local
 // to connect an account; with a custom endpoint that instruction is simply wrong.
 const NOT_SIGNED_IN_ROW_BEFORE = '(p="Not signed in",b="Connect your Cursor account to Grok Bot")';
 const NOT_SIGNED_IN_ROW_AFTER = '(p="Local",b="Using your own endpoint")';
+// The account card itself, `Vs` in the panel chunk — the same component the two anchors above
+// live in, one third of the way down. It rendered a pill button beside the avatar whose whole
+// label was decided by two lines:
+//
+//   let o="Sign In with Cursor",c="primary";
+//   r ? (o="Sign Out",c="secondary") : i && (o="Cancel",c="tertiary")
+//
+// `r` is `l.kind==="logged-in"` and nothing in this build ever puts the status there: the
+// account-chip patch deliberately leaves `isSignedIn:!1` alone, because faking a signed-in
+// state is forbidden, so `r` is false on every render. The button could therefore only ever say
+// "Sign In with Cursor" or "Cancel", and it offered the one account the router refuses to hand
+// this build — `no-cursor-provider` has no entry for it. Clicking it called `t.login()`, a real
+// browser OAuth flow for a session nothing here can spend a token against.
+//
+// The first anchor deletes both not-signed-in labels instead of rewording one of them: a deleted
+// branch cannot grow new copy, a reworded one can. `o` and `c` are left holding the sign-out
+// pair, which is the only state the second anchor is able to render, so the string left in the
+// chunk is one the renderer already ships on a branch it can actually reach. No new sentence is
+// written here.
+//
+// The second anchor gates the element on `r` and moves `r` into slot 40 of the memo's dependency
+// test. That half is load-bearing, not a tidy-up, and the reason is in React rather than in this
+// chunk: `useMemoCache` (react-dom-client.development.js, `function useMemoCache(size)`) copies
+// the previous render's cache forward on an update and returns the SAME array, so those slots
+// still hold the last render's values and the dependency test alone decides whether a cached
+// value is reused or recomputed. `o` is a constant after the first anchor, so a test that still
+// read `o` could never change: the first signed-out render would cache `null`, every later render
+// would hand that `null` straight back, and "Sign Out" would be missing from the one screen that
+// needs it until the card unmounted. Slot 40 carries `r`, the value the memo's result now depends
+// on, which is what the compiler emits for every other piece of state in this component.
+//
+// The element itself is untouched, so if a signed-in account ever becomes reachable the same
+// button, the same `variant` and the same `logout()` handler still run.
+//
+// The card is not deleted, because it is not only a sign-in affordance: it carries the avatar,
+// the account name and the status line, and `patchOriginalAccountRow` above has already made
+// that line honest. A signed-in user must keep a card they can sign out of.
+const ACCOUNT_CARD_LABEL_BEFORE =
+  'let o="Sign In with Cursor",c="primary";r?(o="Sign Out",c="secondary"):i&&(o="Cancel",c="tertiary");';
+const ACCOUNT_CARD_LABEL_AFTER = 'let o="Sign Out",c="secondary";';
+const ACCOUNT_CARD_ACTION_BEFORE =
+  'e[40]!==o||e[41]!==c||e[42]!==V||e[43]!==N||e[44]!==Y?(S=a.jsx(oe,{className:M,disabled:V,onClick:N,shape:"pill",size:"md",style:Y,variant:c,children:o}),e[40]=o,e[41]=c,e[42]=V,e[43]=N,e[44]=Y,e[45]=S):S=e[45];';
+const ACCOUNT_CARD_ACTION_AFTER =
+  'e[40]!==r||e[41]!==c||e[42]!==V||e[43]!==N||e[44]!==Y?(S=r?a.jsx(oe,{className:M,disabled:V,onClick:N,shape:"pill",size:"md",style:Y,variant:c,children:o}):null,e[40]=r,e[41]=c,e[42]=V,e[43]=N,e[44]=Y,e[45]=S):S=e[45];';
 // The chat composer still told the user to sign in before they were allowed to
 // type. Its resting placeholder had four states and the signed-out one was the
 // only instruction left on the first screen of the app:
@@ -252,6 +296,21 @@ export function patchOriginalAccountRow(source) {
   return replaceExactlyOnce(source, NOT_SIGNED_IN_ROW_BEFORE, NOT_SIGNED_IN_ROW_AFTER, "account row label");
 }
 
+/**
+ * Leaves the account card with nothing to click unless somebody is signed in.
+ *
+ * The label anchor runs first because the two are independent but read in this order: after it
+ * the only label the card holds is the sign-out pair, and the action anchor decides whether the
+ * button that would carry it is ever rendered. Both go through `replaceExactlyOnce`, so an
+ * upstream chunk where either anchor moved fails the build here instead of shipping an account
+ * card that quietly grew a sign-in button back.
+ */
+export function patchOriginalAccountCardSignIn(source) {
+  let patched = replaceExactlyOnce(source, ACCOUNT_CARD_LABEL_BEFORE, ACCOUNT_CARD_LABEL_AFTER, "account card label");
+  patched = replaceExactlyOnce(patched, ACCOUNT_CARD_ACTION_BEFORE, ACCOUNT_CARD_ACTION_AFTER, "account card action");
+  return patched;
+}
+
 export function patchOriginalAccountSlot(source) {
   return replaceExactlyOnce(source, ACCOUNT_SLOT_BEFORE, ACCOUNT_SLOT_AFTER, "account slot");
 }
@@ -304,7 +363,7 @@ export async function applyOriginalRendererRouterPatch({ stageRoot }) {
   const changes = [];
   for (const [role, candidate, transforms] of [
     ["registry", registryCandidates[0], [patchOriginalSettingsRegistry, patchOriginalSignInGate, patchOriginalAccountSlot, patchOriginalThreadSurfaces]],
-    ["panel", panelCandidates[0], [patchOriginalSettingsPanel, patchOriginalAccountRow]],
+    ["panel", panelCandidates[0], [patchOriginalSettingsPanel, patchOriginalAccountRow, patchOriginalAccountCardSignIn]],
   ]) {
     const patched = transforms.reduce((source, transform) => transform(source), candidate.source);
     await writeFile(candidate.target, patched);
@@ -319,8 +378,8 @@ export async function applyOriginalRendererRouterPatch({ stageRoot }) {
     schemaVersion: 1,
     mode: "original-renderer-settings-extension",
     chunks: changes,
-    features: ["settings-router-provider", "settings-local-docker-vm", "usage-current-provider", "skip-signin-gate", "shell-during-boot-check", "no-account-nag", "local-roster-without-account", "endpoint-model-picker", "no-cursor-provider", "thread-orphan-stays-visible", "thread-survives-off-window-root", "agent-instructions-field", "composer-needs-no-cursor-signin"],
-    transformations: ["settings-registry", "router-panel", "usage-panel", "component-source-injection", "signin-gate", "boot-check-gate", "account-chip-label", "account-row-label", "account-slot", "orphaned-branch-entry", "open-thread-close-guard", "agent-instructions-component-injection", "agent-instructions-field", "composer-placeholder"],
+    features: ["settings-router-provider", "settings-local-docker-vm", "usage-current-provider", "skip-signin-gate", "shell-during-boot-check", "no-account-nag", "local-roster-without-account", "endpoint-model-picker", "no-cursor-provider", "thread-orphan-stays-visible", "thread-survives-off-window-root", "agent-instructions-field", "composer-needs-no-cursor-signin", "account-card-needs-no-cursor-signin"],
+    transformations: ["settings-registry", "router-panel", "usage-panel", "component-source-injection", "signin-gate", "boot-check-gate", "account-chip-label", "account-row-label", "account-slot", "orphaned-branch-entry", "open-thread-close-guard", "agent-instructions-component-injection", "agent-instructions-field", "composer-placeholder", "account-card-label", "account-card-action"],
   };
   const provenancePath = path.join(stageRoot, "dist", "renderer-router-extension.json");
   await writeFile(provenancePath, `${JSON.stringify(record, null, 2)}\n`);
