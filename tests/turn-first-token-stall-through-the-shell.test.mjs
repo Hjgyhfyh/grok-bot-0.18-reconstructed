@@ -463,7 +463,12 @@ function observationsClosed(provider) {
 
 test("the first-token deadline doubles per retry and stops at the ceiling", async () => {
   process.env.SAND_FIRST_TOKEN_STALL_DEADLINE_MS = "60";
-  process.env.SAND_FIRST_TOKEN_STALL_MAX_DEADLINE_MS = "90";
+  // The ladder doubles 60 -> 120 and is then held at the ceiling. A ceiling of
+  // 90 made the intended growth a 30ms difference, which is smaller than how far
+  // a timer overshoots on a loaded machine: both attempts then land on the
+  // ceiling and the ladder stops looking like it grows even though it did. The
+  // growth has to sit above the measurement noise or the test measures the clock.
+  process.env.SAND_FIRST_TOKEN_STALL_MAX_DEADLINE_MS = "180";
   const delivered = [];
   const startedAt = [];
   const { agent } = providerAgent(

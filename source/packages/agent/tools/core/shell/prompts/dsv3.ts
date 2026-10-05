@@ -17,10 +17,18 @@ export interface Dsv3ShellDescriptionOptions {
   readonly useMinimalHarness?: boolean | undefined;
   readonly requireBlockUntilMs?: boolean | undefined;
   readonly defaultBlockUntilMs?: number | undefined;
+  /**
+   * What `resolvePlan` falls back to when the model sets `is_background` and no
+   * `timeout`. It is `options.defaultTimeoutMs ?? 30000`, so a host that
+   * reconfigures the wait must be described with the wait it really imposes.
+   */
+  readonly defaultTimeoutMs?: number | undefined;
   readonly enableJobCompletionNotifications?: boolean | undefined;
   readonly enableJobProgressNotifications?: boolean | undefined;
   readonly enableTerminalFiles?: boolean | undefined;
 }
+
+const DEFAULT_SHELL_TIMEOUT_MS = 30_000;
 
 const baseDescriptionDsv3 = `PROPOSE a command to run on behalf of the user.
 If you have this tool, note that you DO have the ability to run commands directly on the USER's system.
@@ -32,7 +40,7 @@ In using these tools, adhere to the following guidelines:
 3. If in the same shell, LOOK IN CHAT HISTORY for your current working directory.
 4. For ANY commands that would require user interaction, ASSUME THE USER IS NOT AVAILABLE TO INTERACT and PASS THE NON-INTERACTIVE FLAGS (e.g. --yes for npx).
 5. If the command would use a pager, append \` | cat\` to the command.
-6. For commands that are long running/expected to run indefinitely until interruption, please run them in the background. To run jobs in the background, set \`is_background\` to true rather than changing the details of the command.
+6. For commands that are long running/expected to run indefinitely until interruption, please run them in the background. To run jobs in the background, set \`is_background\` to true rather than changing the details of the command. This tool never delivers a result in a later message: the call still waits, and everything it has to say arrives in the same turn.
 7. Dont include any newlines in the command.`;
 
 const baseDescriptionDsv31205 = `Executes a given command in a shell session with optional timeout.
@@ -84,11 +92,32 @@ function blockUntilMsDescriptionOptional(defaultBlockUntilMs: number): string {
 
 const blockUntilMsDescriptionRequired = "How long to block and wait for the command to complete before moving it to background (in milliseconds). Set to 0 to immediately run the command in the background. The timer includes the shell startup time.";
 
-const baseParametersSchemaDsv3 = z.object({
-  command: z.string().describe("The terminal command to execute"),
-  is_background: z.boolean().describe("Whether the command should be run in the background"),
-  explanation: z.string().optional().describe("One sentence explanation as to why this command needs to be run and how it contributes to the goal."),
-});
+/**
+ * What `is_background` actually costs the model, stated on the parameter that
+ * sets it.
+ *
+ * `resolvePlan` reads `timeout` whenever `is_background` is true and hands that
+ * number to the executor as the block-until value, so the call holds the turn
+ * for it and then returns — in this same turn — the output collected so far plus
+ * the shell id. "Whether the command should be run in the background" said none
+ * of that. A model that read it as fire-and-forget planned around a result it
+ * believed would arrive as a later message, and this tool never sends one: the
+ * price was one silent wait per backgrounded command and a plan built on a
+ * delivery that does not exist.
+ */
+function isBackgroundDescription(defaultTimeoutMs: number, hasTimeoutParameter: boolean): string {
+  const wait = formatBlockUntilMsDefaultForSchema(defaultTimeoutMs);
+  const howToReturnNow = hasTimeoutParameter ? ` Set \`timeout\` to 0 to hand the turn back immediately.` : "";
+  return `Run the command in the background. This call still waits ${wait} before it returns, and the output collected up to that point plus the shell id come back in this same turn, not in a later message. The command keeps running afterwards and keeps appending to its terminal file, so read that file to see the rest.${howToReturnNow}`;
+}
+
+function baseParametersSchemaDsv3(defaultTimeoutMs: number) {
+  return z.object({
+    command: z.string().describe("The terminal command to execute"),
+    is_background: z.boolean().describe(isBackgroundDescription(defaultTimeoutMs, false)),
+    explanation: z.string().optional().describe("One sentence explanation as to why this command needs to be run and how it contributes to the goal."),
+  });
+}
 
 const descriptionSchema = z.string().optional().describe(`Clear, concise description of what this command does in 5-10 words. Examples:
 Input: ls
@@ -103,12 +132,12 @@ Output: Installs package dependencies
 Input: mkdir foo
 Output: Creates directory 'foo'`);
 
-const baseParametersSchemaDsv31205 = z.object({
+const baseParametersSchemaDsv31205 = (defaultTimeoutMs: number) => z.object({
   command: z.string().describe("The command to execute"),
   working_directory: z.string().optional().describe("The absolute path to the working directory to execute the command in (defaults to current directory)"),
   timeout: lenientNumber().optional().describe("Timeout in milliseconds (defaults to 30000ms/30s)"),
   description: descriptionSchema,
-  is_background: z.boolean().optional().describe("Whether the command should be run in the background"),
+  is_background: z.boolean().optional().describe(isBackgroundDescription(defaultTimeoutMs, true)),
 });
 
 const baseParametersSchemaDsv31205WithBlockUntilShared = z.object({
@@ -160,7 +189,8 @@ export function getDescriptionDsv3(sandboxEnabled: boolean, version: string, opt
 }
 
 export function getParametersSchemaDsv3(sandboxEnabled: boolean, version: string, options: Dsv3ShellDescriptionOptions & { readonly strictArgParsing?: boolean } = {}): z.ZodObject<z.ZodRawShape> {
-  const { isReadonly, enableBlockUntilMs, strictArgParsing, requireBlockUntilMs, defaultBlockUntilMs, enableJobProgressNotifications } = options;
+  const { isReadonly, enableBlockUntilMs, strictArgParsing, requireBlockUntilMs, defaultBlockUntilMs, defaultTimeoutMs, enableJobProgressNotifications } = options;
+  const waitMs = defaultTimeoutMs ?? DEFAULT_SHELL_TIMEOUT_MS;
   const addOptionalParameters = (schema: z.ZodObject<z.ZodRawShape>): z.ZodObject<z.ZodRawShape> => {
     let nextSchema = schema;
     if (enableJobProgressNotifications === true) nextSchema = nextSchema.extend({ notify_on_output: notifyOnOutputSchema });
@@ -176,9 +206,9 @@ export function getParametersSchemaDsv3(sandboxEnabled: boolean, version: string
           : baseParametersSchemaDsv31205WithBlockUntilOptional(defaultBlockUntilMs ?? 3e4);
       return addOptionalParameters(blockUntilSchema);
     }
-    return addOptionalParameters(baseParametersSchemaDsv31205);
+    return addOptionalParameters(baseParametersSchemaDsv31205(waitMs));
   }
-  return addOptionalParameters(baseParametersSchemaDsv3);
+  return addOptionalParameters(baseParametersSchemaDsv3(waitMs));
 }
 
 export { notifyOnOutputSchema };

@@ -13,6 +13,7 @@ import {
   type BackgroundWorkRegistry,
 } from "./background-shell-lifecycle.js";
 import type { ShellCoreEvent } from "./shell-core.js";
+import { shellOutputTruncatedNotice } from "./shell-core.js";
 import { type Context } from "../context/core.js";
 import { createLogger } from "../context/logger.js";
 
@@ -451,6 +452,17 @@ export class FileLoggingShellFactory {
             if (event.type === "stdout" || event.type === "stderr") {
               if (!headerWritten) { await writeHeader(); await ensureHandlesOpen(); }
               await safeWrite(event.data ?? "");
+            } else if (event.type === "stdout_trimmed" || event.type === "stderr_trimmed") {
+              // `shell-core` stops emitting a channel the moment it passes
+              // MAX_BUFFER_SIZE and discards the rest, with no spill file to go
+              // back to. This file is the only window a model has into a
+              // backgrounded command, so a silent stop here left it reading a
+              // chopped log as the whole log while the header still said the
+              // command was running normally. The foreground stream says this in
+              // words; the log has to say it too, or the words are lost at the
+              // moment the call is backgrounded.
+              if (!headerWritten) { await writeHeader(); await ensureHandlesOpen(); }
+              await safeWrite(`${shellOutputTruncatedNotice(event.type === "stdout_trimmed" ? "stdout" : "stderr", event.keptBytes, event.limitBytes)}\n`);
             } else if (event.type === "stdin_ready" && !stdinPatched) {
               stdinPatched = true;
               if (!headerWritten) { await writeHeader(event.pid); await ensureHandlesOpen(); }
@@ -525,6 +537,10 @@ export class FileLoggingShellFactory {
           const result = await value.eventIterator.next();
           if (!result.done) {
             if (result.value.type === "stdout" || result.value.type === "stderr") await safeWrite(result.value.data ?? "");
+            // Same obligation as the spawn path above: a channel cut by
+            // MAX_BUFFER_SIZE stops arriving here with no word about it, and this
+            // log is the only place a model can look to find out.
+            else if (result.value.type === "stdout_trimmed" || result.value.type === "stderr_trimmed") await safeWrite(`${shellOutputTruncatedNotice(result.value.type === "stdout_trimmed" ? "stdout" : "stderr", result.value.keptBytes, result.value.limitBytes)}\n`);
             else if (result.value.type === "exit") { await finalizeTerminal(result.value.aborted ? "aborted" : result.value.code === 0 ? "succeeded" : "failed", `exit_code: ${result.value.code ?? "unknown"}`); await cleanup(); }
           } else if (!terminalFinalized) await finalizeTerminal(value.abortController.signal.aborted ? "aborted" : "failed");
           if (result.done) await cleanup();
