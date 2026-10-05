@@ -4,7 +4,7 @@ import { readdir, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { getSandProfilePath, writeSandProfileFile, type SandAgentProfile } from "../../agents/agent-profile.js";
 import { getSandSettingsPath, writeSandSettingsFile } from "../../agents/settings-file.js";
-import { SandAgentDb } from "./agent-db.js";
+import { SandAgentDb, ensureAgentDbDirectory } from "./agent-db.js";
 import { getAgentDbPath, STORE_FILENAME } from "./session-paths.js";
 import { buildSummary, readDbExtras } from "./session-summaries.js";
 import { automationStoreForDbPath, channelStoreForDbPath, workflowStoreForDbPath } from "./session-store-factories.js";
@@ -76,8 +76,24 @@ export class SandSessionMaterialization {
   private compose(agentId: string, dbPath: string, db: SandAgentDb): MaterializedSession {
     return { id: agentId, dbPath, db, agentStore: this.host.createAgentStore({ pool: this.requireWorkerPool(), agentId, dbPath, db }), memory: this.host.createMemoryStore(dirname(dbPath)), automations: automationStoreForDbPath(dbPath, this.host.resolveUserTimeZone), workflows: workflowStoreForDbPath(dbPath, this.host.resolveUserTimeZone), channels: channelStoreForDbPath(dbPath) };
   }
+  /**
+   * Mints the directory that holds the agent, and is the only place that does.
+   *
+   * `SandAgentDb` no longer creates one as a side effect of being opened: a late
+   * read of a deleted agent's `store.db` used to run `mkdirSync` and hand back a
+   * fresh empty database inside a brand new directory, which then held a slot of
+   * the fifty-agent cap that `listAgents` never showed. Creating became an
+   * explicit act, and the line that performs it lived in a wrapper subclass in
+   * `production.ts` instead of here, so this class -- the one every host builds to
+   * mint an agent -- threw `SandAgentDirectoryMissingError` and minted nothing.
+   * Minting is the one operation that means "this agent now exists", so it is the
+   * one that creates the directory. `openSession`, the reclaim passes and the
+   * cap check never call this method and never create anything.
+   */
   async materializeSession(agentId: string, profile?: Partial<SandAgentProfile>, origin: "user" | "dev" = "user", purpose?: string): Promise<MaterializedSession> {
-    const dbPath = getAgentDbPath(this.host.rootDir, agentId), db = new SandAgentDb(dbPath);
+    const dbPath = getAgentDbPath(this.host.rootDir, agentId);
+    ensureAgentDbDirectory(dbPath);
+    const db = new SandAgentDb(dbPath);
     try {
       db.set("agentId", agentId); db.setAgentOrigin(origin); if (purpose != null) db.setAgentPurpose(purpose);
       writeSandProfileFile(getSandProfilePath(dirname(dbPath)), { name: profile?.name?.trim() || "Grok", description: profile?.description?.trim() ?? "", title: profile?.title?.trim() ?? "", avatarShape: profile?.avatarShape?.trim() ?? "", avatarColor: profile?.avatarColor?.trim() ?? "" });

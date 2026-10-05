@@ -492,6 +492,36 @@ export function withRecordedToolCallNames<T extends TurnTool>(
   };
 }
 
+/**
+ * The tool context a call runs under, when the caller handed one in.
+ *
+ * `TurnTool.execute` is variadic, so the first argument is only inspected, never assumed: a
+ * value without `withCancel()` is passed through untouched and keeps the old behaviour.
+ */
+function cancellableToolContext(
+  value: unknown,
+): { readonly ctx: unknown; readonly cancel: (reason?: unknown) => void } | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const withCancel = (value as { withCancel?: unknown }).withCancel;
+  if (typeof withCancel !== "function") return undefined;
+  const [ctx, cancel] = (withCancel as () => [unknown, (reason?: unknown) => void]).call(value);
+  return { ctx, cancel };
+}
+
+/**
+ * Per-call execution guard.
+ *
+ * The guard used to be a bare `Promise.race`: when the timer won, the model was told the call
+ * `timed out after N seconds and was terminated`, and nothing terminated it. The tool held the
+ * turn's own context, which the guard never cancelled, so a command the model had already been
+ * told was dead kept running, kept writing and kept holding its file handles for the rest of
+ * the session. The model-facing sentence was a lie the product could not back.
+ *
+ * The tool now runs under a cancellable child context, and the guard cancels it at the same
+ * moment it rejects, so the two can never disagree. The child is only cancelled on the deadline:
+ * a call that finished keeps exactly the context it had, so a command the shell deliberately
+ * sent to the background is not killed by this wrapper on its way out.
+ */
 export function withToolTimeout<T extends TurnTool>(
   tool: T,
   timeoutMs: number,
@@ -504,13 +534,21 @@ export function withToolTimeout<T extends TurnTool>(
   return {
     ...tool,
     async execute(...args: readonly unknown[]) {
+      const scoped = cancellableToolContext(args[0]);
       let timeout: NodeJS.Timeout | undefined;
       try {
         return await Promise.race([
-          tool.execute(...args),
+          tool.execute(...(scoped === undefined ? args : [scoped.ctx, ...args.slice(1)])),
           new Promise<never>((_resolve, reject) => {
             timeout = setTimeout(
-              () => reject(createTimeoutError()),
+              () => {
+                scoped?.cancel(
+                  new Error(
+                    `The ${tool.name} tool call exceeded its ${timeoutMs} ms per-call limit and was cancelled.`,
+                  ),
+                );
+                reject(createTimeoutError());
+              },
               timeoutMs,
             );
             timeout.unref?.();

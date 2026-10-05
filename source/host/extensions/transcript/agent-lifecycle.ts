@@ -727,10 +727,31 @@ export class AgentLifecycle {
     } else await this.tm.sessionStore.setSessionUnread(agentId, isUnread, atMs);
     await this.tm.roster.emitAgentUpdate(agentId);
   }
+  /**
+   * Refuses a write about an agent that is not on disk.
+   *
+   * `writeSandSettingsFile` and `writeSandProfileFile` both end in
+   * `mkdirSync(dirname(path), { recursive: true })`, so an unguarded write about
+   * an id creates the agent directory as a side effect. Measured on a live box:
+   * one `setAgentHiddenFromSidebar` for a fresh uuid answered `200` and left
+   * `<root>\<uuid>\settings.json` behind -- a directory for an agent nobody
+   * created, listed by no roster, and counted by the directory walk the
+   * fifty-agent cap is computed from. `updateAgent` above already refuses such an
+   * id; the switches are the same operation on the same id and owe the same
+   * answer. The refusal names the agent, because a caller holding several ids
+   * cannot otherwise tell which one is gone.
+   */
+  private requireAgentOnDisk(agentId: string): void {
+    if (!this.tm.sessionStore.agentDirExists(agentId))
+      throw new SandAgentLifecycleError(
+        `Agent ${agentId} no longer exists on disk.`,
+      );
+  }
   async setAgentNotifyOnUpdates(
     agentId: string,
     enabled: boolean,
   ): Promise<void> {
+    this.requireAgentOnDisk(agentId);
     this.tm.sessionStore.setSessionNotifyOnUpdates(agentId, enabled);
     await this.tm.roster.emitAgentUpdate(agentId);
   }
@@ -738,6 +759,7 @@ export class AgentLifecycle {
     agentId: string,
     hidden: boolean,
   ): Promise<void> {
+    this.requireAgentOnDisk(agentId);
     this.tm.sessionStore.setSessionHiddenFromSidebar(agentId, hidden);
     await this.tm.roster.emitAgentUpdate(agentId);
   }

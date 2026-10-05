@@ -138,6 +138,9 @@ const runtimeSpecs = Object.freeze({
       installInvariantReporter: ["clean-provider", "source/shared/invariant.ts#installInvariantReporter", "installInvariantReporter((report)"],
       pinHostDiagnosticsReporter: ["clean-provider", "source/host/host-diagnostics.ts#pinHostDiagnosticsReporter", "pinHostDiagnosticsReporter((diagnostic)"],
       acquireHostLock: ["clean-provider", "source/host/host-lock.ts#acquireHostLock", "await acquireHostLock()"],
+      // The preflight runs before the lock so a half-configured host fails on its
+      // own account instead of evicting a working one first.
+      preflight: ["clean-provider", "source/host/main.ts#createHostMainDependencies", "await deps.preflight?.()"],
       startBoxExecDaemon: ["clean-provider", "source/host/box/exec-daemon-process.ts#startBoxExecDaemonProcess", "await acquireHostLock()"],
       getSandRootDir: ["clean-provider", "source/host/host-paths.ts#getSandRootDir", "getSandRootDir()}"],
       createHost: ["clean-provider-needs-explicit-ports", "source/host/sand-host.ts#createProductionSandHost", "new SandHost()"],
@@ -800,6 +803,15 @@ export async function createRuntimeCompositionAudit({ outputRoot = null, require
       let [status, cleanProvider, needle] = spec.requirements[member.name];
       if (runtimeName === "host" && member.name === "executeBoxCopyInFromEnv") {
         status = productionBindingStatus("ports.executeBoxCopyInFromEnv");
+      }
+      // An optional dependency may postdate the captured payload, so there is
+      // nothing in the artifact to anchor to. Demanding a needle for one would
+      // mean inventing a phrase that was never shipped, which is worse than
+      // recording that it has no anchor because it did not have to be bound when
+      // the payload was captured. Required members keep the anchor.
+      if (member.optional) {
+        status = "clean-default-or-optional";
+        return { ...member, status, cleanProvider, artifactAnchor: undefined };
       }
       return {
         ...member,

@@ -414,7 +414,13 @@ test("the deadline guard caps the worst case even if the transport never settles
 
   assert.equal(outcome.skip, "deadline");
   assert.deepEqual(ids(outcome.plugins), ["p-word", "p-notion"]);
-  assert.ok(elapsedMs >= jev.PLUGIN_SEARCH_JEV_DEADLINE_MS, `expected to wait the full ${jev.PLUGIN_SEARCH_JEV_DEADLINE_MS}ms guard (waited ${Math.round(elapsedMs)}ms)`);
+  // A deadline timer fires AT the deadline, and the clock that measures it starts
+  // after the timer was armed. The two readings differ by however long that took,
+  // so an exact lower bound is a coin flip that only lands green on a quiet
+  // machine. The guard's job is to wait no SHORTER than its deadline; the margin
+  // below is the arithmetic of two clocks, not a slackened requirement.
+  const clockMarginMs = 50;
+  assert.ok(elapsedMs >= jev.PLUGIN_SEARCH_JEV_DEADLINE_MS - clockMarginMs, `expected to wait the full ${jev.PLUGIN_SEARCH_JEV_DEADLINE_MS}ms guard (waited ${Math.round(elapsedMs)}ms)`);
   assert.ok(elapsedMs < jev.PLUGIN_SEARCH_JEV_DEADLINE_MS + 1_000, `the guard must cap the wait (waited ${Math.round(elapsedMs)}ms)`);
 });
 

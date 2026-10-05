@@ -5,6 +5,7 @@ import { clearGatewayDiscovery, writeGatewayDiscovery } from "./host-discovery.j
 import { pinHostDiagnosticsReporter } from "./host-diagnostics.js";
 import { acquireHostLock } from "./host-lock.js";
 import { getSandRootDir } from "./host-paths.js";
+import { access } from "node:fs/promises";
 import path from "node:path";
 import { installProcessCrashGuards } from "./process-crash-guard.js";
 import {
@@ -75,13 +76,38 @@ export interface ProcessCrashGuards {
   setReporter(reporter: (error: unknown, kind: string) => void): void;
 }
 
+/**
+ * What `preflight` settled before the sandbox lock was touched.
+ *
+ * It carries the gateway configuration so the composition is not built twice:
+ * `resolveGatewayServerConfig` mints a fresh bearer token on every call, and
+ * two calls would leave the token the launcher reads from `gateway.json`
+ * describing a configuration this host never served.
+ */
+export interface HostStartupPreflight {
+  readonly gatewayConfig: GatewayServerConfig;
+  readonly gatewayScheme: string;
+}
+
 export interface HostMainDependencies {
   executeBoxCopyInFromEnv(): Promise<number>;
   installProcessCrashGuards(options: { scope: "sand-host" }): ProcessCrashGuards;
   installInvariantReporter(reporter: (report: unknown) => void): void;
   pinHostDiagnosticsReporter(reporter: (diagnostic: unknown) => void): void;
   acquireHostLock(): Promise<HostLockResult>;
-  startBoxExecDaemon?(): Promise<OwnedBoxExecDaemon>;
+  /**
+   * Checks everything this host needs on its own terms, BEFORE it takes the
+   * sandbox lock and therefore before it evicts the host that is running now.
+   * Throwing here refuses this start and leaves the running host alone.
+   */
+  preflight?(): HostStartupPreflight | Promise<HostStartupPreflight>;
+  /**
+   * Receives the lock result of this very start. A takeover killed a live host,
+   * and its exec-daemon socket is released only when that process has exited,
+   * so the receiver needs that outcome to wait out the release instead of
+   * refusing a port the OS has not freed yet.
+   */
+  startBoxExecDaemon?(previousHost: HostLockResult): Promise<OwnedBoxExecDaemon>;
   getSandRootDir(): string;
   createHost(): HostMainHost;
   resolveGatewayServerConfig(): GatewayServerConfig;
@@ -133,11 +159,23 @@ export function createProductionHostMainDependencies(
       reporter as Parameters<typeof pinHostDiagnosticsReporter>[0]
     ),
     acquireHostLock,
-    ...(useExistingBoxExecDaemon ? {} : { startBoxExecDaemon: () => startBoxExecDaemonProcess({
+    preflight: async () => {
+      // Everything here fails on this host's own account, never because of the
+      // host that is running right now: the daemon bundle is missing, or the
+      // TLS pair is half configured, or the entry path cannot be resolved. All
+      // three used to be discovered AFTER the eviction, which turned a broken
+      // local setting into "no app at all" with a message about a running one.
+      const entryPath = resolveBoxExecDaemonEntry();
+      await access(entryPath);
+      const gatewayConfig = resolveGatewayServerConfig();
+      return { gatewayConfig, gatewayScheme: gatewayScheme(gatewayConfig) };
+    },
+    ...(useExistingBoxExecDaemon ? {} : { startBoxExecDaemon: (previousHost: HostLockResult) => startBoxExecDaemonProcess({
         entryPath: resolveBoxExecDaemonEntry(),
         generated: ports.extensionHost.boxGenerated,
         workspaceRoot: path.join(getSandRootDir(), "box-workspace"),
         terminalsDirectory: path.join(getSandRootDir(), "box-terminals"),
+        previousHost,
         ...(ports.log === undefined ? {} : { log: ports.log }),
       }) }),
     getSandRootDir,
@@ -205,6 +243,25 @@ export async function main(
 
   const crashGuards = deps.installProcessCrashGuards({ scope: "sand-host" });
 
+  // Everything that can fail on this host's own account is settled BEFORE
+  // `acquireHostLock`, because the lock is what kills the host that is running
+  // right now. Past that line a refusal is not a failed start, it is the user
+  // having no app at all, and the reason printed names the wrong culprit. The
+  // cost of moving the check forward is one lost crash report: a preflight
+  // failure has no `host` object yet to report through, so it is logged and the
+  // process exits 1 while the running host keeps serving.
+  let preflighted: HostStartupPreflight | undefined;
+  try {
+    preflighted = await deps.preflight?.();
+  } catch (error) {
+    log.error(
+      "[sand-host] fatal startup failure: this host cannot start, so the host running now was left alone:",
+      error,
+    );
+    processControl.exit(1);
+    return;
+  }
+
   // `acquireHostLock` and `createHost` used to run OUTSIDE the try/catch below.
   // `acquireHostLock` writes this process's own pid into `<root>\host.lock`, so
   // a throw from either one killed the process on an unhandled rejection with
@@ -244,10 +301,13 @@ export async function main(
   });
 
   try {
-    boxExecDaemon = await deps.startBoxExecDaemon?.();
+    // The lock result, not a bare call: on "took-over" the predecessor is gone
+    // but its socket is not yet, and only this value lets the daemon start wait
+    // for the release instead of refusing a port that is on its way out.
+    boxExecDaemon = await deps.startBoxExecDaemon?.(lockResult);
     await host.start();
-    const gatewayConfig = deps.resolveGatewayServerConfig();
-    const scheme = deps.gatewayScheme(gatewayConfig);
+    const gatewayConfig = preflighted?.gatewayConfig ?? deps.resolveGatewayServerConfig();
+    const scheme = preflighted?.gatewayScheme ?? deps.gatewayScheme(gatewayConfig);
     const gateway = await deps.startGatewayServer({
       api: host.getApi(),
       subscribe: listener => host.subscribe(listener),
