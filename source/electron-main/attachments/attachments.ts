@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { open, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { extname, join } from "node:path";
 
@@ -49,9 +50,36 @@ export interface AttachmentEdgeDeps {
 
 export function errorClassOf(error: unknown): string { return error instanceof Error ? error.name || "Error" : typeof error; }
 export function isSafeFilename(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= 255 && !value.includes("/") && !value.includes("\\") && !value.includes("\0"); }
+/**
+ * A native Windows absolute path is a legal URL: the drive letter becomes the
+ * scheme. `new URL("C:\\...")` therefore succeeds with protocol `"c:"`, and the
+ * file-protocol test below answered `null` for every attachment this product
+ * produces.
+ *
+ * Measured on a live box. The composer commits a staged file through
+ * `uploadAttachment`, the host answers with the content-addressed path it wrote,
+ * and that answer is what the renderer sends back as `source` for every preview,
+ * download and text read. For a 232109-byte JPEG at
+ * `.../agents/<id>/attachments/<sha256>.jpg` the host read the same path back
+ * over the gateway as HTTP 200 with a 309503-character data URL, while this
+ * function returned `null` and the card rendered "Image unavailable".
+ *
+ * The same URL also decodes `file:///C:/...` into `/C:/...`, which is not a path
+ * Windows can open, so the `file:` branch is repaired for that form too. Only the
+ * drive form changes: a POSIX `/home/...` decodes unchanged and still passes
+ * through, a relative path still fails to parse and is still returned as it
+ * arrived, and every non-`file:` scheme other than a drive letter is still
+ * refused.
+ */
+const WINDOWS_DRIVE_ABSOLUTE = /^[A-Za-z]:[/\\]/;
 export function normalizeAttachmentSource(source: unknown): string | null {
   if (typeof source !== "string" || source.length === 0) return null;
-  try { const url = new URL(source); return url.protocol === "file:" ? posixPathFromFileUrl(source) : null; } catch { return source; }
+  let url: URL;
+  try { url = new URL(source); } catch { return source; }
+  if (url.protocol !== "file:") return WINDOWS_DRIVE_ABSOLUTE.test(source) ? source : null;
+  const decoded = posixPathFromFileUrl(source);
+  if (decoded == null) return null;
+  return WINDOWS_DRIVE_ABSOLUTE.test(decoded.slice(1)) ? decoded.slice(1) : decoded;
 }
 export function resizePreviewImage(dataUrl: string, target: { width: number } | { height: number }, encoding: "jpeg" | "png", nativeImage: PreviewImagePort): string | null {
   const source = nativeImage.createFromDataURL(dataUrl); if (source.isEmpty()) return null;
@@ -88,7 +116,7 @@ export function createAttachmentEdgePort(deps: AttachmentEdgeDeps) {
       if (!isSafeFilename(filename) || !(bytes instanceof Uint8Array)) return { ok: false as const, reason: "failed" as const };
       if (bytes.byteLength === 0) return { ok: false as const, reason: "empty" as const };
       if (bytes.byteLength > deps.byteLimitForName(filename)) return { ok: false as const, reason: "too-large" as const };
-      try { const dir = deps.getStagingDir(); await mkdir(dir, { recursive: true }); const path = join(dir, `${(deps.now ?? Date.now)()}-${(deps.randomUUID ?? crypto.randomUUID)()}${extname(filename)}`); await writeFile(path, bytes); return { ok: true as const, path }; } catch (error) { report("stage", error); return { ok: false as const, reason: "failed" as const }; }
+      try { const dir = deps.getStagingDir(); await mkdir(dir, { recursive: true }); const path = join(dir, `${(deps.now ?? Date.now)()}-${(deps.randomUUID ?? randomUUID)()}${extname(filename)}`); await writeFile(path, bytes); return { ok: true as const, path }; } catch (error) { report("stage", error); return { ok: false as const, reason: "failed" as const }; }
     },
     async commitStaged(rawPaths: unknown, rawFilenames: unknown): Promise<string[] | null> {
       const paths = Array.isArray(rawPaths) ? rawPaths : []; const filenames = Array.isArray(rawFilenames) ? rawFilenames : []; const committed: string[] = [];

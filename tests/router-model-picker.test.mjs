@@ -269,7 +269,9 @@ test("the preload and main edge expose one read-only model-listing call", async 
   // The handler reveals the key itself and never forwards it into the reply.
   assert.match(mainEdge, /const CUSTOM_ENDPOINT_SECRET_KEY = "OPENAI_COMPATIBLE_API_KEY"/);
   assert.equal(serializable(mainEdge.match(/listInferenceRouterModels:[^\n]*/)[0]).includes(SECRET), false);
-  // Untouched by this change: the router save path a test regex-matches.
-  assert.match(mainEdge, /syncHostSettingsToBox\(\{ inferenceProvider: provider \}\)/);
-  assert.match(mainEdge, /return \{ provider, usage:/);
+  // The router save path carries the provider the store agreed to, not the one the
+  // caller asked for. Forwarding the requested value would push the account-backed
+  // provider at the box and hand the panel back a route no turn ever took.
+  assert.match(mainEdge, /syncHostSettingsToBox\(\{ inferenceProvider: resolveServedInferenceProvider\(provider\) \}\)/);
+  assert.match(mainEdge, /return \{ provider: resolveServedInferenceProvider\(provider\), usage:/);
 });

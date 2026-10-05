@@ -46,12 +46,12 @@ const CONTROL_REPLY = '{"isNewTopic":true,"title":"Возможности аге
  * the only thing that is fixed. The stub records every call into `globalThis`, because esbuild
  * inlines the stub into the router bundle and no module-level array is shared with this file.
  */
-async function loadRouter({ provider = "custom", reply = CONTROL_REPLY } = {}) {
+async function loadRouter({ provider = "custom", reply = CONTROL_REPLY, extraSettings = {} } = {}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "grok-sendprompt-agent-"));
   delete globalThis.__routedProviderCalls;
   await writeFile(
     path.join(dataDir, "settings.json"),
-    `${JSON.stringify({ version: 1, inferenceProvider: provider, inferenceCustomEndpoint: { baseUrl: "https://endpoint.invalid/v1", modelId: "model-under-test" } }, null, 2)}\n`,
+    `${JSON.stringify({ version: 1, inferenceProvider: provider, inferenceCustomEndpoint: { baseUrl: "https://endpoint.invalid/v1", modelId: "model-under-test" }, ...extraSettings }, null, 2)}\n`,
     "utf8",
   );
   const stubPath = path.join(dataDir, "provider-session-stub.mjs");
@@ -233,17 +233,48 @@ test("a title that cannot be stored never turns into an error in the chat", asyn
   }
 });
 
-test("the cursor provider declines the turn and asks the model for nothing, exactly as before", async () => {
-  const loaded = await loadRouter({ provider: "cursor" });
-  const host = stubbedHost();
+test("a persisted account-backed provider is read as the local provider, not as a route of its own", async () => {
+  // The route used to special-case a stored "cursor": it declined sendPrompt and
+  // asked the model for nothing. That branch was reachable from a settings file on
+  // disk, and the four host branches that share the same stored value built a
+  // session for a hosted model on an account this build never signs in to. The
+  // stored value is refused at the store now, so the route cannot tell the two
+  // files apart — which is the whole point: a refused provider must not be a
+  // second behaviour, it must not be a behaviour at all.
+  // `settingsMigrations` is written in full so the settings store's migration does
+  // not rewrite the value under the route. Without it this test passes against the
+  // old reader too, and would prove nothing about the refusal.
+  const alreadyMigrated = {
+    settingsMigrations: ["downgrade-persisted-max-fast", "local-inference-provider", "retire-account-backed-inference-provider"],
+  };
+  const asCursor = await loadRouter({ provider: "cursor", extraSettings: alreadyMigrated });
+  const asCustom = await loadRouter({ provider: "custom", extraSettings: alreadyMigrated });
+  const cursorHost = stubbedHost();
+  const customHost = stubbedHost();
   try {
-    const run = await sendPrompt(loaded, host);
+    const cursorRun = await sendPrompt(asCursor, cursorHost);
+    // `providerCalls` reads one global the stub resets on every load and appends to
+    // for the life of the process, so each run is captured as a delta.
+    const consumed = cursorRun.providerCalls.length;
+    const cursorCalls = cursorRun.providerCalls.slice();
+    const customRun = await sendPrompt(asCustom, customHost);
+    const customCalls = customRun.providerCalls.slice(consumed);
 
-    assert.equal(run.dispatched.handled, false, "the cursor provider stopped declining sendPrompt, which is not this route's to change");
-    assert.deepEqual(run.providerCalls, [], "the cursor provider was sent a request it never sent before");
-    assert.deepEqual(host.remote, [], "the cursor provider was asked for a roster it never needed before");
+    assert.deepEqual(
+      cursorCalls.map((call) => call.provider),
+      customCalls.map((call) => call.provider),
+      "a stored account-backed provider still reaches a branch of its own, so the file on disk is still a routing decision",
+    );
+    assert.equal(
+      cursorCalls.some((call) => call.provider === "cursor"),
+      false,
+      "naming a conversation must never reach a provider this build cannot serve",
+    );
+    assert.equal(cursorCalls.length > 0, true, "this comparison would also pass on a route that asked the model for nothing at all");
+    assert.deepEqual(cursorRun.dispatched.handled, customRun.dispatched.handled, "the two files produced different turn handling");
   } finally {
-    await loaded.dispose();
+    await asCursor.dispose();
+    await asCustom.dispose();
   }
 });
 

@@ -9,13 +9,14 @@ import { DEFAULT_SAND_AUTO_REVIEW_INSTRUCTIONS, normalizeSandAutoReviewInstructi
 import { SidebarSections, type SidebarSection } from "../../sidebar-sections.js";
 import { coerceToEnabledTrack, isSandUpdateTrack, type SandUpdateTrack } from "../../update-track.js";
 import { isSandAgentModelSelection, type SandAgentModelSelection } from "../../agents/sand-agent-model.js";
-import { emptySandInferenceRouterUsage, isSandInferenceProvider, normalizeSandInferenceCustomEndpoint, type SandInferenceCustomEndpoint, type SandInferenceProvider, type SandInferenceRouterUsage } from "../../inference-router.js";
+import { emptySandInferenceRouterUsage, isSandInferenceProvider, normalizeSandInferenceCustomEndpoint, resolveServedInferenceProvider, type SandInferenceCustomEndpoint, type SandInferenceProvider, type SandInferenceRouterUsage } from "../../inference-router.js";
 import { DEFAULT_SAND_BOX_RUNTIME, isSandBoxRuntime, type SandBoxRuntime } from "../../box-runtime.js";
 
 export const SETTINGS_VERSION = 1;
 export const SAND_DOWNGRADE_MAX_FAST_MIGRATION_ID = "downgrade-persisted-max-fast";
 export const SAND_LOCAL_INFERENCE_PROVIDER_MIGRATION_ID = "local-inference-provider";
-export const SAND_SETTINGS_MIGRATION_IDS = [SAND_DOWNGRADE_MAX_FAST_MIGRATION_ID, SAND_LOCAL_INFERENCE_PROVIDER_MIGRATION_ID] as const;
+export const SAND_RETIRE_ACCOUNT_BACKED_PROVIDER_MIGRATION_ID = "retire-account-backed-inference-provider";
+export const SAND_SETTINGS_MIGRATION_IDS = [SAND_DOWNGRADE_MAX_FAST_MIGRATION_ID, SAND_LOCAL_INFERENCE_PROVIDER_MIGRATION_ID, SAND_RETIRE_ACCOUNT_BACKED_PROVIDER_MIGRATION_ID] as const;
 
 type StringMap = Record<string, string>;
 type StringListMap = Record<string, string[]>;
@@ -106,6 +107,12 @@ export class SandSettingsStore {
     // migration would have been unreachable on every already-migrated file.
     if (!done.has(SAND_DOWNGRADE_MAX_FAST_MIGRATION_ID)) { pending.push(SAND_DOWNGRADE_MAX_FAST_MIGRATION_ID); next = { ...next, ...(next.agentDefaultModel === undefined ? {} : { agentDefaultModel: downgradePersistedFast(next.agentDefaultModel) }) }; }
     if (!done.has(SAND_LOCAL_INFERENCE_PROVIDER_MIGRATION_ID)) { pending.push(SAND_LOCAL_INFERENCE_PROVIDER_MIGRATION_ID); next = { ...next, inferenceProvider: next.inferenceProvider ?? "custom" }; }
+    // The migration above fills an absent key only, so a file that already named
+    // the account-backed provider kept naming it. Every reader treats that value
+    // as a live routing decision, and the branch it selects builds a session for a
+    // hosted model on an account this build never signs in to. The reader refuses
+    // it either way; this rewrites the file so it stops claiming otherwise.
+    if (!done.has(SAND_RETIRE_ACCOUNT_BACKED_PROVIDER_MIGRATION_ID)) { pending.push(SAND_RETIRE_ACCOUNT_BACKED_PROVIDER_MIGRATION_ID); next = { ...next, inferenceProvider: resolveServedInferenceProvider(next.inferenceProvider) }; }
     if (pending.length === 0) return settings;
     const migrated = { ...next, settingsMigrations: [...settings.settingsMigrations, ...pending] };
     try { this.persist(migrated); } catch {}
@@ -165,9 +172,14 @@ export class SandSettingsStore {
   setLocalToolPermission(value: SandLocalToolPermission): void { this.update((s) => ({ ...s, localToolPermission: value })); }
   // The bundled default is the user's own endpoint. There is no account here to
   // serve the "cursor" provider, so defaulting to it routed every turn into a
-  // provider that can never answer.
-  getInferenceProvider(): SandInferenceProvider { return this.load().inferenceProvider ?? "custom"; }
-  setInferenceProvider(value: SandInferenceProvider): void { this.update((s) => ({ ...s, inferenceProvider: value })); }
+  // provider that can never answer. A file that still names it is refused here
+  // rather than honoured: this reader is the one every routing decision shares
+  // (host turn shell, cursor session factory, inference service, coordinator
+  // router, desktop panel), so a refusal here cannot be bypassed downstream.
+  getInferenceProvider(): SandInferenceProvider { return resolveServedInferenceProvider(this.load().inferenceProvider); }
+  // Refusing on read alone would leave the panel showing a provider the store
+  // never agreed to, so a refused value is not written in the first place.
+  setInferenceProvider(value: SandInferenceProvider): void { const served = resolveServedInferenceProvider(value); this.update((s) => ({ ...s, inferenceProvider: served })); }
   getInferenceCustomEndpoint(): SandInferenceCustomEndpoint | undefined { return this.load().inferenceCustomEndpoint; }
   setInferenceCustomEndpoint(value: SandInferenceCustomEndpoint | undefined): void { this.update((s) => { const { inferenceCustomEndpoint: _old, ...rest } = s; return value === undefined ? rest : { ...rest, inferenceCustomEndpoint: value }; }); }
   getInferenceRouterUsage(): SandInferenceRouterUsage { return this.load().inferenceRouterUsage ?? emptySandInferenceRouterUsage(); }

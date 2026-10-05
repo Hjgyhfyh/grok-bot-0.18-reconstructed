@@ -77,7 +77,23 @@ function resolvePath(path: string, root: string): string {
 
 export async function resolveShellWorkingDirectory(args: { readonly root: string; readonly requested: string }): Promise<{ workingDirectory: string; fellBackToRoot: boolean }> {
   const requested = args.requested.trim();
-  if (requested.length === 0) return { workingDirectory: requested, fellBackToRoot: false };
+  // WHAT CHANGED. An empty request answered with the empty string and claimed
+  // `fellBackToRoot: false`. `shell-core.ts` consumes this value as
+  // `args.workingDirectory || await this.executor.getCwd()`, and `""` is falsy,
+  // so the command silently inherited the PERSISTED shell session directory
+  // instead. `powershell.ts` rewrites that directory after every command from
+  // the snapshot its wrapper writes, so a single `cd` outside the root made
+  // every later call that named no directory run — and be refused by
+  // `createLocalExecPermissionsService.escapes` — somewhere the model never
+  // asked for. That is the "access to my computer drops" the user reported, and
+  // it arrived as a permissions refusal on a command that named no path at all.
+  //
+  // A request that names no directory means the root. That is what the root is
+  // for, and it is not a widening: `containPath` still refuses everything
+  // outside it, `gateway.json` included. `fellBackToRoot` stays `false` because
+  // nothing fell back — reporting `true` would print a "does not exist on this
+  // machine" notice that is not true.
+  if (requested.length === 0) return { workingDirectory: args.root, fellBackToRoot: false };
   const resolved = resolvePath(requested, args.root);
   if (await isDirectory(resolved)) return { workingDirectory: resolved, fellBackToRoot: false };
   return { workingDirectory: args.root, fellBackToRoot: true };

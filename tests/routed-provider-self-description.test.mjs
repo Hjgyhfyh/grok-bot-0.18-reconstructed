@@ -40,6 +40,17 @@ import { build } from "esbuild";
  * completion. Only the composition was broken. These tests prove both halves, so a future trim
  * to the agent prompt cannot be mistaken for this bug again, and so the routed path cannot
  * silently lose its last remaining capability text.
+ *
+ * A third defect sat alongside both of these and was not covered by either test, because both
+ * only ever checked the presence of a name: `buildSandBaseSystemPrompt` was given capability
+ * flags for `mcpTools`, `screenshot`, `fileTransfer` and `subagentManagement` and used them, but
+ * `mcpManagement`, `cloudAgent` and `boxDesktop` existed and went unread. So a turn with no
+ * Cursor account was taught SearchPlugins, AuthenticateMcpServer, Computer, request_box_help and
+ * the whole cloud-agent handoff — and the fallback text blamed the user's team for a tool that
+ * needs an account they never signed into. The `ALWAYS_ON_TOOLS` comment below used to cite that
+ * unconditional teaching as the reason to list two MCP management tools as always present, so
+ * this file enforced the defect as if it were the contract. Both directions are now asserted
+ * instead: present when the turn carries them, absent when it does not.
  */
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -120,7 +131,19 @@ const WIRED_AGENT_TOOLS = new Set([
   "StopSubagent",
 ]);
 
-/** Tools no turn is ever without, so conditioning on the toolset must never silence them. */
+/**
+ * Tools no turn is ever without, so conditioning on the toolset must never silence them.
+ *
+ * SearchPlugins and AuthenticateMcpServer used to sit in this list, and the comment beside them
+ * gave the reason: "it was among the 28 tools the live capture carried, and the 'no connector'
+ * section of the base prompt teaches it unconditionally." Both are MCP *management* tools —
+ * `UNAVAILABLE_TOOL_NAMES` in system-prompt-assembly.ts puts them in the `mcpManagement` family
+ * and declares their names must never reach a prompt whose turn lacks that family — and the base
+ * prompt taught them unconditionally anyway. So the reason was the defect, restated as a
+ * justification, and this list enforced it. They moved to `ACCOUNT_GATED_TOOLS` below, where both
+ * directions are asserted: a wired turn must still be told about them, and a turn with no toolset
+ * to consult must not be.
+ */
 const ALWAYS_ON_TOOLS = [
   "CreateAgent",
   "UpdateAgent",
@@ -133,11 +156,14 @@ const ALWAYS_ON_TOOLS = [
   "ExternalRead",
   "WebSearch",
   "WebFetch",
-  "SearchPlugins",
-  // An MCP management tool, not a per-server MCP call: it was among the 28 tools the live capture
-  // carried, and the "no connector" section of the base prompt teaches it unconditionally.
-  "AuthenticateMcpServer",
 ];
+
+/**
+ * Tools that need a signed-in Cursor account: registered by `mcp.management` only, so absent from
+ * every turn on a host that has none. They are named by the base prompt exactly when the turn's
+ * own toolset carries them.
+ */
+const ACCOUNT_GATED_TOOLS = ["SearchPlugins", "AuthenticateMcpServer"];
 
 /**
  * The optional families, named by hand rather than read out of the product's own list. A test
@@ -281,7 +307,7 @@ async function withSafetyCeiling(body, ceiling = 200) {
 
 test("a fully wired agent is told about every tool its turn actually carries", () => {
   const prompt = assembleMainAgentPrompt();
-  const named = [...ALWAYS_ON_TOOLS, "GetMcpTools", "CallMcpTool"];
+  const named = [...ALWAYS_ON_TOOLS, ...ACCOUNT_GATED_TOOLS, "GetMcpTools", "CallMcpTool"];
   for (const tool of named) {
     assert.ok(
       prompt.includes(tool),
@@ -309,6 +335,17 @@ test("a turn with no toolset to consult is told about no optional family at all"
       prompt.includes(tool),
       false,
       `the prompt named ${tool} for a turn that carries no optional tool, so the model either invents it or denies having tools`,
+    );
+  }
+  // The account-gated pair, same rule, different reason: these are not "optional families" the
+  // user turned off, they are tools that do not exist without a signed-in account. The old prompt
+  // taught the whole plugin section to a turn that had neither, which made the agent apologise
+  // for a feature the user never bought.
+  for (const tool of ACCOUNT_GATED_TOOLS) {
+    assert.equal(
+      prompt.includes(tool),
+      false,
+      `${tool} needs a signed-in account this turn does not have, so naming it teaches the agent to call a tool it cannot call`,
     );
   }
   for (const tool of ALWAYS_ON_TOOLS) {

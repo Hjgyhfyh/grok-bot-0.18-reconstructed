@@ -206,18 +206,35 @@ function getRequiredConversationStartedDate(conversationStartedDate: string | un
   return conversationStartedDate;
 }
 
+/**
+ * The one thing about this tool that is true on every host, said once.
+ *
+ * Search is a Cursor cloud service: `createCursorWebSearchService` reaches it over connect-RPC
+ * with `auth.getAccessToken`. Without a credential every call throws
+ * `SandCredentialsWaitingError`, which `maybeNormalizeExecBoundaryError` already reports as
+ * terminal ("Do not call this tool again. Tell the user it needs an account.").
+ *
+ * So the failure is honest once it happens, and the prompt was not: this description read
+ * "Search the web for up-to-date information about any topic", the model called it, got the
+ * terminal error, and reported to the user that web search was broken. It is not broken and it
+ * will not recover, so the cost of the missing sentence is the agent apologising for a feature
+ * the user never bought. Saying it here, before the first call, is the whole fix.
+ */
+const CREDENTIAL_REQUIRED_NOTE =
+  "\n\nThis tool needs a signed-in account. On a host without one every call fails, retrying never helps, and you should tell the user it needs an account instead of retrying or working around it.";
+
 function getBaseDescription(promptVersion: string, useMinimalHarness: boolean, conversationStartedDate: string | undefined): string {
-  if (useMinimalHarness) return "Search the web for up-to-date information and return snippets and URLs. Prefer this over shell for web searches because shell egress is more restricted.";
+  if (useMinimalHarness) return "Search the web for up-to-date information and return snippets and URLs. Prefer this over shell for web searches because shell egress is more restricted." + CREDENTIAL_REQUIRED_NOTE;
   switch (promptVersion) {
     case "gpt5-codex":
     case "codex-cloud":
-    case "cursor-0226": return "Search web for real-time info on any topic; use for up-to-date facts not in training data, like current events or tech updates. Results include snippets and URLs.";
+    case "cursor-0226": return "Search web for real-time info on any topic; use for up-to-date facts not in training data, like current events or tech updates. Results include snippets and URLs." + CREDENTIAL_REQUIRED_NOTE;
     case "dsv3-1205":
-    case "dsv3-1018": return "Search the web for real-time information about any topic. Use this tool when you need up-to-date information that might not be available in your training data, or when you need to verify facts. The search results will include relevant snippets and URLs from web pages. This is particularly useful for questions about current events, technology updates, or any topic that requires recent information.";
+    case "dsv3-1018": return "Search the web for real-time information about any topic. Use this tool when you need up-to-date information that might not be available in your training data, or when you need to verify facts. The search results will include relevant snippets and URLs from web pages. This is particularly useful for questions about current events, technology updates, or any topic that requires recent information." + CREDENTIAL_REQUIRED_NOTE;
     case "latest":
     case "haiku": {
       const yearGuidance = buildWebSearchYearGuidance(getRequiredConversationStartedDate(conversationStartedDate));
-      return `Search the web for real-time information about any topic. Returns summarized information from search results and relevant URLs.\n\nUse this tool when you need up-to-date information that might not be available or correct in your training data, or when you need to verify facts.\nThis includes queries about:\n- Libraries, frameworks, and tools whose APIs, best practices, or usage instructions are frequently updated. ("How do I run Postgres in a container?")\n- Current events or technology news. ("Which AI model is best for coding?")\n- Informational queries similar to what you might Google ("kubernetes operator for mysql")\n\n${yearGuidance}`;
+      return `Search the web for real-time information about any topic. Returns summarized information from search results and relevant URLs.\n\nUse this tool when you need up-to-date information that might not be available or correct in your training data, or when you need to verify facts.\nThis includes queries about:\n- Libraries, frameworks, and tools whose APIs, best practices, or usage instructions are frequently updated. ("How do I run Postgres in a container?")\n- Current events or technology news. ("Which AI model is best for coding?")\n- Informational queries similar to what you might Google ("kubernetes operator for mysql")\n\n${yearGuidance}${CREDENTIAL_REQUIRED_NOTE}`;
     }
     default: throw new Error(`Unhandled version: ${promptVersion}`);
   }

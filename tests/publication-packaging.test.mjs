@@ -139,9 +139,12 @@ test("Router settings use the trusted backend and display recorded inference usa
   assert.match(preload, /getInferenceRouter: \(\) => edge\("getInferenceRouter"\)/);
   assert.match(preload, /getBoxRuntime: \(\) => edge\("getBoxRuntime"\)/);
   assert.match(preload, /setBoxRuntime: \(mode: string\) => edge\("setBoxRuntime", \{ mode \}\)/);
-  assert.match(mainEdge, /syncHostSettingsToBox\(\{ inferenceProvider: provider \}\)/);
+  // The box and the reply both carry the provider the store agreed to. Forwarding
+  // the requested value would tell the host to use the account-backed provider and
+  // hand the panel back a route no turn ever took.
+  assert.match(mainEdge, /syncHostSettingsToBox\(\{ inferenceProvider: resolveServedInferenceProvider\(provider\) \}\)/);
   assert.match(mainEdge, /invoke\(deps\.settingsStore, "setInferenceProvider", provider\)/);
-  assert.match(mainEdge, /return \{ provider, usage:/);
+  assert.match(mainEdge, /return \{ provider: resolveServedInferenceProvider\(provider\), usage:/);
   assert.match(mainEdge, /invoke\(deps\.boxRecovery, "restartCoordinator"\)/);
   assert.match(mainEdge, /mode === "local-docker"\) await startLocalDockerBox\(settingsPath\); else await stopLocalDockerBox\(\)/);
   assert.match(mainEdge, /setBoxRuntime", mode === "local-docker" \? "remote" : "local-docker"/);

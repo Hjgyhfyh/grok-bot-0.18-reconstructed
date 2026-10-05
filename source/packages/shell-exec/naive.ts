@@ -71,8 +71,58 @@ export class NaiveTerminalExecutor implements TerminalExecutor {
       : resolvedPolicy.policy;
     const child = spawnWithSignal(spawnShell, buildShellCommandArgs(spawnShell, this.options.shellArgs, transformedCommand), {
       env,
+      // WHAT CHANGED. `cwd` was computed on the line above and never handed to
+      // the spawn, so the child inherited this process's own working directory
+      // and every relative path in the command landed somewhere else. The four
+      // sibling executors — `bash.ts`, `zsh.ts`, `zsh-light.ts`,
+      // `powershell.ts` — all pass `cwd` here; this one did not.
+      //
+      // This is not a widening of anything. `cwd` is the directory the caller
+      // already resolved and the permissions service already checked, so
+      // passing it makes the process match the decision that was already made.
+      // Naming it also keeps the macOS seatbelt policy anchored to the directory
+      // the command was approved for instead of to the daemon's.
+      cwd,
       // Use 'ignore' for stdin unless interactive, to prevent background processes from inheriting an open stdin pipe.
       stdio: [pipeStdin ? "pipe" : "ignore", "pipe", "pipe"],
+      // WHAT CHANGED, AND WHY. `windowsVerbatimArguments` was missing, and this
+      // is the one executor that hands the agent's own command string to an
+      // interpreter as the last argv element. Without it Node builds a Windows
+      // command line out of `argv` and escapes the arguments, so the command —
+      // which is full of quotes the agent wrote — was escaped a SECOND time on
+      // its way to `cmd.exe /c`. `cmd.exe` does not understand backslash-escaped
+      // quotes, so it toggled quote state at every `\"` and delivered a
+      // truncated argument to the program.
+      //
+      // Measured on this machine through this executor, before and after, `/c`
+      // identical:
+      //
+      //   `python -c "import sys;print(sys.executable)"` exit 1, Python saw `"import`
+      //                                                     -> exit 0, the real path
+      //   `python -c "print(123)"`                         exit 0, NO OUTPUT AT ALL
+      //                                                     -> exit 0, `123`
+      //
+      // The second is the worst kind of failure: it reported success, printed
+      // nothing, and left the model believing the machine had done nothing.
+      // Both appear in the live agent transcript — `echo %CD% && python -c
+      // "import sys;print(sys.executable)"` printed the right working directory
+      // and then a SyntaxError for `"import` — which is what the user reported as
+      // the agent's access to the computer intermittently dropping. It is
+      // intermittent because it depends on the command: `echo`, `dir`, `mkdir`
+      // and `cd` carry no quotes and are unaffected, while every `python -c`,
+      // `node -e`, `git commit -m "..."` and `powershell -Command "..."` does.
+      //
+      // It is set HERE and not in the shared `spawnWithSignal`, because that is
+      // what the four sibling executors would get too, and it would be wrong for
+      // them: `powershell.ts` passes `-File <script path>` and `bash.ts` /
+      // `zsh.ts` pass `-ilc <script text>`, both of which rely on Node quoting a
+      // path argument. Only this executor's last argument is the raw command line
+      // that an interpreter re-parses for itself.
+      //
+      // It changes only how the agent's own command string is tokenised. The
+      // program, the environment, `cwd` and every path check above it are
+      // untouched, so nothing here widens what a command may reach.
+      ...(process.platform === "win32" ? { windowsVerbatimArguments: true } : {}),
     }, sandboxPolicy, options.signal);
     child.on("spawn", async () => {
       try {

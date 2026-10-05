@@ -110,15 +110,19 @@ test.after(() => {
  * parent, plus the command that runs it.
  *
  * The command is a bare name, and it is put on `PATH` rather than written as a
- * path, for two measured reasons that have nothing to do with process trees.
- * `NaiveTerminalExecutor` computes a working directory and never passes it to
- * `spawn` (`source/packages/shell-exec/naive.ts:66` against `:72`), so nothing
- * in the command may be resolved relative to it. And `buildShellCommandArgs`
- * hands the whole command to `cmd.exe` as one argv element, which Node quotes
- * for the Win32 C runtime — so a `"` in the command arrives at `cmd.exe` as
- * `\"` and is not a quote. A command that has to quote a path cannot be run
- * through this executor at all, which is worth knowing and is not what this
- * file is about. A bare name has neither problem.
+ * path, for one measured reason that has nothing to do with process trees.
+ * `NaiveTerminalExecutor` used to compute a working directory and never pass it
+ * to `spawn` (`source/packages/shell-exec/naive.ts:66` against `:72`), so
+ * nothing in the command could be resolved relative to it. That is fixed — the
+ * executor now hands `cwd` to the spawn like its four siblings do, proven by
+ * `tests/local-exec-working-directory-drift.test.mjs` — and a bare name still
+ * works either way, because `PATH` lookup does not consult the working
+ * directory. What is still true, and the reason the command stays a bare name,
+ * is `buildShellCommandArgs`: it hands the whole command to `cmd.exe` as one
+ * argv element, which Node quotes for the Win32 C runtime — so a `"` in the
+ * command arrives at `cmd.exe` as `\"` and is not a quote. A command that has to
+ * quote a path cannot be run through this executor at all, which is worth
+ * knowing and is not what this file is about. A bare name has neither problem.
  */
 function makeTree(label) {
   const dir = mkdtempSync(path.join(os.tmpdir(), `grok-tree-${label}-`));

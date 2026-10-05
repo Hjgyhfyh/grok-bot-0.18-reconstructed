@@ -222,8 +222,13 @@ test("an existing settings file without the routing key is migrated onto the use
     );
     assert.deepEqual(
       onDisk.settingsMigrations,
-      ["downgrade-persisted-max-fast", "local-inference-provider"],
-      "the migration id must be recorded exactly once so a second load is a no-op",
+      [...store.SAND_SETTINGS_MIGRATION_IDS],
+      "every shipped migration id must be recorded exactly once, in order, so a second load is a no-op",
+    );
+    assert.equal(
+      new Set(onDisk.settingsMigrations).size,
+      onDisk.settingsMigrations.length,
+      "a duplicated id would re-run that migration on every load forever",
     );
     const second = new store.SandSettingsStore(settingsPath);
     assert.equal(second.getInferenceProvider(), "custom", "a migrated store stays on the local provider across reloads");

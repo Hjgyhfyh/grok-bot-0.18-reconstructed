@@ -89,6 +89,45 @@ const ACCOUNT_CARD_ACTION_BEFORE =
   'e[40]!==o||e[41]!==c||e[42]!==V||e[43]!==N||e[44]!==Y?(S=a.jsx(oe,{className:M,disabled:V,onClick:N,shape:"pill",size:"md",style:Y,variant:c,children:o}),e[40]=o,e[41]=c,e[42]=V,e[43]=N,e[44]=Y,e[45]=S):S=e[45];';
 const ACCOUNT_CARD_ACTION_AFTER =
   'e[40]!==r||e[41]!==c||e[42]!==V||e[43]!==N||e[44]!==Y?(S=r?a.jsx(oe,{className:M,disabled:V,onClick:N,shape:"pill",size:"md",style:Y,variant:c,children:o}):null,e[40]=r,e[41]=c,e[42]=V,e[43]=N,e[44]=Y,e[45]=S):S=e[45];';
+// The same door, left open in the app shell. Four patches had already removed every Cursor
+// sign-in from the Settings surfaces, and the one that is actually on screen all day — the
+// account menu behind the chip in the agents sidebar footer — was never looked at.
+//
+// `Rct` is that chip and it is mounted twice (agents sidebar, onboarding sidebar preview);
+// it renders `Xln`, which builds the menu. One item of it was decided by three lines:
+//
+//   P = s === "logged-in"
+//   J = s === "logged-out" && r && !i
+//   fe = J ? <Item onSelect={o}>Sign in</Item> : null
+//
+// where `s` is `authStatus` = `cursorAuth.status.kind`, `r` is `isLoaded`, `i` is
+// `isPending`, and `o` is `onSignIn`. `Rct` hands `Xln` `() => { t.login() }` as `onSignIn`,
+// and the store's `login` is `login: () => x(() => n.loginCursor(), !0)` — a real browser
+// OAuth against Cursor, the same handler `patchOriginalAccountCardSignIn` just removed from
+// the account card one chunk over.
+//
+// The gate does not save it, and this is measured rather than assumed: the store's initial
+// state is the module constant `a$n = {kind:"logged-out"}`, and `l$n` writes `isLoaded:!0`
+// on BOTH settle paths — the one where `getCursorAuthStatus()` resolves and the one where
+// it rejects. So `J` is true from the first settled frame of every launch, signed out,
+// which is the only state this build is ever in. The chip above the menu reads "Local" and
+// the Settings row reads "Using your own endpoint" after the patches above; a "Sign in"
+// item opening a Cursor OAuth sits directly under both.
+//
+// It is the same lie the account card button was, by the recorded reasoning in
+// `ACCOUNT_CARD_LABEL_BEFORE` above: `no-cursor-provider` gives `RRouterProviders` no
+// `cursor` entry, so the Router panel offers claude-code, codex, openrouter and custom and
+// nothing routes through the account this button would buy. Clicking it changes the account
+// slot and buys a session nothing here can spend a token against.
+//
+// The branch is deleted rather than reworded, for the reason the composer patch gives: a
+// deleted branch cannot grow new copy back, and no sentence is invented here. `J` and `o`
+// stay bound and the memo slots 56-58 keep their indices, so no other `e[n]` shifts. The
+// sibling "Log out" item is left exactly as it is — it is gated on `P`, it is the only item
+// in this menu that must survive a signed-in user, and `onLogOut` still works.
+const ACCOUNT_MENU_SIGN_IN_BEFORE =
+  'fe=J?p.jsx(It.Section,{children:p.jsx(It.Item,{leading:p.jsx(bt,{name:"arrow-bracket-to-right",size:"base"}),onSelect:o,children:"Sign in"})}):null';
+const ACCOUNT_MENU_SIGN_IN_AFTER = "fe=null";
 // The chat composer still told the user to sign in before they were allowed to
 // type. Its resting placeholder had four states and the signed-out one was the
 // only instruction left on the first screen of the app:
@@ -315,6 +354,23 @@ export function patchOriginalAccountSlot(source) {
   return replaceExactlyOnce(source, ACCOUNT_SLOT_BEFORE, ACCOUNT_SLOT_AFTER, "account slot");
 }
 
+/**
+ * Takes the account menu's "Sign in" item out of the app shell.
+ *
+ * This is the fifth door to the same Cursor sign-in and the only one left in the shell
+ * itself, under a chip the same patch set relabelled "Local". It is not a dead branch:
+ * `a$n = {kind:"logged-out"}` is the store's initial state and `isLoaded` becomes true on
+ * both settle paths, so `J = s==="logged-out" && r && !i` is true on every launch of this
+ * build. Clicking it called `t.login()`, which is `desktop.loginCursor()` — a real browser
+ * OAuth for an account `no-cursor-provider` deliberately offers no route for.
+ *
+ * The anchor is a single `replaceExactlyOnce`, so an upstream chunk that moved or
+ * duplicated the item fails the build here instead of quietly shipping the button back.
+ */
+export function patchOriginalAccountMenuSignIn(source) {
+  return replaceExactlyOnce(source, ACCOUNT_MENU_SIGN_IN_BEFORE, ACCOUNT_MENU_SIGN_IN_AFTER, "account menu sign-in");
+}
+
 export function patchOriginalThreadSurfaces(source) {
   let patched = replaceExactlyOnce(source, ORPHANED_BRANCH_BEFORE, ORPHANED_BRANCH_AFTER, "orphaned branch entry");
   patched = replaceExactlyOnce(patched, THREAD_CLOSE_BEFORE, THREAD_CLOSE_AFTER, "open-thread close guard");
@@ -362,7 +418,7 @@ export async function applyOriginalRendererRouterPatch({ stageRoot }) {
   }
   const changes = [];
   for (const [role, candidate, transforms] of [
-    ["registry", registryCandidates[0], [patchOriginalSettingsRegistry, patchOriginalSignInGate, patchOriginalAccountSlot, patchOriginalThreadSurfaces]],
+    ["registry", registryCandidates[0], [patchOriginalSettingsRegistry, patchOriginalSignInGate, patchOriginalAccountSlot, patchOriginalAccountMenuSignIn, patchOriginalThreadSurfaces]],
     ["panel", panelCandidates[0], [patchOriginalSettingsPanel, patchOriginalAccountRow, patchOriginalAccountCardSignIn]],
   ]) {
     const patched = transforms.reduce((source, transform) => transform(source), candidate.source);
@@ -378,8 +434,8 @@ export async function applyOriginalRendererRouterPatch({ stageRoot }) {
     schemaVersion: 1,
     mode: "original-renderer-settings-extension",
     chunks: changes,
-    features: ["settings-router-provider", "settings-local-docker-vm", "usage-current-provider", "skip-signin-gate", "shell-during-boot-check", "no-account-nag", "local-roster-without-account", "endpoint-model-picker", "no-cursor-provider", "thread-orphan-stays-visible", "thread-survives-off-window-root", "agent-instructions-field", "composer-needs-no-cursor-signin", "account-card-needs-no-cursor-signin"],
-    transformations: ["settings-registry", "router-panel", "usage-panel", "component-source-injection", "signin-gate", "boot-check-gate", "account-chip-label", "account-row-label", "account-slot", "orphaned-branch-entry", "open-thread-close-guard", "agent-instructions-component-injection", "agent-instructions-field", "composer-placeholder", "account-card-label", "account-card-action"],
+    features: ["settings-router-provider", "settings-local-docker-vm", "usage-current-provider", "skip-signin-gate", "shell-during-boot-check", "no-account-nag", "local-roster-without-account", "endpoint-model-picker", "no-cursor-provider", "thread-orphan-stays-visible", "thread-survives-off-window-root", "agent-instructions-field", "composer-needs-no-cursor-signin", "account-card-needs-no-cursor-signin", "account-menu-needs-no-cursor-signin"],
+    transformations: ["settings-registry", "router-panel", "usage-panel", "component-source-injection", "signin-gate", "boot-check-gate", "account-chip-label", "account-row-label", "account-slot", "orphaned-branch-entry", "open-thread-close-guard", "agent-instructions-component-injection", "agent-instructions-field", "composer-placeholder", "account-card-label", "account-card-action", "account-menu-sign-in"],
   };
   const provenancePath = path.join(stageRoot, "dist", "renderer-router-extension.json");
   await writeFile(provenancePath, `${JSON.stringify(record, null, 2)}\n`);

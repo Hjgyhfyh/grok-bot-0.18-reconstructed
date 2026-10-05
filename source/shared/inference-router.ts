@@ -1,6 +1,23 @@
 export const SAND_INFERENCE_PROVIDERS = ["cursor", "claude-code", "codex", "openrouter", "custom"] as const;
 export type SandInferenceProvider = (typeof SAND_INFERENCE_PROVIDERS)[number];
 
+/**
+ * The one member of `SAND_INFERENCE_PROVIDERS` this build cannot serve. It is kept
+ * in the enum rather than deleted so a settings file written by an earlier build
+ * still parses against the same schema, but keeping it in the enum is not keeping
+ * it selectable: every routing decision goes through `resolveServedInferenceProvider`,
+ * which refuses it. Deleting the member instead would quietly turn the two
+ * `Exclude<SandInferenceProvider, "cursor">` guards into the full union and lose
+ * the compile-time proof, with no compiler signal to say so.
+ */
+export const SAND_ACCOUNT_BACKED_INFERENCE_PROVIDER = "cursor";
+
+/** Where a refused provider lands: the user's own OpenAI-compatible endpoint. */
+export const SAND_FALLBACK_INFERENCE_PROVIDER = "custom";
+
+/** The providers a turn may actually be routed to. */
+export type ServedSandInferenceProvider = Exclude<SandInferenceProvider, typeof SAND_ACCOUNT_BACKED_INFERENCE_PROVIDER>;
+
 /** A user-owned OpenAI-compatible inference endpoint. Never carries credentials; the API key lives in the OS secret store. */
 export interface SandInferenceCustomEndpoint {
   readonly baseUrl: string;
@@ -25,6 +42,24 @@ export interface SandInferenceRouterUsage {
 
 export function isSandInferenceProvider(value: unknown): value is SandInferenceProvider {
   return typeof value === "string" && (SAND_INFERENCE_PROVIDERS as readonly string[]).includes(value);
+}
+
+/** True only for a provider this build can actually answer a turn with. */
+export function isServedSandInferenceProvider(value: unknown): value is ServedSandInferenceProvider {
+  return isSandInferenceProvider(value) && value !== SAND_ACCOUNT_BACKED_INFERENCE_PROVIDER;
+}
+
+/**
+ * The single place a provider value becomes a routing decision. An unknown value,
+ * an absent value and the account-backed provider all land on the user's own
+ * endpoint, because every reader of the stored setting shares this function: the
+ * host turn shell, the cursor session factory, the inference service, the
+ * coordinator's routed router and the desktop panel. A provider that cannot be
+ * served must never survive as a value, or the branch that builds an
+ * account-backed session stays reachable from a file on disk.
+ */
+export function resolveServedInferenceProvider(value: unknown): ServedSandInferenceProvider {
+  return isServedSandInferenceProvider(value) ? value : SAND_FALLBACK_INFERENCE_PROVIDER;
 }
 
 export function isSandInferenceCustomEndpoint(value: unknown): value is SandInferenceCustomEndpoint {

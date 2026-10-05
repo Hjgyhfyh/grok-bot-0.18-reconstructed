@@ -17,6 +17,24 @@ export class SandCredentialsWaitingError extends Error {
 
 export const EXPIRY_LEEWAY_MS = 30_000;
 export const SAND_SHORTLIVED_CREDS_WAITING_MESSAGE = "Waiting for an inference credential. Grok Bot's computer renews this automatically (no desktop required); this resolves on its own shortly.";
+/**
+ * What the host says when no renewal credential was ever delivered into the box.
+ *
+ * `SAND_SHORTLIVED_CREDS_WAITING_MESSAGE` is only true on the branch that can act: with a
+ * renewal credential the renewer really does keep retrying, so "renews this automatically"
+ * and "resolves on its own shortly" describe what happens. Without one the renewer has
+ * nothing to renew from -- `getAccessToken` below skips `requestImmediateRenewal` entirely
+ * and throws -- so the same sentence promises a self-healing that can never happen, and the
+ * host already says so in the log line it writes at startup ("inference is unavailable until
+ * the box is re-provisioned with one"). The throw contradicted the service's own log.
+ *
+ * Both messages keep the opening phrase `Waiting for an inference credential` on purpose:
+ * `packages/agent/tools/core/connect-error.ts` matches that exact text to recognise the
+ * condition at the tool boundary and replace it with the terminal "needs an account"
+ * answer. Rewording it here would silently restore the `default:` branch, which hands the
+ * model "Tool failed; this may be temporary. Try again."
+ */
+export const SAND_NO_RENEWAL_CREDENTIAL_MESSAGE = "Waiting for an inference credential. This box was never given one to renew from, so it will not arrive on its own; inference is unavailable until the box is re-provisioned.";
 
 export class InferenceCredentialStore {
   private credential: InferenceCredential | undefined;
@@ -84,7 +102,7 @@ export function createHostAuthService(options: {
         const renewed = await renewer.requestImmediateRenewal();
         if (renewed) token = store.getValidAccessToken();
       }
-      if (token === null) throw new SandCredentialsWaitingError(SAND_SHORTLIVED_CREDS_WAITING_MESSAGE);
+      if (token === null) throw new SandCredentialsWaitingError(hasRenewalCredential ? SAND_SHORTLIVED_CREDS_WAITING_MESSAGE : SAND_NO_RENEWAL_CREDENTIAL_MESSAGE);
       return token;
     },
     peekAccessToken: () => store.getValidAccessToken(),

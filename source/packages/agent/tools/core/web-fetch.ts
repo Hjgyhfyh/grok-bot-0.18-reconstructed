@@ -69,10 +69,22 @@ function localNetworkRejection(url: URL): string | undefined {
   return undefined;
 }
 
-function description(promptVersion: string, minimal: boolean): string {
-  if (minimal) return "Fetch content from a URL and return it as readable markdown. Prefer this over shell for web content because shell egress is more restricted.";
-  return `Fetch content from a specified URL and return its contents in a readable markdown format. Use this tool when you need to retrieve and analyze webpage content.
+/**
+ * The one thing about this tool that is true on every host, said once.
+ *
+ * Fetch is a Cursor cloud service: `createCursorWebFetchService` reaches it over connect-RPC
+ * with `auth.getAccessToken`. Without a credential every call throws `SandCredentialsWaitingError`,
+ * which `maybeNormalizeExecBoundaryError` already reports as terminal. The description below
+ * promised a working fetcher and never mentioned that, so the model called it, failed, and told
+ * the user it was broken.
+ */
+const CREDENTIAL_REQUIRED_NOTE =
+  "\n- This tool needs a signed-in account. On a host without one every call fails, retrying never helps, and you should tell the user it needs an account instead of retrying or working around it.\n";
 
+function description(promptVersion: string, minimal: boolean): string {
+  if (minimal) return "Fetch content from a URL and return it as readable markdown. Prefer this over shell for web content because shell egress is more restricted." + CREDENTIAL_REQUIRED_NOTE;
+  return `Fetch content from a specified URL and return its contents in a readable markdown format. Use this tool when you need to retrieve and analyze webpage content.
+${CREDENTIAL_REQUIRED_NOTE}
 - The URL must be a fully-formed, valid URL.
 - This tool is read-only and will not work for requests intended to have side effects.
 - This fetch tries to return live results but may return previously cached content.

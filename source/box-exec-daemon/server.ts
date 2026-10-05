@@ -15,6 +15,7 @@ import {
   isWindowsCommandInterpreter,
   readEnvName,
 } from "../packages/shell-exec/shell-env.js";
+import { createShellOutputDecoder, resolveConsoleCodePageLabel } from "./shell-output-text.js";
 import { ControlService } from "../packages/proto/generated/agent/v1/control_service_connect.js";
 import { ExecService } from "../packages/proto/generated/agent/v1/exec_service_connect.js";
 import {
@@ -570,9 +571,16 @@ class BoxExecRuntime {
   /** Starts in flight, so two concurrent listings cannot spawn the same server twice. */
   readonly #mcpStarting = new Map<string, Promise<LiveMcpServer>>();
   #nextShellId = 1;
+  /**
+   * The code page this box's command interpreter writes in, resolved once at
+   * startup. `undefined` means the probe did not answer, and the output decoder
+   * then behaves exactly as the shipped one did.
+   */
+  readonly #consoleCodePageLabel: string | undefined;
 
-  constructor(readonly workspaceRoot: string, readonly terminalsDirectory: string, environment: NodeJS.ProcessEnv) {
+  constructor(readonly workspaceRoot: string, readonly terminalsDirectory: string, environment: NodeJS.ProcessEnv, consoleCodePageLabel?: string) {
     this.#environment = { ...environment };
+    this.#consoleCodePageLabel = consoleCodePageLabel;
   }
 
   applyEnvironment(request: UpdateEnvironmentVariablesRequest): { applied: number; removed: number } {
@@ -745,10 +753,27 @@ class BoxExecRuntime {
     // ends the daemon's own stream instead of answering it.
     let startFailure: string | undefined;
     const notify = () => { wake?.(); wake = undefined; };
-    child.stdout.on("data", data => { events.push({ case: "stdout", data: String(data) }); notify(); });
-    child.stderr.on("data", data => { events.push({ case: "stderr", data: String(data) }); notify(); });
+    // One decoder per channel: the UTF-8-or-legacy decision is a property of the
+    // stream, not of a chunk. See `shell-output-text.ts` for why `String(data)`
+    // made every Russian system message unreadable.
+    const stdoutDecoder = createShellOutputDecoder(this.#consoleCodePageLabel);
+    const stderrDecoder = createShellOutputDecoder(this.#consoleCodePageLabel);
+    child.stdout.on("data", data => { events.push({ case: "stdout", data: stdoutDecoder.push(data) }); notify(); });
+    child.stderr.on("data", data => { events.push({ case: "stderr", data: stderrDecoder.push(data) }); notify(); });
     child.once("error", error => { startFailure = describeShellInterpreterFailure(error, interpreter); notify(); });
-    child.once("close", (code, childSignal) => { exitCode = code ?? 1; exitSignal = childSignal ?? ""; done = true; notify(); });
+    child.once("close", (code, childSignal) => {
+      exitCode = code ?? 1;
+      exitSignal = childSignal ?? "";
+      // The character a stream ended in the middle of is flushed here. It used to
+      // be lost silently because the whole output was one `String(data)` that the
+      // consumer concatenated, so a split character simply never appeared.
+      for (const [channel, decoder] of [["stdout", stdoutDecoder], ["stderr", stderrDecoder]] as const) {
+        const rest = decoder.flush();
+        if (rest.length > 0) events.push({ case: channel, data: rest });
+      }
+      done = true;
+      notify();
+    });
     const abort = () => this.kill(child);
     signal.addEventListener("abort", abort, { once: true });
     let timer: NodeJS.Timeout | undefined;
@@ -1178,6 +1203,28 @@ class BoxExecRuntime {
    * The program is returned next to the child because a spawn failure arrives
    * asynchronously on the child's `error` event, long after this call has
    * returned; only the name that was actually asked for can explain it.
+   *
+   * WHAT CHANGED, AND WHY. `windowsVerbatimArguments` was missing. Without it
+   * Node builds a Windows command line out of `argv` and escapes the arguments,
+   * and the command string — which is full of quotes the agent wrote — was
+   * escaped a second time on its way to `cmd.exe /c`. Measured on this machine,
+   * before and after, with `/c` identical:
+   *
+   *   `python -c "print(123)"`          exit 0, no output at all
+   *                                    -> exit 0, `123`
+   *   `python -c "import sys;print(1+1)"` exit 1, Python saw `"import`
+   *                                    -> exit 0, `2`
+   *   `echo "q1" > z1.txt`             wrote `\"q1\"`
+   *                                    -> wrote `"q1"`
+   *
+   * The first of those is the worst kind of failure: it reported success, printed
+   * nothing, and left the model believing the machine had done nothing. All three
+   * appear in one user session's transcript journal — 18 Python SyntaxErrors and
+   * 7 silently empty successes out of 154 shell calls.
+   *
+   * It changes only how the agent's own command string is tokenised. The program,
+   * the environment, the working directory and every path check above it are
+   * untouched, so nothing here widens what a command may reach.
    */
   private spawnShell(command: string, cwd: string): { child: ChildProcessWithoutNullStreams; interpreter: string } {
     const invocation = resolveShellInvocation(process.platform, command, this.#environment);
@@ -1189,6 +1236,7 @@ class BoxExecRuntime {
         detached: process.platform !== "win32",
         stdio: "pipe",
         windowsHide: true,
+        ...(process.platform === "win32" ? { windowsVerbatimArguments: true } : {}),
       }),
     };
   }
@@ -1208,8 +1256,10 @@ class BoxExecRuntime {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
-    child.stdout.on("data", data => { stdout += String(data); });
-    child.stderr.on("data", data => { stderr += String(data); });
+    const stdoutDecoder = createShellOutputDecoder(this.#consoleCodePageLabel);
+    const stderrDecoder = createShellOutputDecoder(this.#consoleCodePageLabel);
+    child.stdout.on("data", data => { stdout += stdoutDecoder.push(data); });
+    child.stderr.on("data", data => { stderr += stderrDecoder.push(data); });
     const abort = () => this.kill(child);
     signal.addEventListener("abort", abort, { once: true });
     const timer = timeoutMs == null ? undefined : setTimeout(() => { timedOut = true; this.kill(child); }, timeoutMs);
@@ -1218,7 +1268,7 @@ class BoxExecRuntime {
         child.once("error", error => reject(new Error(describeShellInterpreterFailure(error, interpreter))));
         child.once("close", (code, childSignal) => resolve({ code: code ?? 1, signal: childSignal ?? "" }));
       });
-      return { ...outcome, stdout, stderr, elapsedMs: Date.now() - startedAt, timedOut, aborted: signal.aborted };
+      return { ...outcome, stdout: stdout + stdoutDecoder.flush(), stderr: stderr + stderrDecoder.flush(), elapsedMs: Date.now() - startedAt, timedOut, aborted: signal.aborted };
     } finally {
       if (timer != null) clearTimeout(timer);
       signal.removeEventListener("abort", abort);
@@ -1246,7 +1296,7 @@ export async function startBoxExecDaemon(options: BoxExecDaemonOptions): Promise
   await stat(workspaceRoot).then(info => {
     if (!info.isDirectory()) throw new Error(`workspaceRoot is not a directory: ${workspaceRoot}`);
   });
-  const runtime = new BoxExecRuntime(workspaceRoot, terminalsDirectory, options.environment ?? process.env);
+  const runtime = new BoxExecRuntime(workspaceRoot, terminalsDirectory, options.environment ?? process.env, await resolveConsoleCodePageLabel(options.environment ?? process.env));
   const adapter = connectNodeAdapter({
     routes(router) {
       router.service(BoxControlService, {

@@ -215,6 +215,31 @@ function getToolName(promptVersion: string): string {
   }
 }
 
+/**
+ * The one thing about this tool that is true on every host, said once.
+ *
+ * Image generation is a Cursor cloud service: `createSandGenerateImageService` reaches
+ * `AiService.RunGenerateImage` over connect-RPC at `https://api2.cursor.sh` with a Cursor bearer
+ * token. Without a credential every call throws, the way `maybeNormalizeExecBoundaryError` already
+ * reports as terminal.
+ *
+ * The routed local endpoint cannot stand in for it. `createCursorInferencePromptSession` checks the
+ * configured provider before it builds a client (`cursor-inference.ts:189-190`), and every routed
+ * branch in `provider-session.ts` builds `createOpenAI(...).chat(...)` — text. Nothing in the routed
+ * path constructs an image model, so `inferenceProvider: "custom"` changes who answers the chat and
+ * does nothing for this tool.
+ *
+ * So the failure is honest once it happens and the description was not: it described aspect ratios
+ * and reference images and said nothing about the account, so the cost of the missing sentence is
+ * the agent retrying a call that cannot answer. Saying it here, before the first call, is the fix.
+ *
+ * The second thing true on every host is that no production toolset provider supplies
+ * `createGenerateImageToolInputs`, so this description is not currently read by any turn. It is
+ * still the contract: the day the hook is filled in, this is the sentence the model gets first.
+ */
+const CREDENTIAL_REQUIRED_NOTE =
+  "\n\nThis tool needs a signed-in account. Image generation runs on Cursor's cloud and the local inference endpoint cannot produce images, so on a host without an account every call fails, retrying never helps, and you should tell the user it needs an account instead of retrying or working around it.";
+
 function getDescription(promptVersion: string): string {
   switch (promptVersion) {
     case "cursor-0226":
@@ -235,6 +260,7 @@ General guidelines:
 - If the user requests an aspect ratio, set \`aspect_ratio\` to one of "1:1", "4:3", "3:4", "16:9", or "9:16".
 - If the user provides reference images, include them in \`reference_image_paths\`.
 - Do not repeat generated images as Markdown in your response; the client displays tool-generated images automatically.
+${CREDENTIAL_REQUIRED_NOTE}
 `;
     default: throw new Error(`Unhandled version: ${promptVersion}`);
   }
