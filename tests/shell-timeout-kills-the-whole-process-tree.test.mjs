@@ -8,6 +8,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { build } from "esbuild";
 
+// The baseline these tests read the defect from. It is a fixed commit, not HEAD:
+// reading HEAD only proves anything while the fix is uncommitted, and once it is
+// committed HEAD holds the fixed code and every falsification inverts.
+const DEFECT_BASELINE = "18fe9fc";
+
+
 // A shell that was cancelled left its descendants running on the user's machine.
 //
 // Every command the agent runs goes through `cmd.exe /c <command>`, so `python`
@@ -249,7 +255,7 @@ test("the same command on git HEAD leaves the grandchild running, which is what 
   for (const key of Object.keys(gitEnv)) if (/^GIT_CONFIG_COUNT$/i.test(key)) delete gitEnv[key];
   let headSource;
   try {
-    headSource = execFileSync("git", ["show", "HEAD:source/packages/local-exec/shell-core.ts"], {
+    headSource = execFileSync("git", ["show", `${DEFECT_BASELINE}:source/packages/local-exec/shell-core.ts`], {
       cwd: repoRoot,
       env: gitEnv,
       encoding: "utf8",

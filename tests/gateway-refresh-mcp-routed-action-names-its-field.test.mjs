@@ -8,6 +8,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { build } from "esbuild";
 
+// The baseline these tests read the defect from. It is a fixed commit, not HEAD:
+// reading HEAD only proves anything while the fix is uncommitted, and once it is
+// committed HEAD holds the fixed code and every falsification inverts.
+const DEFECT_BASELINE = "18fe9fc";
+
+
 /**
  * A misspelled `routedAction` reloaded every MCP server and answered `200`.
  *
@@ -72,7 +78,7 @@ const headApiPlugin = {
       // inherit it. See the session rule: `Remove-Item env:GIT_CONFIG_COUNT`.
       const env = { ...process.env };
       delete env.GIT_CONFIG_COUNT;
-      const contents = execFileSync("git", ["show", `HEAD:${relative}`], {
+      const contents = execFileSync("git", ["show", `${DEFECT_BASELINE}:${relative}`], {
         cwd: repoRoot,
         encoding: "utf8",
         env,

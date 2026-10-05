@@ -8,6 +8,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { build } from "esbuild";
 
+// The baseline these tests read the defect from. It is a fixed commit, not HEAD:
+// reading HEAD only proves anything while the fix is uncommitted, and once it is
+// committed HEAD holds the fixed code and every falsification inverts.
+const DEFECT_BASELINE = "18fe9fc";
+
+
 /**
  * The shell tool described a command language, and it was not the one the
  * commands were written in.
@@ -68,7 +74,7 @@ function promptPlugin({ fromGitHead }) {
           const relative = path.relative(repoRoot, args.path).split(path.sep).join("/");
           const env = { ...process.env };
           delete env.GIT_CONFIG_COUNT;
-          const contents = execFileSync("git", ["show", `HEAD:${relative}`], {
+          const contents = execFileSync("git", ["show", `${DEFECT_BASELINE}:${relative}`], {
             cwd: repoRoot,
             encoding: "utf8",
             env,

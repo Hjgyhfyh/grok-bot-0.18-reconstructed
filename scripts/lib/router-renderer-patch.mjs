@@ -276,7 +276,7 @@ export async function applyOriginalRendererRouterPatch({ stageRoot }) {
   }
   const changes = [];
   for (const [role, candidate, transforms] of [
-    ["registry", registryCandidates[0], [patchOriginalSettingsRegistry, patchOriginalSignInGate, patchOriginalAccountSlot, patchOriginalThreadSurfaces, patchOriginalAgentInstructionsField]],
+    ["registry", registryCandidates[0], [patchOriginalSettingsRegistry, patchOriginalSignInGate, patchOriginalAccountSlot, patchOriginalThreadSurfaces]],
     ["panel", panelCandidates[0], [patchOriginalSettingsPanel, patchOriginalAccountRow]],
   ]) {
     const patched = transforms.reduce((source, transform) => transform(source), candidate.source);

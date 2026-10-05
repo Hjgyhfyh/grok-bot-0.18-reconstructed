@@ -8,6 +8,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { build } from "esbuild";
 
+// The baseline these tests read the defect from. It is a fixed commit, not HEAD:
+// reading HEAD only proves anything while the fix is uncommitted, and once it is
+// committed HEAD holds the fixed code and every falsification inverts.
+const DEFECT_BASELINE = "18fe9fc";
+
+
 /**
  * A question the user was never shown, and no way left to find it.
  *
@@ -78,7 +84,7 @@ function gitHeadPlugin() {
   const atHead = new Map(
     OWNED_FILES.map((file) => [
       path.join(repoRoot, ...file.split("/")),
-      git(["show", `HEAD:${file}`]),
+      git(["show", `${DEFECT_BASELINE}:${file}`]),
     ]),
   );
   return {
