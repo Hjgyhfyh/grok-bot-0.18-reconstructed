@@ -4,6 +4,7 @@ import {
   parseCoordinatorTranscriptWindowRequest,
 } from "../shared/rpc/coordinator.js";
 import { errorLogTag } from "../shared/errors.js";
+import { SandGatewayRequestError } from "./gateway-server.js";
 
 export const HOST_CAPABILITIES = [
   "orderedReplicasV1",
@@ -72,7 +73,31 @@ function method(api: DynamicGatewayApi, name: string): DynamicMethod {
 }
 
 /**
- * A request field that must arrive as a non-empty string.
+ * A refusal the gateway raises for itself, before any extension is reached.
+ *
+ * `SandGatewayRequestError` is the class `statusForCommandError` answers `400`:
+ * the request arrived, the host read it, and the host is declining it. That is
+ * one fact, and every refusal below is an instance of it. Measured on a live
+ * box, all of these used to answer `500` while naming the command and the field
+ * correctly — the message was right and the status said the server broke:
+ *
+ *   `POST /api/deleteAgent {}`            500  "Malformed deleteAgent request: \"id\" must be a non-empty string."
+ *   `POST /api/searchAgents {}`           500  "Malformed searchAgents request: \"query\" must be a string, and undefined arrived."
+ *   `POST /api/connectChannel {}`         500  "Malformed connectChannel request: \"platform\" must be a non-empty string."
+ *   `POST /api/setBoxSecrets {}`          500  "Malformed setBoxSecrets request: \"secrets\" must be an object, and undefined arrived."
+ *   `POST /api/executeRoutedMcpTool {}`   500  "Malformed executeRoutedMcpTool request: \"name\" must be a string, and undefined arrived."
+ *   `POST /api/deleteAgents {"ids":"x"}`  500  "Malformed deleteAgents request: \"ids\" must be an array, and string arrived."
+ *   `POST /api/deleteAgent {"id":`        400  "Malformed deleteAgent request: the body is not valid JSON."
+ *
+ * The last line is the same mistake on the same endpoint, already answered with
+ * a status that blames the caller. The checks existed; the status did not.
+ */
+function malformed(command: string, detail: string): SandGatewayRequestError {
+  return new SandGatewayRequestError(`Malformed ${command} request: ${detail}`);
+}
+
+/**
+ * A request field that must arrive as a string.
  *
  * These commands read their arguments deep inside the extension, past the
  * gateway edge, where a missing string arrives as `undefined` and the first
@@ -89,8 +114,9 @@ function method(api: DynamicGatewayApi, name: string): DynamicMethod {
 function requireText(args: unknown, field: string, command: string): string {
   const value = (args as Record<string, unknown> | null | undefined)?.[field];
   if (typeof value !== "string") {
-    throw new Error(
-      `Malformed ${command} request: "${field}" must be a string, and ${typeof value} arrived.`,
+    throw malformed(
+      command,
+      `"${field}" must be a string, and ${arrivalType(value)} arrived.`,
     );
   }
   return value;
@@ -100,11 +126,78 @@ function requireText(args: unknown, field: string, command: string): string {
 function requirePath(args: unknown, field: string, command: string): string {
   const value = (args as unknown as Record<string, unknown> | null | undefined)?.[field];
   if (typeof value !== "string" || value.length === 0) {
-    throw new Error(
-      `Malformed ${command} request: "${field}" must be a non-empty string.`,
-    );
+    throw malformed(command, `"${field}" must be a non-empty string.`);
   }
   return value;
+}
+
+/**
+ * A request field that must arrive as a plain object, not an array.
+ *
+ * `createAgentWorkflow` and `updateAgentWorkflow` read `spec.trigger` and
+ * `spec.name` on their first line. Measured on a live box,
+ * `POST /api/createAgentWorkflow {"id":"…"}` answered
+ * `500 {"error":"Cannot read properties of undefined (reading 'trigger')"}` and
+ * `POST /api/updateAgentWorkflow {"id":"…"}` answered the same for `name` — the
+ * shape of the payload was the fault and the answer never said so.
+ */
+function requireObject(args: unknown, field: string, command: string): Record<string, unknown> {
+  const value = (args as Record<string, unknown> | null | undefined)?.[field];
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw malformed(command, `"${field}" must be an object, and ${arrivalType(value)} arrived.`);
+  }
+  return value as Record<string, unknown>;
+}
+
+/**
+ * A request field that may be absent, but must be a finite number when present.
+ *
+ * `getAgentTranscriptWindow` parses `beforeSeq` and `limit` in
+ * `parseCoordinatorTranscriptWindowRequest` and refuses the whole request when
+ * either one is a non-number, so a missing field is what that parser is for. The
+ * message it produced — `Malformed getAgentTranscriptWindow request` — named
+ * neither field, and a caller with three of them in hand cannot tell which one
+ * to fix.
+ */
+function requireOptionalNumber(args: unknown, field: string, command: string): void {
+  const value = (args as Record<string, unknown> | null | undefined)?.[field];
+  if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value))) {
+    throw malformed(command, `"${field}" must be a finite number when present, and ${arrivalType(value)} arrived.`);
+  }
+}
+
+/**
+ * Every field a command cannot answer without, named in one refusal.
+ *
+ * A first-field-wins message is worse on two counts. A caller holding `{}` for a
+ * three-field command is told one name and has to guess the rest, so the cost of
+ * a wrong guess is another round trip; and the order the checks happen to be
+ * written in quietly becomes a contract that no caller should depend on. One
+ * sentence naming all of them is one round trip, and it is the same sentence
+ * whichever field happens to be checked first.
+ *
+ * `allowEmpty` keeps a field that may legitimately be `""` — a channel token is
+ * read for emptiness later, while a platform name is not.
+ */
+function requireFields(
+  args: unknown,
+  command: string,
+  fields: readonly { field: string; allowEmpty?: boolean }[],
+): void {
+  const record = args as Record<string, unknown> | null | undefined;
+  const missing = fields.filter(
+    ({ field, allowEmpty }) =>
+      typeof record?.[field] !== "string" || (!allowEmpty && record[field] === ""),
+  );
+  if (missing.length === 0) return;
+  const names = missing.map(({ field }) => `"${field}"`);
+  const list = names.length === 2 ? `${names[0]} and ${names[1]}` : names.join(", ");
+  const strict = missing.some(({ allowEmpty }) => allowEmpty !== true);
+  const kind = `${strict ? "non-empty " : ""}string`;
+  throw malformed(
+    command,
+    `${list} must ${names.length === 1 ? "be a" : "each be a"} ${kind}.`,
+  );
 }
 
 /** What arrived instead of a field, in words the caller can act on. */
@@ -129,14 +222,13 @@ function arrivalType(value: unknown): string {
 function requireIdList(args: unknown, command: string): string[] {
   const value = (args as Record<string, unknown> | null | undefined)?.ids;
   if (!Array.isArray(value)) {
-    throw new Error(
-      `Malformed ${command} request: "ids" must be an array, and ${arrivalType(value)} arrived.`,
-    );
+    throw malformed(command, `"ids" must be an array, and ${arrivalType(value)} arrived.`);
   }
   for (const entry of value) {
     if (typeof entry !== "string" || entry.length === 0) {
-      throw new Error(
-        `Malformed ${command} request: "ids" must hold non-empty strings, and ${arrivalType(entry)} arrived.`,
+      throw malformed(
+        command,
+        `"ids" must hold non-empty strings, and ${arrivalType(entry)} arrived.`,
       );
     }
   }
@@ -306,9 +398,11 @@ export function createHostGatewayApi(
     }));
   };
   const executeRoutedMcpTool = async (args: any) => {
-    requireText(args, "name", "executeRoutedMcpTool");
-    requireText(args, "toolName", "executeRoutedMcpTool");
-    requireText(args, "providerIdentifier", "executeRoutedMcpTool");
+    requireFields(args, "executeRoutedMcpTool", [
+      { field: "name" },
+      { field: "toolName" },
+      { field: "providerIdentifier" },
+    ]);
     const mcp = deps.extensions.api("mcp").mcp;
     const executor = method(mcp, "createExecutor")(undefined, undefined, { agentId: args.agentId });
     return await method(executor, "execute")({}, {
@@ -338,19 +432,46 @@ export function createHostGatewayApi(
         : method(manager, "getAgentTranscript")(agentId);
     },
     getAgentTranscript: (args: any) =>
-      method(manager, "getAgentTranscript")(args.id),
+      method(manager, "getAgentTranscript")(
+        requirePath(args, "id", "getAgentTranscript"),
+      ),
     getAgentTranscriptPage: (args: any) =>
-      method(manager, "getAgentTranscriptPage")(args.id, args),
-    getAgentTranscriptWindow: (args: unknown) => {
+      method(manager, "getAgentTranscriptPage")(
+        requirePath(args, "id", "getAgentTranscriptPage"), args,
+      ),
+    /**
+     * The two parsers below already refused a request they could not read, but
+     * both refusals named neither field: `POST /api/getAgentTranscriptWindow {}`
+     * and `POST /api/getAgentThread {}` answered `500 {"error":"Malformed
+     * getAgentTranscriptWindow request"}` — a caller holding three candidate
+     * fields cannot tell which one to fix. The fields are checked here, by name,
+     * before the parser runs; the parser stays the authority on the answer shape.
+     *
+     * `getAgentTranscriptPage` and `getAgentTranscriptTail` are the other half
+     * of this defect and they were quieter than any other command measured here:
+     * they never threw at all. `POST /api/getAgentTranscriptPage {}` and
+     * `POST /api/getAgentTranscriptTail {"limit":1}` answered `200
+     * {"entries":[]}` — "this conversation is empty", for a request that named
+     * no conversation. A renderer that lost its agent id renders an empty chat
+     * and looks like a data loss. `POST /api/openAgentWindowed {}` did the same
+     * and additionally reported a successful switch to nothing.
+     */
+    getAgentTranscriptWindow: (args: any) => {
+      requirePath(args, "id", "getAgentTranscriptWindow");
+      requireOptionalNumber(args, "beforeSeq", "getAgentTranscriptWindow");
+      requireOptionalNumber(args, "limit", "getAgentTranscriptWindow");
       const request = parseCoordinatorTranscriptWindowRequest(args);
-      if (request == null) throw new Error("Malformed getAgentTranscriptWindow request");
+      if (request == null) throw malformed("getAgentTranscriptWindow", '"id", "beforeSeq" and "limit" did not read as a window request.');
       return method(manager, "getAgentTranscriptWindow")(request.id, args);
     },
     getAgentTranscriptTail: (args: any) =>
-      method(manager, "getAgentTranscriptTail")(args.id, args),
-    getAgentThread: (args: unknown) => {
+      method(manager, "getAgentTranscriptTail")(
+        requirePath(args, "id", "getAgentTranscriptTail"), args,
+      ),
+    getAgentThread: (args: any) => {
+      requireFields(args, "getAgentThread", [{ field: "id" }, { field: "rootId" }]);
       const request = parseCoordinatorAgentThreadRequest(args);
-      if (request == null) throw new Error("Malformed getAgentThread request");
+      if (request == null) throw malformed("getAgentThread", '"id" and "rootId" did not read as a thread request.');
       return method(manager, "getAgentThread")(request.id, request.rootId);
     },
 
@@ -399,8 +520,17 @@ export function createHostGatewayApi(
         args.agentId
       );
     },
+    // Both widget answers below were reached with a request that named no agent and
+    // no widget entry. `POST /api/resolveAutoReviewApproval {}` answered
+    // `500 {"error":"Invalid Sand agent id: undefined"}` — the id check one layer
+    // down naming the value it was handed. `POST /api/resolveLocalToolPermission
+    // {}` answered `500 {"error":"Unknown local-tool permission resolution."}`,
+    // which names neither the field (`resolution`) nor the command, and reads as
+    // "you answered a question that was never asked" rather than "you left the
+    // answer out".
     resolveAutoReviewApproval: (args: any) => {
       markActive("user_action");
+      requirePath(args, "agentId", "resolveAutoReviewApproval");
       return method(
         deps.extensions.api("auto-review"),
         "resolveApproval"
@@ -408,6 +538,7 @@ export function createHostGatewayApi(
     },
     resolveLocalToolPermission: async (args: any) => {
       markActive("user_action");
+      requireText(args, "resolution", "resolveLocalToolPermission");
       await method(localToolPermission, "resolveAsk")(args);
     },
     dismissWidget: (args: any) => {
@@ -482,19 +613,35 @@ export function createHostGatewayApi(
       }
       return minted;
     },
+    /**
+     * `kickstartAgent` and `requestDiskSaverAudit` take no path through a store,
+     * so a missing id used to be invisible rather than fatal. Measured on a live
+     * box, `POST /api/kickstartAgent {}`, `{"id":42}` and `{"id":"1111…"}` — a
+     * request that named nothing, one that named a number, and one that named an
+     * agent nobody created — all answered the same
+     * `200 {"isIntroductionInFlight":false}`. That answer also means "the
+     * introduction really is running", so a caller whose id was lost reads the
+     * one reply that tells it to carry on.
+     */
     kickstartAgent: async (args: any) => ({
-      isIntroductionInFlight: await deps.kickstartIfPending(args.id)
+      isIntroductionInFlight: await deps.kickstartIfPending(requirePath(args, "id", "kickstartAgent"))
     }),
     requestDiskSaverAudit: async (args: any) => ({
-      isAuditInFlight: await deps.requestDiskSaverAudit(args.id)
+      isAuditInFlight: await deps.requestDiskSaverAudit(requirePath(args, "id", "requestDiskSaverAudit"))
     }),
     createGroup: (args: any) => method(manager, "createGroup")({
-      name: args.name,
+      name: requireText(args, "name", "createGroup"),
       description: args.description,
       memberIds: args.memberAgentIds
     }),
+    // `setGroupMembers` read its id straight off the request, so the agent root
+    // was joined onto `undefined` and the host answered `500 {"error":"The
+    // \"path\" argument must be of type string. Received undefined"}` — the text
+    // of a `node:path` call, naming no command, no field and no remedy. Measured
+    // on a live box with `POST /api/setGroupMembers {}`.
     setGroupMembers: (args: any) =>
-      method(manager, "setGroupMembers")(args.id, args.memberAgentIds),
+      method(manager, "setGroupMembers")(
+        requirePath(args, "id", "setGroupMembers"), args.memberAgentIds),
     updateAgent: (args: any) =>
       method(manager, "updateAgent")(
         requirePath(args, "id", "updateAgent"),
@@ -536,9 +683,19 @@ export function createHostGatewayApi(
         ? result
         : { ...result, cleanupFailures };
     },
-    duplicateAgent: (args: any) => method(manager, "cloneAgent")(args.id),
+    // `cloneAgent(undefined)` reached the lifecycle as "that agent no longer
+    // exists" — a sentence about an agent, for a request that named none. Measured
+    // on a live box: `POST /api/duplicateAgent {}` answered
+    // `500 {"error":"That agent no longer exists."}`.
+    duplicateAgent: (args: any) =>
+      method(manager, "cloneAgent")(requirePath(args, "id", "duplicateAgent")),
+    // Same shape, same fix: `POST /api/setAgentUnread {}` answered
+    // `500 {"error":"Invalid Sand agent id: undefined"}` — the id check two
+    // layers down naming the value it was handed rather than the field the
+    // caller left out.
     setAgentUnread: (args: any) =>
-      method(manager, "setAgentUnread")(args.id, args.isUnread, args.atMs),
+      method(manager, "setAgentUnread")(
+        requirePath(args, "id", "setAgentUnread"), args.isUnread, args.atMs),
     /**
      * Was `async () => undefined`: the request body `{ id, isEnabled }` was
      * parsed by the protocol layer and then dropped, so the notification switch
@@ -560,20 +717,37 @@ export function createHostGatewayApi(
         requirePath(args, "id", "setAgentHiddenFromSidebar"),
         args.isHidden,
       ),
+    // `openAgent` is allowed to carry no id: switching to the active agent is a
+    // real request. The two windowed forms are not — they answer about one
+    // conversation, and `POST /api/openAgentWindowed {}` answered
+    // `200 {"entries":[]}` while reporting a successful switch, which is
+    // indistinguishable from a conversation that has no messages.
     openAgent: (args: any) => openAgent(args, "switchAgent"),
-    openAgentWindowed: (args: any) => openAgent(args, "openAgentWindowed"),
-    openAgentTail: (args: any) => openAgent(args, "openAgentTail"),
+    openAgentWindowed: (args: any) => {
+      requirePath(args, "id", "openAgentWindowed");
+      return openAgent(args, "openAgentWindowed");
+    },
+    openAgentTail: (args: any) => {
+      requirePath(args, "id", "openAgentTail");
+      return openAgent(args, "openAgentTail");
+    },
     setWindowFocused: (args: any) =>
       method(manager, "setWindowFocused")(args.isFocused),
 
     getAgentMemories: (args: any) =>
       method(manager, "getAgentMemories")(requirePath(args, "id", "getAgentMemories")),
+    // `deleteAgentMemory {}` answered `500 {"error":"The \"path\" argument must be of
+    // type string. Received undefined"}` — the id was joined onto the agent root
+    // by a `node:path` call that was handed `undefined`.
     deleteAgentMemory: (args: any) =>
-      method(manager, "deleteAgentMemory")(args.id, args.memoryId),
+      method(manager, "deleteAgentMemory")(
+        requirePath(args, "id", "deleteAgentMemory"), args.memoryId),
     clearAgentMemories: (args: any) =>
-      method(manager, "clearAgentMemories")(args.id),
+      method(manager, "clearAgentMemories")(
+        requirePath(args, "id", "clearAgentMemories")),
     getAgentAutomations: (args: any) =>
-      method(manager, "getAgentAutomations")(args.id),
+      method(manager, "getAgentAutomations")(
+        requirePath(args, "id", "getAgentAutomations")),
     listAllAutomations: () => method(manager, "listAllAutomations")(),
     isAgentNetworkEnabled: () =>
       method(deps.extensions.api("experiments"), "isAgentNetworkEnabled")(),
@@ -600,19 +774,20 @@ export function createHostGatewayApi(
       method(sharing, "setSharedRoomTyping")(args),
     leaveSharedRoom: (args: any) => markSharingAction("leaveSharedRoom", args),
 
+    // `setAgentAutomationEnabled {"id":"1111…"}` answered `200 []` — an empty list
+    // that reads as "this agent has no automations", for a request that named no
+    // automation to switch. Every sibling below needs the same two fields.
     setAgentAutomationEnabled: (args: any) =>
       method(manager, "setAgentAutomationEnabled")(
-        args.id,
-        args.automationId,
+        requirePath(args, "id", "setAgentAutomationEnabled"),
+        requirePath(args, "automationId", "setAgentAutomationEnabled"),
         args.isEnabled
       ),
     createAgentAutomation: async (args: any) => {
       markActive("user_action");
       requirePath(args, "id", "createAgentAutomation");
       if (typeof (args.spec as any)?.trigger !== "object" || args.spec.trigger === null) {
-        throw new Error(
-          `Malformed createAgentAutomation request: "spec.trigger" must be an object.`,
-        );
+        throw malformed("createAgentAutomation", '"spec.trigger" must be an object.');
       }
       const countBefore = (await method(manager, "getAgentAutomations")(
         args.id
@@ -630,23 +805,43 @@ export function createHostGatewayApi(
       }
       return created;
     },
+    // `updateAgentAutomation {"id":"…","automationId":"probe","spec":{}}` answered
+    // `500 {"error":"Cannot read properties of undefined (reading 'replace')"}` —
+    // the automation runtime rewriting a trigger field that `spec:{}` does not
+    // carry. The `spec` shape is checked before the runtime is entered, so the
+    // caller is told which field to fix instead of being handed a V8 sentence.
     updateAgentAutomation: (args: any) =>
       method(manager, "updateAgentAutomation")(
-        args.id,
-        args.automationId,
-        args.spec
+        requirePath(args, "id", "updateAgentAutomation"),
+        requirePath(args, "automationId", "updateAgentAutomation"),
+        requireObject(args, "spec", "updateAgentAutomation"),
       ),
     deleteAgentAutomation: (args: any) =>
-      method(manager, "deleteAgentAutomation")(args.id, args.automationId),
+      method(manager, "deleteAgentAutomation")(
+        requirePath(args, "id", "deleteAgentAutomation"),
+        requirePath(args, "automationId", "deleteAgentAutomation"),
+      ),
     runAgentAutomationNow: (args: any) => {
       markActive("user_action");
       return method(manager, "runAgentAutomationNow")(
-        args.id,
-        args.automationId
+        requirePath(args, "id", "runAgentAutomationNow"),
+        requirePath(args, "automationId", "runAgentAutomationNow"),
       );
     },
+    /**
+     * `POST /api/broadcastToAgents {}` answered
+     * `500 {"error":"Cannot read properties of undefined (reading 'trim')"}` — the
+     * message clamp, one layer down, tripping on a `message` that never arrived.
+     * The other half of the same request was quieter: `targets` that is not
+     * `"all"` becomes an empty id set, so `{"targets":[],"message":"x"}` is a
+     * real request to broadcast to nobody, and stays one.
+     */
     broadcastToAgents: async (args: any) => {
       markActive("user_action");
+      if (args.targets !== "all" && !Array.isArray(args.targets)) {
+        throw malformed("broadcastToAgents", `"targets" must be "all" or an array of agent ids, and ${arrivalType(args.targets)} arrived.`);
+      }
+      requireText(args, "message", "broadcastToAgents");
       const result = await method(manager, "broadcastToAgents")(
         args.targets,
         args.message
@@ -660,16 +855,23 @@ export function createHostGatewayApi(
     },
 
     getAgentWorkflows: (args: any) =>
-      method(manager, "getAgentWorkflows")(args.id),
+      method(manager, "getAgentWorkflows")(
+        requirePath(args, "id", "getAgentWorkflows")),
+    // `createAgentWorkflow {"id":"1111…"}` answered
+    // `500 {"error":"Cannot read properties of undefined (reading 'trigger')"}` and
+    // `updateAgentWorkflow {"id":"1111…"}` answered the same for `name`: the first
+    // line of each, on a `spec` that never arrived.
     createAgentWorkflow: async (args: any) => {
-      const isAutomation = args.spec.trigger != null;
+      requirePath(args, "id", "createAgentWorkflow");
+      const spec = requireObject(args, "spec", "createAgentWorkflow");
+      const isAutomation = (spec as any).trigger != null;
       if (isAutomation) markActive("user_action");
       const countBefore = isAutomation
         ? (await method(manager, "getAgentAutomations")(args.id)).length
         : 0;
       const workflows = await method(manager, "createAgentWorkflow")(
         args.id,
-        args.spec
+        spec
       );
       if (isAutomation) {
         const countAfter = (await method(manager, "getAgentAutomations")(
@@ -690,30 +892,46 @@ export function createHostGatewayApi(
     },
     updateAgentWorkflow: (args: any) =>
       method(manager, "updateAgentWorkflow")(
-        args.id,
-        args.workflowId,
-        args.spec
+        requirePath(args, "id", "updateAgentWorkflow"),
+        requirePath(args, "workflowId", "updateAgentWorkflow"),
+        requireObject(args, "spec", "updateAgentWorkflow"),
       ),
     setAgentWorkflowEnabled: (args: any) =>
       method(manager, "setAgentWorkflowEnabled")(
-        args.id,
-        args.workflowId,
+        requirePath(args, "id", "setAgentWorkflowEnabled"),
+        requirePath(args, "workflowId", "setAgentWorkflowEnabled"),
         args.isEnabled
       ),
     deleteAgentWorkflow: (args: any) =>
-      method(manager, "deleteAgentWorkflow")(args.id, args.workflowId),
+      method(manager, "deleteAgentWorkflow")(
+        requirePath(args, "id", "deleteAgentWorkflow"),
+        requirePath(args, "workflowId", "deleteAgentWorkflow"),
+      ),
     runAgentWorkflowNow: (args: any) =>
-      method(manager, "runAgentWorkflowNow")(args.id, args.workflowId),
+      method(manager, "runAgentWorkflowNow")(
+        requirePath(args, "id", "runAgentWorkflowNow"),
+        requirePath(args, "workflowId", "runAgentWorkflowNow"),
+      ),
+    // `importAgentWorkflowText {}` answered
+    // `500 {"error":"Invalid Sand agent id: undefined"}`, and with the id present
+    // but no `markdown` it still answered `200` — importing nothing at all.
     importAgentWorkflowText: (args: any) =>
       method(manager, "importAgentWorkflowMarkdown")(
-        args.id,
-        args.markdown,
+        requirePath(args, "id", "importAgentWorkflowText"),
+        requireText(args, "markdown", "importAgentWorkflowText"),
         args.name
       ),
+    // `POST /api/importAgentWorkflowUrl {}` and `{"id":"1111…"}` both answered
+    // `500 {"error":"Cannot read properties of undefined (reading 'split')"}` —
+    // the URL parser, reached with nothing to parse.
     importAgentWorkflowUrl: (args: any) =>
-      method(manager, "importAgentWorkflowUrl")(args.id, args.url, args.name),
+      method(manager, "importAgentWorkflowUrl")(
+        requirePath(args, "id", "importAgentWorkflowUrl"),
+        requireText(args, "url", "importAgentWorkflowUrl"),
+        args.name),
     portAgentLocalSkills: (args: any) =>
-      method(manager, "portAgentLocalSkills")(args.id),
+      method(manager, "portAgentLocalSkills")(
+        requirePath(args, "id", "portAgentLocalSkills")),
     getConversationOutline: (args: any) =>
       method(manager, "getConversationOutline")(
         requirePath(args, "id", "getConversationOutline"),
@@ -733,33 +951,63 @@ export function createHostGatewayApi(
     unpublishSkill: (args: any) =>
       method(deps.extensions.api("mcp").skillPublish, "unpublish")(args),
 
+    // All three channel views are keyed by an agent id. Measured on a live box,
+    // `POST /api/getAgentChannels {}` and `POST /api/refreshChannel {}` answered
+    // `500 {"error":"Invalid Sand agent id: undefined"}`, and
+    // `POST /api/disconnectChannel {}` the same. With an id that names nothing
+    // they answer `200` carrying the box-wide channel manifest — a channel list
+    // for an agent that does not exist, which reads as "this agent is connected to
+    // nothing" and is really "the box has these two platforms available".
     getAgentChannels: (args: any) =>
-      method(automations, "getAgentChannels")(args.id),
+      method(automations, "getAgentChannels")(
+        requirePath(args, "id", "getAgentChannels")),
     connectChannel: async (args: any) => {
-      requirePath(args, "platform", "connectChannel");
-      requireText(args, "token", "connectChannel");
+      requireFields(args, "connectChannel", [
+        { field: "id" },
+        { field: "platform" },
+        { field: "token", allowEmpty: true },
+      ]);
       method(manager, "connectChannel")(args.id, args.platform, args.token);
       return method(automations, "getAgentChannels")(args.id);
     },
     disconnectChannel: async (args: any) => {
+      requireFields(args, "disconnectChannel", [
+        { field: "id" },
+        { field: "platform" },
+      ]);
       method(manager, "disconnectChannel")(args.id, args.platform);
       return method(automations, "getAgentChannels")(args.id);
     },
     refreshChannel: (args: any) =>
-      method(automations, "getAgentChannels")(args.id),
+      method(automations, "getAgentChannels")(
+        requirePath(args, "id", "refreshChannel")),
     getListenerIntegrations: () =>
       method(automations, "getListenerIntegrations")(),
     getListenerConnectUrl: async (args: any) => ({
-      url: await method(automations, "getListenerConnectUrl")(args.platform)
+      // The platform name reaches a listener lookup one layer down, where a
+      // missing one is a lookup for nothing. Naming the field here is the
+      // difference between "fix the request" and "the listener subsystem is
+      // broken".
+      url: await method(automations, "getListenerConnectUrl")(
+        requireText(args, "platform", "getListenerConnectUrl"),
+      )
     }),
-    getSubagents: (args: any) => method(manager, "getSubagents")(args.id),
-    getAsyncTasks: (args: any) => method(manager, "getAsyncTasks")(args.id),
+    // `POST /api/getSubagents {}` and `POST /api/getAsyncTasks {}` answered `200 []`
+    // — "this agent has none" — for a request that named no agent at all. An
+    // empty list is a real answer, and it is also the answer for a lost id.
+    getSubagents: (args: any) =>
+      method(manager, "getSubagents")(requirePath(args, "id", "getSubagents")),
+    getAsyncTasks: (args: any) =>
+      method(manager, "getAsyncTasks")(requirePath(args, "id", "getAsyncTasks")),
+    // `Buffer.from(42, "base64")` is a TypeError from deep inside Node, and a
+    // truncated base64 payload is the caller's, not the host's.
     setAgentAvatarBytes: (args: any) =>
       method(manager, "setAgentAvatarBytes")(
-        args.id,
+        requirePath(args, "id", "setAgentAvatarBytes"),
         args.pngBase64 == null
           ? null
-          : Uint8Array.from(Buffer.from(args.pngBase64, "base64"))
+          : Uint8Array.from(Buffer.from(
+              requireText(args, "pngBase64", "setAgentAvatarBytes"), "base64"))
       ),
     getAgentAvatar: (args: any) =>
       method(manager, "getAgentAvatar")(requirePath(args, "id", "getAgentAvatar")),
@@ -768,9 +1016,12 @@ export function createHostGatewayApi(
       deps.decorateForeverBoxStatus(
         await method(deps.extensions.api("forever-box"), "getStatus")(args)
       ),
+    // `POST /api/getCloudAgentInfo {}` and `{"includeFiles":true}` answered
+    // `500 {"error":"Cannot read properties of undefined (reading 'trim')"}` — the
+    // cloud agent key, trimmed one layer down, on a request that carried none.
     getCloudAgentInfo: (args: any) =>
       method(deps.extensions.api("cloud-agents"), "getInfo")(
-        args.bcId,
+        requireText(args, "bcId", "getCloudAgentInfo"),
         args.includeFiles
       ),
     ensureForeverBox: async (args: any) =>
@@ -820,9 +1071,11 @@ export function createHostGatewayApi(
         args.pendingWakes
       );
     },
+    // `endHandoff(undefined, "button")` is a lookup for a handoff nobody named.
+    // `trigger` keeps its default on purpose — the button is the normal case.
     handBackForeverBox: (args: any) =>
       method(deps.extensions.api("session"), "endHandoff")(
-        args.id,
+        requirePath(args, "id", "handBackForeverBox"),
         args.trigger ?? "button"
       ),
 
@@ -889,12 +1142,12 @@ export function createHostGatewayApi(
       // `Object.entries(undefined)` inside the secrets store answered `500
       // {"error":"Cannot convert undefined or null to object"}`, which reads as
       // a broken secret store rather than a request that carried no secrets.
-      if (typeof args?.secrets !== "object" || args.secrets === null || Array.isArray(args.secrets)) {
-        throw new Error(
-          `Malformed setBoxSecrets request: "secrets" must be an object, and ${Array.isArray(args?.secrets) ? "an array" : args?.secrets === null ? "null" : typeof args?.secrets} arrived.`,
-        );
-      }
-      return method(deps.extensions.api("secrets"), "set")({ secrets: args.secrets });
+      // It was the last refusal in this file still raising a plain `Error`, so
+      // it was also the last one answered `500` for a request that is the
+      // caller's own mistake.
+      return method(deps.extensions.api("secrets"), "set")({
+        secrets: requireObject(args, "secrets", "setBoxSecrets"),
+      });
     },
     getBoxSecretsStatus: () =>
       method(deps.extensions.api("secrets"), "getStatus")()

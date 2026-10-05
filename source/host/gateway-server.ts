@@ -16,8 +16,18 @@ export const GATEWAY_REQUEST_ID_HEADER = "x-sand-request-id"; export const SSE_H
 /**
  * The HTTP status a command failure is reported with.
  *
- * Three answers, and the third one is the one that was missing.
+ * Four answers now, and the two that were missing are both about the caller.
  *
+ *  - `SandGatewayRequestError` is `400`. It is the one class raised for a request
+ *    the host read and refused on its own terms: a body that is not JSON, a
+ *    field that is absent or the wrong type, a body over the size ceiling. Every
+ *    one of those used to answer `500`, which told the caller the server broke
+ *    and invited a retry of a request that can never succeed as written. Measured
+ *    on a live box, `POST /api/deleteAgent {}` and `POST /api/searchAgents {}`
+ *    both answered `500 {"error":"Malformed deleteAgent request: \"id\" must be a
+ *    non-empty string."}` while `POST /api/deleteAgent {"id":` answered `400`
+ *    for the same class of mistake — the JSON gate had a status and the field
+ *    gates did not.
  *  - `SandAgentLimitError` and `SandSkillPublishError` are `409`: the request was
  *    well formed, the host understood it, and the state refuses it.
  *  - "That agent id names nothing" is `404`. It used to be `500`, which told the
@@ -34,8 +44,13 @@ export const GATEWAY_REQUEST_ID_HEADER = "x-sand-request-id"; export const SSE_H
  * a race with a file handle and a summary that could not be built. Mapping it to
  * `404` would tell a client to retry a delete it must not retry, which is a worse
  * failure than the status code it replaces.
+ *
+ * `400` is matched by `instanceof`, not by name, and it is checked first. A
+ * malformed request is by definition something the host never reached a callee
+ * with, so it cannot also be a limit refusal or a missing agent; keeping the
+ * branches apart is what lets each message stay about one fact.
  */
-export function statusForCommandError(error: unknown): number { const name = error instanceof Error ? error.name : ""; if (name === "SandAgentLimitError" || name === "SandSkillPublishError") return 409; if (isAgentNotFoundError(error)) return 404; return 500; }
+export function statusForCommandError(error: unknown): number { if (error instanceof SandGatewayRequestError) return 400; const name = error instanceof Error ? error.name : ""; if (name === "SandAgentLimitError" || name === "SandSkillPublishError") return 409; if (isAgentNotFoundError(error)) return 404; return 500; }
 export async function readBody(req: AsyncIterable<unknown>): Promise<string> { const chunks: Buffer[] = []; let total = 0; for await (const chunk of req) { const buffer = chunk instanceof Buffer ? chunk : Buffer.from(chunk as ArrayBuffer); total += buffer.length; if (total > MAX_BODY_BYTES) throw new SandGatewayRequestError("Request body is too large."); chunks.push(buffer); } return Buffer.concat(chunks).toString("utf8"); }
 export function clientAcceptsGzip(req: IncomingMessage): boolean { const header = req.headers["accept-encoding"]; const value = Array.isArray(header) ? header.join(",") : header; return typeof value === "string" && value.toLowerCase().includes("gzip"); }
 export function clientWantsSlimAvatars(req: IncomingMessage): boolean { const header = req.headers[GATEWAY_SLIM_AVATARS_HEADER]; return (Array.isArray(header) ? header[0] : header) === "1"; }
@@ -57,7 +72,7 @@ export interface GatewayServerDeps {
 }
 
 /**
- * Rejects a body that is not JSON before the command table parses it.
+ * Rejects a body the command table cannot read, before it is handed one.
  *
  * Measured on a live box: `POST /api/deleteAgent {"id":` answered
  * `500 {"error":"Unexpected end of JSON input"}` — one V8 sentence, no command,
@@ -66,21 +81,67 @@ export interface GatewayServerDeps {
  * Parsing once here as a gate costs a second parse of an already buffered string
  * and leaves the table signature alone; a body that parses still reaches the same
  * handler with the same bytes.
+ *
+ * `shape: "object"` adds the second half of the contract, and it is what the
+ * command routes ask for. A command body is a JSON *object*: every entry of
+ * `SAND_GATEWAY_COMMANDS` reads named fields off what `parseCommandArgs` returns.
+ * The four values that are not objects parse cleanly and then fail one line
+ * later on a property read — a measured sweep of all 122 commands found
+ * `POST /api/dismissWidget null`,
+ * `500 {"error":"Cannot read properties of null (reading 'agentId')"}`, and nine
+ * more of exactly that shape (`createAgent`, `openAgent`, `setWindowFocused`,
+ * `broadcastToAgents`, `setBoxMigrating`, `resumeBoxAfterRecreate`,
+ * `setHostSettings`, `refreshMcp`, `listBoxMcpServers`), each naming neither the
+ * command nor the body. Refusing them here turns ten scattered V8 sentences into
+ * one `400` that says which endpoint was sent something that is not a request.
+ *
+ * The bridge routes keep the looser gate. They do not read named fields — each
+ * hands the parsed value straight to `submitResponses` — so demanding an object
+ * there would be a new rule rather than the enforcement of an existing one.
  */
-export function refuseUnparsableBody(method: string, body: string, res: ServerResponse): boolean {
-  try { parseCommandArgs(body); } catch { respondError(res, 400, `Malformed ${method} request: the body is not valid JSON.`); return true; }
+export function refuseUnparsableBody(method: string, body: string, res: ServerResponse, shape: "any" | "object" = "any"): boolean {
+  let parsed: unknown;
+  try { parsed = parseCommandArgs(body); } catch { respondError(res, 400, `Malformed ${method} request: the body is not valid JSON.`); return true; }
+  if (shape === "object" && (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))) {
+    respondError(res, 400, `Malformed ${method} request: the body must be a JSON object, and ${Array.isArray(parsed) ? "an array" : parsed === null ? "null" : typeof parsed} arrived.`);
+    return true;
+  }
   return false;
 }
 
-export async function routeCommand(deps: GatewayServerDeps, method: string, body: string, res: ServerResponse, req: IncomingMessage): Promise<void> { if (!Object.hasOwn(SAND_GATEWAY_COMMANDS, method)) return respondError(res, 404, `unknown gateway method: ${method}`); if (refuseUnparsableBody(method, body, res)) return; const table = clientWantsSlimAvatars(req) ? SAND_GATEWAY_SLIM_COMMANDS : SAND_GATEWAY_COMMANDS; const handler = (table as Record<string, (api: unknown, body: string) => unknown>)[method]; if (handler == null) return respondError(res, 404, `unknown gateway method: ${method}`); const requestId = headerValue(req, GATEWAY_REQUEST_ID_HEADER); const { traceparent: _parent, ...traceIds } = commandTrace(req); const startedAt = Date.now(); let result: unknown; try { result = await handler(deps.api, body); } catch (error) { if (deps.onCommandError != null && statusForCommandError(error) >= 500) { try { deps.onCommandError({ method, ...classifyGatewayCommandError(error), durationMs: Date.now() - startedAt, requestId, ...traceIds }); } catch {} } throw error; } if (deps.onCommandComplete != null) { try { deps.onCommandComplete({ method, durationMs: Date.now() - startedAt, requestId, ...traceIds }); } catch {} } respondJson(res, result, req); }
+export async function routeCommand(deps: GatewayServerDeps, method: string, body: string, res: ServerResponse, req: IncomingMessage): Promise<void> { if (!Object.hasOwn(SAND_GATEWAY_COMMANDS, method)) return respondError(res, 404, `unknown gateway method: ${method}`); if (refuseUnparsableBody(method, body, res, "object")) return; const table = clientWantsSlimAvatars(req) ? SAND_GATEWAY_SLIM_COMMANDS : SAND_GATEWAY_COMMANDS; const handler = (table as Record<string, (api: unknown, body: string) => unknown>)[method]; if (handler == null) return respondError(res, 404, `unknown gateway method: ${method}`); const requestId = headerValue(req, GATEWAY_REQUEST_ID_HEADER); const { traceparent: _parent, ...traceIds } = commandTrace(req); const startedAt = Date.now(); let result: unknown; try { result = await handler(deps.api, body); } catch (error) { if (deps.onCommandError != null && statusForCommandError(error) >= 500) { try { deps.onCommandError({ method, ...classifyGatewayCommandError(error), durationMs: Date.now() - startedAt, requestId, ...traceIds }); } catch {} } throw error; } if (deps.onCommandComplete != null) { try { deps.onCommandComplete({ method, durationMs: Date.now() - startedAt, requestId, ...traceIds }); } catch {} } respondJson(res, result, req); }
 
 export function openSseStream(req: IncomingMessage, res: ServerResponse, register: (write: (data: string) => void) => () => void): void { const gzipEnabled = process.env[DISABLE_SSE_GZIP_ENV] !== "1" && clientAcceptsGzip(req); res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache, no-transform", connection: "keep-alive", ...(gzipEnabled ? { "content-encoding": "gzip", vary: "Accept-Encoding" } : {}) }); const zipper = gzipEnabled ? createGzip({ flush: zlibConstants.Z_SYNC_FLUSH }) : null; zipper?.pipe(res); const sink = zipper ?? res; sink.write("retry: 1000\n\n"); const unsubscribe = register((data) => sink.write(`data: ${data}\n\n`)); const heartbeat = setInterval(() => sink.write(":ping\n\n"), SSE_HEARTBEAT_MS); res.on("close", () => { clearInterval(heartbeat); unsubscribe(); zipper?.destroy(); }); }
 export function parseSubscribedChannels(url: URL): Set<string> | undefined { const raw = url.searchParams.get("channels"); if (raw === null) return undefined; const channels = raw.split(",").map((value) => value.trim()).filter(Boolean); return channels.length > 0 ? new Set(channels) : undefined; }
 function handleEvents(deps: GatewayServerDeps, req: IncomingMessage, res: ServerResponse, channels?: Set<string>): void { const slim = clientWantsSlimAvatars(req); res.on("close", () => deps.onEventStreamClosed?.()); openSseStream(req, res, (write) => deps.subscribe((event) => { if (channels != null && !channels.has(event.channel)) return; write(JSON.stringify(slim ? stripInlineAvatarsFromEvent(event) : event)); })); }
 const DATA_URL_PATTERN = /^data:([a-z0-9.+/-]+);base64,(.*)$/i; const AVATAR_NO_EXECUTE_HEADERS = { "content-disposition": "attachment", "x-content-type-options": "nosniff", "content-security-policy": "default-src 'none'; sandbox" };
-async function handleAvatarImage(deps: GatewayServerDeps, req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> { if (req.headers["sec-fetch-site"] === "cross-site") return respondError(res, 403, "cross-site avatar loads are not allowed"); const agentId = decodeURIComponent(url.pathname.slice(GATEWAY_AVATARS_PATH.length + 1)); if (agentId.length === 0) return respondError(res, 404, "missing agent id"); const avatar = await deps.api.getAgentAvatar({ id: agentId }) as { dataUrl?: string | null; version?: string | null }; const match = avatar.dataUrl == null ? null : DATA_URL_PATTERN.exec(avatar.dataUrl); if (avatar.version == null || match?.[1] == null || match[2] == null) return respondError(res, 404, "agent has no avatar"); const requested = url.searchParams.get("v"); if (requested != null && requested !== avatar.version) return respondError(res, 404, "no such avatar version"); const etag = `"${avatar.version}"`; const cache = requested != null ? { "cache-control": "private, max-age=31536000, immutable", etag } : { "cache-control": "no-store", etag }; if (req.headers["if-none-match"] === etag) { res.writeHead(304, cache); res.end(); return; } const bytes = Buffer.from(match[2], "base64"); res.writeHead(200, { ...cache, ...AVATAR_NO_EXECUTE_HEADERS, "content-type": match[1], "content-length": bytes.byteLength }); res.end(bytes); }
+/**
+ * The avatar bytes for one agent, or a status that names why there are none.
+ *
+ * `decodeURIComponent` raises a bare `URIError: URI malformed` on a truncated
+ * escape such as `%ZZ`, and an unhandled throw here answers `500` with that V8
+ * sentence. The id is caller-supplied, so a caller that mangles it is told so
+ * and pointed at the encoding rather than shown a server fault. Measured
+ * against a synthetic request; the loopback box answers `%ZZ` as `404` because
+ * `HttpWebRequest` re-encodes the path before it reaches the socket.
+ */
+async function handleAvatarImage(deps: GatewayServerDeps, req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> { if (req.headers["sec-fetch-site"] === "cross-site") return respondError(res, 403, "cross-site avatar loads are not allowed"); let agentId = ""; try { agentId = decodeURIComponent(url.pathname.slice(GATEWAY_AVATARS_PATH.length + 1)); } catch { return respondError(res, 400, "the agent id in the avatar path is not valid percent-encoding."); } if (agentId.length === 0) return respondError(res, 404, "missing agent id"); const avatar = await deps.api.getAgentAvatar({ id: agentId }) as { dataUrl?: string | null; version?: string | null }; const match = avatar.dataUrl == null ? null : DATA_URL_PATTERN.exec(avatar.dataUrl); if (avatar.version == null || match?.[1] == null || match[2] == null) return respondError(res, 404, "agent has no avatar"); const requested = url.searchParams.get("v"); if (requested != null && requested !== avatar.version) return respondError(res, 404, "no such avatar version"); const etag = `"${avatar.version}"`; const cache = requested != null ? { "cache-control": "private, max-age=31536000, immutable", etag } : { "cache-control": "no-store", etag }; if (req.headers["if-none-match"] === etag) { res.writeHead(304, cache); res.end(); return; } const bytes = Buffer.from(match[2], "base64"); res.writeHead(200, { ...cache, ...AVATAR_NO_EXECUTE_HEADERS, "content-type": match[1], "content-length": bytes.byteLength }); res.end(bytes); }
 function handleBridgeRequests(bridge: GatewayServerDeps["localExec"] | GatewayServerDeps["webauthn"], missing: string, req: IncomingMessage, res: ServerResponse): void { if (bridge == null) return respondError(res, 404, missing); openSseStream(req, res, (write) => bridge.registerProvider((frame) => write(JSON.stringify(frame)))); }
-function handleBridgeResponses(bridge: GatewayServerDeps["localExec"] | GatewayServerDeps["webauthn"], missing: string, body: string, res: ServerResponse): void { if (bridge == null) return respondError(res, 404, missing); bridge.submitResponses(body.length > 0 ? JSON.parse(body) : {}); respondJson(res, { ok: true }); }
+/**
+ * The POST half of a bridge channel: the caller hands back the answers its SSE
+ * stream asked for, as JSON.
+ *
+ * The parse was unguarded, and these two routes skip `routeCommand` entirely —
+ * they are the only places that read a body without passing `refuseUnparsableBody`
+ * first. Measured on a live box, `POST /local-exec/responses {"broken` and
+ * `POST /webauthn/responses {"broken` both answered `500 {"error":"Unterminated
+ * string in JSON at position 8 (line 1 column 9)"}`: a V8 parser sentence with no
+ * endpoint in it and a status that blames the host for the caller's truncated
+ * write. The same gate the command routes use is applied here, with the route's
+ * own path as the name, so the answer says which endpoint and that the body is
+ * what is wrong.
+ */
+function handleBridgeResponses(bridge: GatewayServerDeps["localExec"] | GatewayServerDeps["webauthn"], missing: string, channel: string, body: string, res: ServerResponse): void { if (bridge == null) return respondError(res, 404, missing); if (refuseUnparsableBody(channel, body, res)) return; bridge.submitResponses(body.length > 0 ? JSON.parse(body) : {}); respondJson(res, { ok: true }); }
 
 export async function handleRequest(deps: GatewayServerDeps, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? "/", "http://127.0.0.1"); if (rejectUntrustedBrowserRequest(deps, req, res)) return;
@@ -99,7 +160,7 @@ export async function handleRequest(deps: GatewayServerDeps, req: IncomingMessag
   if (!(events || prepare || avatar || localRequests || localResponses || webRequests || webResponses || command)) return respondError(res, 404, `not found: ${req.method} ${url.pathname}`);
   if ((localRequests || localResponses) && deps.authToken == null) return respondError(res, 401, "local-exec requires gateway authentication"); if ((webRequests || webResponses) && deps.authToken == null) return respondError(res, 401, "webauthn requires gateway authentication"); if (deps.authToken != null && !isAuthorized(req, deps.authToken)) return respondError(res, 401, "unauthorized");
   if (prepare) return respondJson(res, deps.prepareForUpgrade != null ? await deps.prepareForUpgrade() : { quiescing: false, runningTurns: 0 }); if (localRequests || localResponses) deps.onDesktopContact?.();
-  if (localRequests) return handleBridgeRequests(deps.localExec, "local-exec channel not enabled", req, res); if (localResponses) return handleBridgeResponses(deps.localExec, "local-exec channel not enabled", await readBody(req), res); if (webRequests) return handleBridgeRequests(deps.webauthn, "webauthn channel not enabled", req, res); if (webResponses) return handleBridgeResponses(deps.webauthn, "webauthn channel not enabled", await readBody(req), res); if (events) return handleEvents(deps, req, res, parseSubscribedChannels(url)); if (avatar) return handleAvatarImage(deps, req, res, url);
+  if (localRequests) return handleBridgeRequests(deps.localExec, "local-exec channel not enabled", req, res); if (localResponses) return handleBridgeResponses(deps.localExec, "local-exec channel not enabled", GATEWAY_LOCAL_EXEC_RESPONSES_PATH, await readBody(req), res); if (webRequests) return handleBridgeRequests(deps.webauthn, "webauthn channel not enabled", req, res); if (webResponses) return handleBridgeResponses(deps.webauthn, "webauthn channel not enabled", GATEWAY_WEBAUTHN_RESPONSES_PATH, await readBody(req), res); if (events) return handleEvents(deps, req, res, parseSubscribedChannels(url)); if (avatar) return handleAvatarImage(deps, req, res, url);
   return routeCommand(deps, url.pathname.slice(GATEWAY_API_PREFIX.length + 1), await readBody(req), res, req);
 }
 

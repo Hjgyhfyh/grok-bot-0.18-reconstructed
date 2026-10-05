@@ -42,7 +42,35 @@ export interface SandLocalToolPermissionControllerOptions {
 const SETTLED_STATUS_OF_RESOLUTION: Readonly<Record<SandLocalToolResolution, Exclude<SandLocalToolRequestStatus, "pending" | "expired">>> = { "allow-once": "allowed", deny: "denied", always: "always", never: "never" };
 function askKey(scope: Required<Pick<SandLocalToolScope, "agentId" | "toolCallId">>, request: SandLocalToolRequest): string { return `${scope.agentId}\0${scope.toolCallId}\0${request.action}\0${request.target}`; }
 function refusalKey(agentId: string, action: SandLocalToolRequest["action"], target: string): string { return `${agentId}\0${action}\0${createHash("sha256").update(target, "utf8").digest("hex")}`; }
-function delay(ms: number, signal: AbortSignal): Promise<void> { return new Promise((resolve) => { if (signal.aborted) return resolve(); const timer = setTimeout(resolve, ms); timer.unref?.(); signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true }); }); }
+/**
+ * Waits out the lifetime of one open ask, or until the ask is settled first.
+ *
+ * The timer used to be `unref`'d, which turned "an ask always expires" into a
+ * promise the event loop was free to break. A process whose only pending work
+ * was the ask itself — the agent blocked in `authorize` with nothing else to
+ * keep Node alive — drained its loop, Node exited, and the agent received no
+ * answer at all: no refusal, no expiry, no trace that it had ever asked.
+ *
+ * The timer stays referenced because it *is* the work being awaited. It is
+ * bounded by `askTtlMs` and `settle` aborts it the instant anyone answers, so
+ * it holds a handle only while a question is genuinely open.
+ */
+function delay(ms: number, signal: AbortSignal): Promise<void> { return new Promise((resolve) => { if (signal.aborted) return resolve(); const timer = setTimeout(resolve, ms); signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true }); }); }
+
+/**
+ * Whether a settlement carries the user's own "no".
+ *
+ * Only `denied` and `never` are answers: the user was asked and said no. An
+ * `expired` ask is what a question becomes when nobody answered it, and a
+ * cancellation is what it becomes when the caller walked away — neither was ever
+ * put to anybody. They used to be remembered as refusals, so the first ask a
+ * user stepped away from answered every later request for that same command
+ * with "the user already refused this and it will not be asked again", and
+ * nothing could lift it, because a remembered refusal outranks the `always`
+ * setting in `authorize`. A timeout is not consent, and it is not a refusal
+ * either.
+ */
+function isUserRefusal(status: Exclude<SandLocalToolRequestStatus, "pending">): boolean { return status === "denied" || status === "never"; }
 
 export class SandLocalToolPermissionController {
   private readonly pendingByKey = new Map<string, Pending>(); private readonly pendingById = new Map<string, string>(); private readonly approvalsById = new Map<string, StoredApproval>(); private readonly directionEpochs = new Map<string, number>();
@@ -104,6 +132,6 @@ if (request.signal?.aborted === true) return { allowed: false, reason: SAND_LOCA
     this.pendingByKey.set(key, pending); this.pendingById.set(pending.request.id, key); void delay(this.askTtlMs, pending.expiryAbort.signal).then(() => { if (!pending.expiryAbort.signal.aborted) this.settle(pending, "expired", { allowed: false, reason: SAND_LOCAL_TOOLS_ASK_EXPIRED_MESSAGE }); }); this.emit({ type: "created", request: pending.request }); return this.join(pending, request.signal);
   }
   private async join(pending: Pending, signal?: AbortSignal): Promise<SandLocalToolDecision> { return new Promise((resolve) => { const settleWaiter = (decision: SandLocalToolDecision) => { pending.waiters.delete(settleWaiter); signal?.removeEventListener("abort", onAbort); resolve(decision); if (pending.waiters.size === 0 && this.pendingById.has(pending.request.id)) this.settle(pending, "expired", { allowed: false, reason: SAND_LOCAL_TOOLS_ASK_CANCELLED_MESSAGE }); }; const onAbort = () => settleWaiter({ allowed: false, reason: SAND_LOCAL_TOOLS_ASK_CANCELLED_MESSAGE }); pending.waiters.add(settleWaiter); if (signal !== undefined) { if (signal.aborted) onAbort(); else signal.addEventListener("abort", onAbort, { once: true }); } }); }
-  private settle(pending: Pending, status: Exclude<SandLocalToolRequestStatus, "pending">, decision: SandLocalToolDecision, options?: { readonly rememberRefusal?: boolean }): SandLocalToolAskRequest { pending.expiryAbort.abort(); const key = this.pendingById.get(pending.request.id); if (key !== undefined && this.pendingByKey.get(key) === pending) this.pendingByKey.delete(key); this.pendingById.delete(pending.request.id); const settled = { ...pending.request, status }; pending.request = settled; if (options?.rememberRefusal ?? (status !== "allowed" && status !== "always")) this.rememberRefusedAction(pending); this.settledIds.add(pending.request.id); if (this.settledIds.size > SAND_LOCAL_TOOL_SETTLED_ID_MEMORY) { const oldest = this.settledIds.values().next(); if (!oldest.done) this.settledIds.delete(oldest.value); } for (const waiter of [...pending.waiters]) waiter(decision); pending.waiters.clear(); this.emit({ type: "settled", request: settled }); return settled; }
+  private settle(pending: Pending, status: Exclude<SandLocalToolRequestStatus, "pending">, decision: SandLocalToolDecision, options?: { readonly rememberRefusal?: boolean }): SandLocalToolAskRequest { pending.expiryAbort.abort(); const key = this.pendingById.get(pending.request.id); if (key !== undefined && this.pendingByKey.get(key) === pending) this.pendingByKey.delete(key); this.pendingById.delete(pending.request.id); const settled = { ...pending.request, status }; pending.request = settled; if (options?.rememberRefusal ?? isUserRefusal(status)) this.rememberRefusedAction(pending); this.settledIds.add(pending.request.id); if (this.settledIds.size > SAND_LOCAL_TOOL_SETTLED_ID_MEMORY) { const oldest = this.settledIds.values().next(); if (!oldest.done) this.settledIds.delete(oldest.value); } for (const waiter of [...pending.waiters]) waiter(decision); pending.waiters.clear(); this.emit({ type: "settled", request: settled }); return settled; }
   private emit(event: SandLocalToolControllerEvent): void { for (const listener of this.listeners) listener(event); }
 }

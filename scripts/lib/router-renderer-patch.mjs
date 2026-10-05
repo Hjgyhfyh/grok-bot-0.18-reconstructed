@@ -76,6 +76,92 @@ const ORPHANED_BRANCH_AFTER = 'if(u==null){r=!0;i.push(c);continue}';
 // offer, because then absence proves nothing.
 const THREAD_CLOSE_BEFORE = '!d&&I!=null&&!Y.has(I)&&P(null),!d&&A!=null&&!Y.has(A)&&E(null)';
 const THREAD_CLOSE_AFTER = '!d&&I!=null&&!Y.has(I)&&P(null),!d&&!f&&A!=null&&!Y.has(A)&&E(null)';
+// Injected into the registry chunk, beside `h3n`, and using that chunk's own
+// bindings: `S` (React), `p` (the jsx runtime), `Uwe` (the field the other three
+// agent fields use), `vt` (the secondary/erroneous text component) and `lr` (the
+// mutation wrapper that returns `{ok,value}` / `{ok,error}` instead of throwing).
+// Nothing here is imported and nothing new is added to the chunk's scope except the
+// two names below, which carry the `Rp` prefix of this patch.
+//
+// `lr` is used rather than a bare call so a refusal arrives as data. `updateAgent`
+// refuses an over-long instruction with a sentence instead of shortening it
+// (`AGENT_INSTRUCTIONS_MAX_BYTES`); an editor that swallowed that answer would show
+// a saved-looking box for a brief the host refused to store, which is the exact
+// shape of the defect this patch exists to close. `isPending` replaces the help line
+// while the write is in flight so the two states are never confused.
+export const AGENT_INSTRUCTIONS_COMPONENT_SOURCE = String.raw`
+const RpAgentInstructionsLabel="sand-1y1aw1k sand-jkvuk6 sand-163pfp sand-y13l1i sand-1wm8ruf sand-spwq11 sand-19aaqeu";
+function RpAgentInstructions(n){
+  const{agent:e,roster:t}=n,
+    {run:d,isPending:m}=lr(typeof t.updateAgent==="function"?t.updateAgent:async()=>{throw new Error("This build cannot save agent instructions.")}),
+    [s,i]=S.useState(null),
+    u=S.useCallback(l=>{
+      const c=String(l??"").replace(/\r\n?/g,"\n").trim();
+      if(c===(e.instructions??""))return;
+      return d(e.id,{name:e.name,description:e.description,instructions:c}).then(a=>{i(a.ok?null:"Not saved: "+String(a.error?.message??a.error))})
+    },[d,e.id,e.name,e.description,e.instructions]);
+  if(e.isGroup)return null;
+  const o=e.instructionsError??null;
+  return p.jsxs(p.Fragment,{children:[
+    p.jsx("div",{className:RpAgentInstructionsLabel,children:"Instructions"}),
+    o===null?p.jsx(Uwe,{ariaLabel:"Agent instructions",initialValue:e.instructions??"",isMultiline:!0,onCommit:u,placeholder:"What this agent should always do"}):null,
+    o===null?null:p.jsx(vt,{color:"red",size:"sm",children:o}),
+    s===null?null:p.jsx(vt,{color:"red",size:"sm",children:s}),
+    p.jsx(vt,{color:"secondary",size:"sm",children:m?"Saving\u2026":"Read by this agent on every turn."})
+  ]})
+}
+`;
+// The agent's own instruction text had nowhere to live in this build.
+//
+// The host half was finished first: `createAgent`/`updateAgent` carry an
+// `instructions` string, `splitAgentInstructions` pulls it out of the profile so a
+// later profile write cannot rebuild it away, and it lands in `instructions.md`
+// beside `profile.json` and is read on every prompt build. Nothing was missing on
+// the server. What was missing was a box.
+//
+// The agent dialog is `h3n`, in the registry chunk, and it is the one surface that
+// already edits the other two things an agent IS: `h3n` renders "Name", "Title"
+// and "Description" through the same `Uwe` field and commits each through a handler
+// that the dialog's caller wires to `updateAgent`. Instructions were the fourth
+// field, and the omission was invisible — the agent worked by the brief the user
+// typed, the prompt said so, and the settings screen showed three short boxes and
+// no sign that a fourth existed.
+//
+// The shape of the fix is the shape of the three fields above, deliberately: the
+// same `Uwe` multiline field, the same label element and label classes, the same
+// `updateAgent` call carrying `name`/`description` unchanged so a save cannot drop
+// them. Only one thing is added around it, and it is the honest part: a file that
+// is present but unreadable reports `instructionsError`, and that sentence is shown
+// in place of an empty box. An empty box and "this agent has no brief" look
+// identical, and that is the shape of the lie this avoids.
+//
+// Both anchors below are the shipped bytes and each occurs exactly once in
+// `index-lA9cgT4O.js`, which `applyOriginalRendererRouterPatch` proves by refusing
+// to patch a chunk where it is missing or ambiguous.
+const AGENT_SETTINGS_HEAD_BEFORE =
+  'function h3n(n){const e=he.c(31),{agent:t,onNameChange:s,onTitleChange:r,onDescriptionChange:i}=n,o=Qe().roster,{run:l,isPending:c}=lr(o.setAgentNotifyOnUpdates),u=S.useId();';
+// The memo cache grows by one slot (31) because the description node now carries the
+// instruction field with it. Reading slot 31 before anything writes it would still be
+// safe on a plain array, but `he.c` is `React.useMemoCache`, which fills with -1 so
+// that the compiler's own "has this slot ever been written" test works. Using an
+// untouched slot would mean reading `undefined` where every other slot reads -1, so
+// the size is bumped instead: the injected code then looks exactly like code the
+// compiler wrote.
+const AGENT_SETTINGS_HEAD_AFTER =
+  `${AGENT_INSTRUCTIONS_COMPONENT_SOURCE}function h3n(n){const e=he.c(32),{agent:t,onNameChange:s,onTitleChange:r,onDescriptionChange:i}=n,o=Qe().roster,{run:l,isPending:c}=lr(o.setAgentNotifyOnUpdates),u=S.useId();`;
+const AGENT_SETTINGS_DESCRIPTION_BEFORE =
+  'let N;e[13]!==t.description||e[14]!==i?(N=p.jsx(Uwe,{ariaLabel:"Agent description",initialValue:t.description,isMultiline:!0,onCommit:i,placeholder:"What this agent is for"}),e[13]=t.description,e[14]=i,e[15]=N):N=e[15];';
+// `t.instructions` joins the dependency test, and that is load-bearing rather than
+// decorative. `h3n`'s nodes are memoised: without the extra term, saving an
+// instruction updates the host, the roster emits a fresh row, `h3n` re-renders with
+// a new `t` whose `name` and `description` are the SAME STRINGS, every slot still
+// compares equal, and React reuses the identical element and never re-renders the
+// field. The save would work and the screen would keep showing the old text until
+// the dialog was reopened. The `initialValue` the field seeds from is
+// `t.instructions`, and `sIe` re-syncs a draft that is not focused, so one extra
+// term is what makes the box show what was just stored.
+const AGENT_SETTINGS_DESCRIPTION_AFTER =
+  'let N;e[13]!==t.description||e[14]!==i||e[31]!==t.instructions?(N=p.jsxs(p.Fragment,{children:[p.jsx(Uwe,{ariaLabel:"Agent description",initialValue:t.description,isMultiline:!0,onCommit:i,placeholder:"What this agent is for"}),p.jsx(RpAgentInstructions,{agent:t,roster:o})]}),e[13]=t.description,e[14]=i,e[31]=t.instructions,e[15]=N):N=e[15];';
 export const COMPONENT_SOURCE = String.raw`
 const RRouterProviders=[
   {value:"claude-code",label:"Claude Code",description:"Use your existing Claude Code sign-in and Grok Bot's connected plugins.",kind:"local",localKey:"claude-code"},
@@ -149,6 +235,21 @@ export function patchOriginalThreadSurfaces(source) {
   return patched;
 }
 
+/**
+ * Gives the agent settings dialog the fourth field it was missing.
+ *
+ * The head anchor is replaced first because it carries the injected component and
+ * the one-byte cache-size bump; the description anchor is replaced second, and it
+ * names that component. Both must hold, and `replaceExactlyOnce` throws on a chunk
+ * where either is missing or appears twice, so a drifted upstream build fails here
+ * rather than shipping a settings screen with no instructions field and no error.
+ */
+export function patchOriginalAgentInstructionsField(source) {
+  let patched = replaceExactlyOnce(source, AGENT_SETTINGS_HEAD_BEFORE, AGENT_SETTINGS_HEAD_AFTER, "agent settings head");
+  patched = replaceExactlyOnce(patched, AGENT_SETTINGS_DESCRIPTION_BEFORE, AGENT_SETTINGS_DESCRIPTION_AFTER, "agent settings description field");
+  return patched;
+}
+
 export async function applyOriginalRendererRouterPatch({ stageRoot }) {
   const assetsRoot = path.join(stageRoot, "dist", "renderer", "assets");
   const registryCandidates = [];
@@ -175,7 +276,7 @@ export async function applyOriginalRendererRouterPatch({ stageRoot }) {
   }
   const changes = [];
   for (const [role, candidate, transforms] of [
-    ["registry", registryCandidates[0], [patchOriginalSettingsRegistry, patchOriginalSignInGate, patchOriginalAccountSlot, patchOriginalThreadSurfaces]],
+    ["registry", registryCandidates[0], [patchOriginalSettingsRegistry, patchOriginalSignInGate, patchOriginalAccountSlot, patchOriginalThreadSurfaces, patchOriginalAgentInstructionsField]],
     ["panel", panelCandidates[0], [patchOriginalSettingsPanel, patchOriginalAccountRow]],
   ]) {
     const patched = transforms.reduce((source, transform) => transform(source), candidate.source);
@@ -191,8 +292,8 @@ export async function applyOriginalRendererRouterPatch({ stageRoot }) {
     schemaVersion: 1,
     mode: "original-renderer-settings-extension",
     chunks: changes,
-    features: ["settings-router-provider", "settings-local-docker-vm", "usage-current-provider", "skip-signin-gate", "shell-during-boot-check", "no-account-nag", "local-roster-without-account", "endpoint-model-picker", "no-cursor-provider", "thread-orphan-stays-visible", "thread-survives-off-window-root"],
-    transformations: ["settings-registry", "router-panel", "usage-panel", "component-source-injection", "signin-gate", "boot-check-gate", "account-chip-label", "account-row-label", "account-slot", "orphaned-branch-entry", "open-thread-close-guard"],
+    features: ["settings-router-provider", "settings-local-docker-vm", "usage-current-provider", "skip-signin-gate", "shell-during-boot-check", "no-account-nag", "local-roster-without-account", "endpoint-model-picker", "no-cursor-provider", "thread-orphan-stays-visible", "thread-survives-off-window-root", "agent-instructions-field"],
+    transformations: ["settings-registry", "router-panel", "usage-panel", "component-source-injection", "signin-gate", "boot-check-gate", "account-chip-label", "account-row-label", "account-slot", "orphaned-branch-entry", "open-thread-close-guard", "agent-instructions-component-injection", "agent-instructions-field"],
   };
   const provenancePath = path.join(stageRoot, "dist", "renderer-router-extension.json");
   await writeFile(provenancePath, `${JSON.stringify(record, null, 2)}\n`);

@@ -1,5 +1,5 @@
 import { existsSync, watch, type FSWatcher } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import type { EventEmitter } from "node:events";
 
 import { SAND_DEFAULT_AGENT_NAME } from "../../../shared/agents/agents.js";
@@ -16,6 +16,10 @@ import {
   getSandSettingsPath,
   SAND_SETTINGS_FILENAME,
 } from "../../agents/settings-file.js";
+import {
+  AGENT_INSTRUCTIONS_FILENAME,
+  readAgentInstructions,
+} from "../../runner/system-prompt-assembly.js";
 import type { RosterEmit } from "./roster-emit.js";
 import type { Disposable, TranscriptManagerLike } from "./transcript-hub.js";
 
@@ -78,6 +82,7 @@ export class ProfileWatch {
           if (
             filename !== SAND_PROFILE_FILENAME &&
             filename !== SAND_SETTINGS_FILENAME &&
+            filename !== AGENT_INSTRUCTIONS_FILENAME &&
             (filename == null || !isConventionalAvatarFilename(filename))
           )
             return;
@@ -130,11 +135,30 @@ export class ProfileWatch {
     };
   }
 
+  /**
+   * Everything about one agent that the host resolves from its folder.
+   *
+   * `instructions` is here for the same reason `filePath` and `settingsFilePath`
+   * are: it is a thing this agent has, it lives in a file, and the file is named
+   * so that a caller can show it to the user. The resolved profile used to answer
+   * a name and a description only, which is exactly the pair an agent card renders —
+   * so the one field that decides what the agent IS was reachable by the turn
+   * (`agentInstructionProvider` reads the same file on every prompt build) and by
+   * nobody who could show it. An instruction the user wrote could not be read back
+   * anywhere in the product.
+   *
+   * `undefined` on `profile` means `profile.json` is gone or unreadable, which says
+   * nothing about `instructions.md`: that file is written once and rewritten only
+   * by an instruction edit, so a lost profile cannot take the brief with it and the
+   * two are reported independently.
+   */
   resolveAgentProfile(session: { dbPath: string }): {
     name: string;
     description: string;
+    instructions: string;
     filePath: string;
     settingsFilePath: string;
+    instructionsFilePath: string;
   } {
     const dir = dirname(session.dbPath);
     const filePath = getSandProfilePath(dir);
@@ -142,8 +166,10 @@ export class ProfileWatch {
     return {
       name: profile?.name.trim() || SAND_DEFAULT_AGENT_NAME,
       description: profile?.description ?? "",
+      instructions: readAgentInstructions(dir),
       filePath,
       settingsFilePath: getSandSettingsPath(dir),
+      instructionsFilePath: join(dir, AGENT_INSTRUCTIONS_FILENAME),
     };
   }
 }
