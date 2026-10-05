@@ -2,8 +2,10 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { readdir, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { errorLogTag } from "../../../shared/errors.js";
+import { SandAgentNotFoundError } from "./agent-errors.js";
+import { removeTranscriptJournals as removeConversationTranscriptJournals } from "./agent-transcript-journal.js";
 import { getSandProfilePath, readSandProfileFile, writeSandProfileFile, type SandAgentProfile } from "../../agents/agent-profile.js";
 import { getSandSettingsPath, writeSandSettingsFile } from "../../agents/settings-file.js";
 import { AUTOMATION_UI_LIMIT } from "../../automations/automation.js";
@@ -18,7 +20,7 @@ import { buildSummary, loadAgentDbExtras, type DbExtras } from "./session-summar
 import { SandConnectorSecretStore } from "./connector-secret-store.js";
 import { ensureConversationCapacityForTurn } from "./conversation-size-limits.js";
 import { expirePendingAutoReviewApprovalEntries, expirePendingLocalToolPermissionAskEntries } from "./pending-card-sweeps.js";
-import { ACTIVE_AGENT_FILENAME, CONVERSATION_BLOBS_FILENAME, getAgentDbPath, getConnectorSecretsRoot, STORE_FILENAME, statIfExists } from "./session-paths.js";
+import { ACTIVE_AGENT_FILENAME, CONVERSATION_BLOBS_FILENAME, getAgentDbPath, getConnectorSecretsRoot, listAgentDirectoryIds, STORE_FILENAME, statIfExists } from "./session-paths.js";
 import { automationStoreForDbPath, channelStoreForDbPath, NO_SESSION_MEMORY, workflowStoreForDbPath } from "./session-store-factories.js";
 import { publishTranscriptMutation } from "../../transcript-mutation-events.js";
 import { reportSessionDiagnostic } from "./session-diagnostics.js";
@@ -123,7 +125,7 @@ export class SandAgentSessionStore {
   async createSession(profile: Partial<SandAgentProfile>, origin: "user" | "dev" = "user", purpose?: string): Promise<OpenAgentSession> { await this.reclaimDanglingAgentDirs(); return this.track(this.materialization?.createSession != null ? this.materialization.createSession(profile, origin, purpose) : this.createLocalSession(profile, origin, purpose)); }
   async mintAgent(mint: (agentId: string) => Promise<OpenAgentSession>): Promise<OpenAgentSession> { await this.reclaimDanglingAgentDirs(); if (this.materialization?.mintAgent != null) return this.track(this.materialization.mintAgent(mint)); let id = randomUUID(); while (this.agentDirExists(id)) id = randomUUID(); return this.track(mint(id)); }
   async createFallbackSession(open: (agentId: string) => Promise<OpenAgentSession>): Promise<OpenAgentSession> { await this.reclaimDanglingAgentDirs(); if (this.materialization?.createFallbackSession != null) return this.track(this.materialization.createFallbackSession(open)); const [agentId] = await this.listAgentIds(); if (agentId == null) throw new Error("No fallback session is available"); return this.track(open(agentId)); }
-  async openSession(agentId: string): Promise<OpenAgentSession> { if (this.materialization?.openSession != null) return this.track(this.materialization.openSession(agentId)); if (!this.agentExists(agentId)) throw new Error(`Agent missing: ${agentId}`); const dbPath = getAgentDbPath(this.rootDir, agentId); return this.track(Promise.resolve({ id: agentId, dbPath, db: new SandAgentDb(dbPath), agentStore: { dispose: async () => {} } })); }
+  async openSession(agentId: string): Promise<OpenAgentSession> { if (this.materialization?.openSession != null) return this.track(this.materialization.openSession(agentId)); if (!this.agentExists(agentId)) throw new SandAgentNotFoundError(`Agent missing: ${agentId}`); const dbPath = getAgentDbPath(this.rootDir, agentId); return this.track(Promise.resolve({ id: agentId, dbPath, db: new SandAgentDb(dbPath), agentStore: { dispose: async () => {} } })); }
   private track<T extends { id: string }>(opening: Promise<T>): Promise<T> { return opening.then((opened) => { this.openSessions.set(opened.id, opened as unknown as OpenAgentSession); return opened; }); }
 
   /**
@@ -159,10 +161,30 @@ export class SandAgentSessionStore {
     try { await connection.close(); }
     catch (error) { reportSessionDiagnostic({ family: "store_db", kind: "blob_worker_close_failed", agentId, errorClass: errorLogTag(error) }); }
   }
-  private async removeTranscriptJournal(agentId: string): Promise<void> {
-    if (!/^[A-Za-z0-9._-]+$/.test(agentId)) return;
-    try { await rm(join(dirname(this.rootDir), "agent-transcripts", agentId), { recursive: true, force: true, maxRetries: 2, retryDelay: 25 }); }
-    catch (error) { reportSessionDiagnostic({ family: "store_db", kind: "transcript_journal_remove_failed", agentId, errorClass: errorLogTag(error) }); }
+  /**
+   * Removes the transcript journals of the conversations this agent owns.
+   *
+   * The agent's own journal is one directory. Its subagents each own one too,
+   * under `agent-transcripts/subagent-<uuid>/`, because the mirror names a
+   * journal directory after the conversation id and a subagent conversation id
+   * is not an agent id. Nothing else in the host ever removed those, so every
+   * deleted agent left one directory per subagent it had ever run, and the
+   * journal count on a long-lived box grew for good. They are removed by name,
+   * from the ids the caller captured while the runner still knew them, and never
+   * by sweeping the transcript directory: a subagent conversation has no agent
+   * directory of its own, so a sweep cannot tell a dead subagent's journal from
+   * a live agent's, and it would eat the journals of agents that are alive.
+   *
+   * A journal that survives — a live session still holding a file in it — is
+   * returned to the caller instead of being reported to a log nobody reads and
+   * forgotten. That is the difference between "the transcript went with the
+   * agent" and "the transcript went, except the part that stayed".
+   */
+  private async removeTranscriptJournals(agentId: string, subagentIds: readonly string[]): Promise<string[]> {
+    const outcome = await removeConversationTranscriptJournals({ agentsRootDir: this.rootDir, conversationIds: [agentId, ...subagentIds] });
+    for (const refusal of outcome.refused) reportSessionDiagnostic({ family: "store_db", kind: "transcript_journal_id_refused", agentId: refusal.conversationId, errorClass: refusal.reason });
+    for (const conversationId of outcome.leftovers) reportSessionDiagnostic({ family: "store_db", kind: "transcript_journal_remove_failed", agentId: conversationId, errorClass: "journal_directory_still_present" });
+    return outcome.leftovers;
   }
   /**
    * Releases `store.db` in every holder that is not this store, then unlinks the
@@ -217,7 +239,7 @@ export class SandAgentSessionStore {
     Object.assign(error, { code: "SandAgentDeleteIncompleteError", agentId, leftovers });
     throw error;
   }
-  async deleteSession(agentId: string): Promise<void> { const dbPath = getAgentDbPath(this.rootDir, agentId); this.extrasCache.delete(agentId); await this.removeAgentDirOrFail(agentId); deleteSandAgentDbWriteGeneration(dbPath); await this.removeTranscriptJournal(agentId); this.options.onAgentRemoved?.(agentId); }
+  async deleteSession(agentId: string, options: { subagentIds?: readonly string[] } = {}): Promise<{ transcriptLeftovers: string[] }> { const dbPath = getAgentDbPath(this.rootDir, agentId); this.extrasCache.delete(agentId); await this.removeAgentDirOrFail(agentId); deleteSandAgentDbWriteGeneration(dbPath); const transcriptLeftovers = await this.removeTranscriptJournals(agentId, options.subagentIds ?? []); this.options.onAgentRemoved?.(agentId); return { transcriptLeftovers }; }
 
   activeAgentPointerPath(): string { return join(this.rootDir, ACTIVE_AGENT_FILENAME); }
   readActiveAgentId(): string | null { try { const parsed = JSON.parse(readFileSync(this.activeAgentPointerPath(), "utf8")) as { activeAgentId?: unknown }; const id = parsed.activeAgentId; return typeof id === "string" && id.length > 0 ? id : null; } catch { return null; } }
@@ -289,7 +311,7 @@ export class SandAgentSessionStore {
   private rosterHost() { return { rootDir: this.rootDir, isAgentBeingDeleted: (id: string) => this.isAgentBeingDeleted(id), memory: this.memory, loadCachedExtras: (args: { dirName: string; dbPath: string; dbStats: { size: number; mtimeMs: number } }) => this.loadCachedExtras(args), recoverAgentWithMissingDb: (args: { dbPath: string; dirName: string; activeAgentId?: string }) => recoverAgentWithMissingDb({ memory: this.memory, isAgentBeingDeleted: (id: string) => this.isAgentBeingDeleted(id), reseedMinimalStoreDbIfMissing: (path: string) => this.reseedMinimalStoreDbIfMissing(path) }, args), pruneExtrasCache: (ids: Set<string>) => { for (const id of this.extrasCache.keys()) if (!ids.has(id)) this.extrasCache.delete(id); } }; }
   async summarizeAgentById(agentId: string, activeAgentId?: string): Promise<Record<string, unknown> | null> { return summarizeAgentById(this.rosterHost(), agentId, activeAgentId); }
   async listAgents(activeAgentId?: string): Promise<Record<string, unknown>[]> { return listAgents(this.rosterHost(), activeAgentId); }
-  async listAgentIds(): Promise<string[]> { try { return (await readdir(this.rootDir, { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort(); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; } }
+  async listAgentIds(): Promise<string[]> { return listAgentDirectoryIds(this.rootDir); }
 
   async getTranscriptEntries(session: OpenAgentSession): Promise<TranscriptEntry[]> { return this.conversationState?.getTranscriptEntries(session) ?? session.db.getTranscriptEntries(); }
   async getSessionOutline(session: OpenAgentSession): Promise<unknown> { if (this.conversationState == null) throw new Error("Session conversation-state provider is required"); return this.conversationState.getSessionOutline(session); }

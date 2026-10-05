@@ -96,7 +96,7 @@ function requireText(args: unknown, field: string, command: string): string {
   return value;
 }
 
-/** A request field that must arrive as a string, and may be empty. */
+/** A request field that must arrive as a non-empty string. */
 function requirePath(args: unknown, field: string, command: string): string {
   const value = (args as unknown as Record<string, unknown> | null | undefined)?.[field];
   if (typeof value !== "string" || value.length === 0) {
@@ -105,6 +105,42 @@ function requirePath(args: unknown, field: string, command: string): string {
     );
   }
   return value;
+}
+
+/** What arrived instead of a field, in words the caller can act on. */
+function arrivalType(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "an array";
+  if (value === "") return "an empty string";
+  return typeof value;
+}
+
+/**
+ * The id list of a batch command, or a refusal that names the field.
+ *
+ * `deleteAgents` used to answer `200 {transcript:[…]}` for a request that named
+ * no agents at all — `{}`, `{"ids":"all"}`, `{"ids":42}` all arrived as an empty
+ * list, and an empty list deletes nothing and reports success. Measured on a live
+ * box: `POST /api/deleteAgents {}` returned `200` with the current transcript, so
+ * a caller that lost its payload could not tell a completed batch from one that
+ * never ran. An empty *array* is still a legitimate request for "delete nothing"
+ * and still answers `200`; what is refused is a payload that is not a list of ids.
+ */
+function requireIdList(args: unknown, command: string): string[] {
+  const value = (args as Record<string, unknown> | null | undefined)?.ids;
+  if (!Array.isArray(value)) {
+    throw new Error(
+      `Malformed ${command} request: "ids" must be an array, and ${arrivalType(value)} arrived.`,
+    );
+  }
+  for (const entry of value) {
+    if (typeof entry !== "string" || entry.length === 0) {
+      throw new Error(
+        `Malformed ${command} request: "ids" must hold non-empty strings, and ${arrivalType(entry)} arrived.`,
+      );
+    }
+  }
+  return [...value];
 }
 
 /**
@@ -405,14 +441,31 @@ export function createHostGatewayApi(
       method(manager, "appendConnectorCard")(args),
 
     listAgents: () => method(manager, "listAgents")(),
+    /**
+     * How many agents this host stores: the agent directories on disk, which is
+     * the same walk the fifty-agent cap refuses on. `listAgents` above is the
+     * roster projection and is allowed to answer fewer — it hides a directory
+     * with nothing in it, and one whose delete is in flight — so these two
+     * commands answer two different questions and are not two readings of one.
+     */
     countAgents: () => method(manager, "countAgentsOnDisk")(),
+    // An empty query is a real search for everything, so this one field uses the
+    // check that allows `""`. Without it a missing query reached the index and
+    // answered `500 {"error":"Cannot read properties of undefined (reading
+    // 'trim')"}`, which names neither the command nor the field.
     searchAgents: async (args: any) =>
       await method(deps.extensions.api("content-search"), "isEnabled")()
-        ? method(manager, "searchAgents")(args.query, args.limit)
+        ? method(manager, "searchAgents")(
+            requireText(args, "query", "searchAgents"),
+            args.limit,
+          )
         : [],
     searchMedia: async (args: any) =>
       await method(deps.extensions.api("content-search"), "isEnabled")()
-        ? method(manager, "searchMedia")(args.query, args.limit)
+        ? method(manager, "searchMedia")(
+            requireText(args, "query", "searchMedia"),
+            args.limit,
+          )
         : [],
     createAgent: (args: any) => {
       const nonce = args.clientNonce;
@@ -443,19 +496,29 @@ export function createHostGatewayApi(
     setGroupMembers: (args: any) =>
       method(manager, "setGroupMembers")(args.id, args.memberAgentIds),
     updateAgent: (args: any) =>
-      method(manager, "updateAgent")(args.id, args.profile),
+      method(manager, "updateAgent")(
+        requirePath(args, "id", "updateAgent"),
+        args.profile,
+      ),
     deleteAgent: async (args: any) => {
-      await method(sharing, "noteAgentDeleted")(args.id).catch(
+      // Measured on a live box: `POST /api/deleteAgent {}` answered
+      // `500 {"error":"The \"path\" argument must be of type string. Received
+      // undefined"}` — the text of a `node:path` call, naming no command, no
+      // field and no remedy. The id is the one field every agent command needs,
+      // so it is checked here as well as inside the lifecycle, which the
+      // coordinator reaches without passing this edge.
+      const agentId = requirePath(args, "id", "deleteAgent");
+      await method(sharing, "noteAgentDeleted")(agentId).catch(
         () => undefined
       );
-      const result = await method(manager, "deleteAgent")(args.id);
-      const cleanupFailures = await forgetDeletedAgent(args.id);
+      const result = await method(manager, "deleteAgent")(agentId);
+      const cleanupFailures = await forgetDeletedAgent(agentId);
       return cleanupFailures.length === 0
         ? result
         : { ...result, cleanupFailures };
     },
     deleteAgents: async (args: any) => {
-      const ids: string[] = Array.isArray(args.ids) ? args.ids : [];
+      const ids = requireIdList(args, "deleteAgents");
       const cleanupFailures: { agentId: string; error: string }[] = [];
       for (const id of ids) {
         try {
@@ -483,11 +546,20 @@ export function createHostGatewayApi(
      * forwards to the same host call its neighbour uses.
      */
     setAgentNotificationsEnabled: (args: any) =>
-      method(manager, "setAgentNotifyOnUpdates")(args.id, args.isEnabled),
+      method(manager, "setAgentNotifyOnUpdates")(
+        requirePath(args, "id", "setAgentNotificationsEnabled"),
+        args.isEnabled,
+      ),
     setAgentNotifyOnUpdates: (args: any) =>
-      method(manager, "setAgentNotifyOnUpdates")(args.id, args.isEnabled),
+      method(manager, "setAgentNotifyOnUpdates")(
+        requirePath(args, "id", "setAgentNotifyOnUpdates"),
+        args.isEnabled,
+      ),
     setAgentHiddenFromSidebar: (args: any) =>
-      method(manager, "setAgentHiddenFromSidebar")(args.id, args.isHidden),
+      method(manager, "setAgentHiddenFromSidebar")(
+        requirePath(args, "id", "setAgentHiddenFromSidebar"),
+        args.isHidden,
+      ),
     openAgent: (args: any) => openAgent(args, "switchAgent"),
     openAgentWindowed: (args: any) => openAgent(args, "openAgentWindowed"),
     openAgentTail: (args: any) => openAgent(args, "openAgentTail"),
@@ -495,7 +567,7 @@ export function createHostGatewayApi(
       method(manager, "setWindowFocused")(args.isFocused),
 
     getAgentMemories: (args: any) =>
-      method(manager, "getAgentMemories")(args.id),
+      method(manager, "getAgentMemories")(requirePath(args, "id", "getAgentMemories")),
     deleteAgentMemory: (args: any) =>
       method(manager, "deleteAgentMemory")(args.id, args.memoryId),
     clearAgentMemories: (args: any) =>
@@ -643,7 +715,9 @@ export function createHostGatewayApi(
     portAgentLocalSkills: (args: any) =>
       method(manager, "portAgentLocalSkills")(args.id),
     getConversationOutline: (args: any) =>
-      method(manager, "getConversationOutline")(args.id),
+      method(manager, "getConversationOutline")(
+        requirePath(args, "id", "getConversationOutline"),
+      ),
 
     skillsCatalog: () => method(managedSetup, "skillsCatalog")(),
     syncPluginSkills: () =>
@@ -687,7 +761,8 @@ export function createHostGatewayApi(
           ? null
           : Uint8Array.from(Buffer.from(args.pngBase64, "base64"))
       ),
-    getAgentAvatar: (args: any) => method(manager, "getAgentAvatar")(args.id),
+    getAgentAvatar: (args: any) =>
+      method(manager, "getAgentAvatar")(requirePath(args, "id", "getAgentAvatar")),
 
     getForeverBoxStatus: async (args: any) =>
       deps.decorateForeverBoxStatus(

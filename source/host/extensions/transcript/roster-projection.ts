@@ -113,8 +113,33 @@ export class RosterProjection {
     return agents;
   }
 
+  /**
+   * How many agents this host stores.
+   *
+   * This used to answer `(await sessionStore.listAgents()).length`, which is a
+   * question about the roster projection, not about the disk, under a name that
+   * claims the disk. The two differ on purpose and permanently:
+   *
+   *  - `listAgents` builds every row, and `buildSummary` returns `null` for a
+   *    directory with no transcript, no name, no title and no durable footprint.
+   *    A blank agent directory is on disk and off the roster.
+   *  - `listAgents` also skips any id whose delete has been requested
+   *    (`isAgentBeingDeleted`), for as long as that mark stands. The directory
+   *    is still there while the roster already stopped counting it — that is the
+   *    window in which the box answered `countAgents: 49` with 50 directories.
+   *
+   * Both differences are correct behaviour for a *list*. Neither is correct for
+   * a *count*, because the fifty-agent cap is computed from directories
+   * (`isAgentCapReached` → `countOwnedAgents` → the same directory walk). Two
+   * numbers for one question meant a caller could be told there was room for a
+   * new agent while the create answered `409`, with nothing to reconcile the two.
+   *
+   * So the count reads the directories, which is what its name promises and what
+   * the cap uses. `listAgents` stays a projection and is still the answer to
+   * "which agents should be shown".
+   */
   async countAgentsOnDisk(): Promise<number> {
-    return (await this.tm.sessionStore.listAgents()).length;
+    return this.tm.sessionStore.countOwnedAgents();
   }
 
   async isAgentCapReached(): Promise<boolean> {

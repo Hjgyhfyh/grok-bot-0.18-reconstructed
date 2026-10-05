@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { isSandAgentLimitError } from "../../../shared/agents/agents.js";
 import { errorLogTag, errorMessage } from "../../../shared/errors.js";
+import { SandAgentLifecycleError, SandAgentNotFoundError } from "../session/agent-errors.js";
 import {
   cloneAgentDir,
   cloneAgentDisplayName,
@@ -32,13 +33,27 @@ import { getTranscript } from "./transcript-store.js";
 import { classifyAgentError } from "./turn-runtime.js";
 import type { TranscriptManagerLike } from "./transcript-hub.js";
 
-export class SandAgentLifecycleError extends Error {}
+// Re-exported so every existing importer of this module keeps importing it from
+// here. The class itself lives with `SandAgentNotFoundError` in the session
+// layer, because the not-found subclass has to extend it and this module already
+// imports that layer.
+export { SandAgentLifecycleError };
 /**
  * One agent the delete could not remove. `error` is the log tag for the host
  * log; `detail` is the sentence the person deleting the agent reads, and it says
  * which files the app still holds and where the folder is.
  */
 interface DeleteFailure { readonly agentId: string; readonly error: string; readonly detail: string }
+/**
+ * A transcript journal directory that outlived the agent that owned it.
+ *
+ * The agent itself is gone either way; this says which conversation's journal did
+ * not go with it, so the caller learns it here instead of finding the directory
+ * on disk later and counting it as an agent nobody owns. `conversationIds` are
+ * conversation ids, and for a subagent that is `subagent-<uuid>`, which is why
+ * they are reported under their own names rather than as agent ids.
+ */
+interface TranscriptLeftover { readonly agentId: string; readonly conversationIds: string[] }
 interface CreateOptions {
   purpose?: string;
   isKickstartRequested?: boolean;
@@ -69,8 +84,75 @@ function splitAgentInstructions(profile: unknown): {
   return { instructions: normalizeAgentInstructions(instructions), identity };
 }
 
+/**
+ * How many removed ids the host remembers for the life of the process.
+ *
+ * The record answers one question — "did *this* process delete that id?" — and a
+ * host that removes an agent every minute for a month would otherwise hold 43 000
+ * uuid strings, none of which anybody can press again. Eviction only costs the
+ * weaker answer: a repeat delete of an id evicted long ago is refused again with
+ * the sentence an id that never existed gets.
+ */
+export const DELETED_AGENT_LEDGER_CAP = 512;
+
+/** What arrived instead of the field a command needs, in words a caller can act on. */
+function arrivalType(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "an array";
+  if (value === "") return "an empty string";
+  return typeof value;
+}
+
 export class AgentLifecycle {
   constructor(readonly tm: TranscriptManagerLike) {}
+
+  /**
+   * The ids this process removed from disk itself.
+   *
+   * `deleteAgents` used to read "already deleted" off the directory alone, and a
+   * directory cannot tell a second delete apart from a delete of an id nobody ever
+   * created. Measured on a live box carrying forty-nine agents: two `deleteAgent`
+   * calls for one agent answered `200 {deleted:[<id>]}` when they overlapped, and
+   * `500 No agent directory on disk for <id>` when the second call started after
+   * the first had finished. The same button, the same agent, the same end state —
+   * gone, deleted correctly — produced an error only because the second call was
+   * a moment slower than the first. The user had asked for the agent to be gone
+   * and the agent was gone.
+   *
+   * So a repeat delete is a success and a delete of an id that never existed stays
+   * a refusal, and this set is what tells them apart. It is process state on
+   * purpose: the host keeps no durable record that an agent ever existed, and
+   * inventing one on disk to serve a button is a worse trade than answering
+   * clearly. A repeat delete that arrives after a restart is refused again, with
+   * the sentence that names the agent.
+   */
+  private readonly removedAgentIds = new Set<string>();
+
+  private noteRemoved(agentId: string): void {
+    this.removedAgentIds.add(agentId);
+    for (const oldest of this.removedAgentIds.keys()) {
+      if (this.removedAgentIds.size <= DELETED_AGENT_LEDGER_CAP) break;
+      this.removedAgentIds.delete(oldest);
+    }
+  }
+
+  /**
+   * Refuses an id that is not an agent id, before anything builds a path out of it.
+   *
+   * `agentDirExists` and every store write below join the id onto the agent root,
+   * so a request that left the field out reached `node:path` and answered `500
+   * {"error":"The \"path\" argument must be of type string. Received undefined"}`
+   * — the text of one Node call, naming no command, no field and no remedy. These
+   * commands are reachable from the coordinator as well as from the gateway, so the
+   * check lives here and not only at the gateway edge.
+   */
+  private requireAgentId(agentId: unknown, command: string): string {
+    if (typeof agentId !== "string" || agentId.length === 0)
+      throw new SandAgentLifecycleError(
+        `Malformed ${command} request: "id" must be a non-empty string, and ${arrivalType(agentId)} arrived.`,
+      );
+    return agentId;
+  }
 
   async createAgent(
     profile: unknown,
@@ -414,11 +496,18 @@ export class AgentLifecycle {
   }
 
   async deleteAgent(agentId: string): Promise<any> {
+    // Checked here under this command's name, because `deleteAgents` is also the
+    // batch entry point and its refusal must name the command the caller used.
+    this.requireAgentId(agentId, "deleteAgent");
     const result = await this.tm.deleteAgents([agentId]);
     // A single delete that left the agent on disk answered `200` with the id in
     // `failed` and an empty `deleted`, so the caller closed its dialog on an
     // agent it still had. One target, one answer: either the directory is gone
     // or the call fails, and the failure says which files are in the way.
+    //
+    // An agent this process already removed is not that case and does not throw:
+    // the requested end state already holds, so the answer is the same success
+    // with `alreadyDeletedAgentIds` naming what was gone before the call.
     const failure = (result?.failed ?? []).find(
       (entry: any) => entry.agentId === agentId,
     );
@@ -429,30 +518,59 @@ export class AgentLifecycle {
     return result;
   }
   async deleteAgents(agentIds: readonly string[]): Promise<any> {
-    const ids = new Set(agentIds);
+    const ids = new Set<string>();
+    for (const id of agentIds) ids.add(this.requireAgentId(id, "deleteAgents"));
     if (ids.size === 0) return { transcript: getTranscript() };
-    const missing: string[] = [];
+    const absent: string[] = [];
     const present = new Set<string>();
     for (const id of ids) {
       if (this.tm.sessionStore.agentDirExists(id)) present.add(id);
-      else missing.push(id);
+      else absent.push(id);
     }
-    if (present.size === 0)
-      throw new SandAgentLifecycleError(
+    // An id this process removed is gone on purpose, and asking again for it is
+    // the same request answered twice. An id nobody ever created is a different
+    // answer and keeps its refusal below, name and all.
+    const alreadyDeleted = absent.filter((id) => this.removedAgentIds.has(id));
+    const missing = absent.filter((id) => !this.removedAgentIds.has(id));
+    // A refusal only fires when nothing in the request can be acted on. One id
+    // left to delete is reason enough to run the delete; one id already deleted is
+    // reason enough to succeed.
+    //
+    // The refusal is `SandAgentNotFoundError` rather than the lifecycle error it
+    // used to be, because the host has positively established that the id names
+    // nothing and `statusForCommandError` turns exactly that into `404`. A delete
+    // that lost a race with a file handle stays a lifecycle error and stays `500`:
+    // a client that retries on `404` must never be told to retry that one.
+    if (present.size === 0 && alreadyDeleted.length === 0)
+      throw new SandAgentNotFoundError(
         `No agent directory on disk for ${missing.join(", ")}`,
       );
     let result: any;
     try {
-      result = await this.runDeleteAgents(present);
+      // Nothing left to unlink, so the delete itself does no work. The answer
+      // still carries both lists: a caller reads `deleted` and `failed` to learn
+      // what happened, and a result without them is a different shape for the
+      // same command depending on how fast the first press was.
+      result =
+        present.size === 0
+          ? { transcript: getTranscript(), ...this.deletionOutcome([], []) }
+          : await this.runDeleteAgents(present);
     } catch (error) {
       for (const id of present)
         if (this.tm.sessionStore.agentDirExists(id))
           this.tm.sessions.deletedAgentIds.delete(id);
       throw error;
     }
-    return missing.length === 0
-      ? result
-      : { ...result, missingAgentIds: missing };
+    const report =
+      missing.length === 0 && alreadyDeleted.length === 0
+        ? {}
+        : {
+            ...(missing.length === 0 ? {} : { missingAgentIds: missing }),
+            ...(alreadyDeleted.length === 0
+              ? {}
+              : { alreadyDeletedAgentIds: alreadyDeleted }),
+          };
+    return Object.keys(report).length === 0 ? result : { ...result, ...report };
   }
   /**
    * Closes the handles that keep `store.db` and `conversation-blobs.db` open.
@@ -490,8 +608,49 @@ export class AgentLifecycle {
   private deletionOutcome(
     deleted: readonly string[],
     failed: readonly DeleteFailure[],
+    transcriptLeftovers: readonly TranscriptLeftover[] = [],
   ): Record<string, unknown> {
-    return { deleted: [...deleted], failed: [...failed] };
+    return {
+      deleted: [...deleted],
+      failed: [...failed],
+      // Only present when something survived, so a clean delete keeps the exact
+      // shape its callers already parse.
+      ...(transcriptLeftovers.length === 0
+        ? {}
+        : {
+            transcriptLeftovers: transcriptLeftovers.map((entry) => ({
+              agentId: entry.agentId,
+              conversationIds: [...entry.conversationIds],
+            })),
+          }),
+    };
+  }
+  /**
+   * The subagent conversation ids of one agent, read before its runner is dropped.
+   *
+   * A subagent owns a transcript journal directory of its own — the mirror names
+   * a journal directory after the conversation id, and a subagent conversation id
+   * is `subagent-<uuid>`, not an agent id. The runner is the only thing that
+   * knows which subagents an agent has, and `runners.delete(id)` is the line that
+   * throws that knowledge away, one line above the delete. Everything captured
+   * after it is gone, which is why the capture sits before the `delete`.
+   */
+  private subagentConversationIds(agentId: string): string[] {
+    const ids = [
+      ...(this.tm.runnerRegistry.runners.get(agentId)?.listSubagents?.() ?? []),
+      ...(this.tm.runnerRegistry.activeGroupMemberRunners
+        .get(agentId)
+        ?.listSubagents?.() ?? []),
+    ];
+    const seen = new Set<string>();
+    const conversationIds: string[] = [];
+    for (const entry of ids as Array<{ subagentId?: string } | string>) {
+      const id = typeof entry === "string" ? entry : entry?.subagentId;
+      if (typeof id !== "string" || id.length === 0 || seen.has(id)) continue;
+      seen.add(id);
+      conversationIds.push(id);
+    }
+    return conversationIds;
   }
   async runDeleteAgents(ids: ReadonlySet<string>): Promise<any> {
     const active = await this.tm.sessions.tryEnsureSession();
@@ -500,15 +659,25 @@ export class AgentLifecycle {
     for (const id of ids) this.tm.trayErrors.clearForAgent(id);
     const deleted: string[] = [];
     const failed: DeleteFailure[] = [];
+    const transcriptLeftovers: TranscriptLeftover[] = [];
     for (const id of ids) {
       if (id === active?.id) continue;
       try {
+        const subagentIds = this.subagentConversationIds(id);
         this.tm.runnerRegistry.runners.delete(id);
         const session = this.tm.sessions.liveSessions.get(id);
         this.tm.sessions.liveSessions.delete(id);
         this.tm.sessions.pendingSessionOpens.delete(id);
         await this.closeAgentHandles(id, session);
-        await this.tm.sessionStore.deleteSession(id);
+        const outcome = await this.tm.sessionStore.deleteSession(id, {
+          subagentIds,
+        });
+        if (outcome?.transcriptLeftovers?.length) {
+          transcriptLeftovers.push({
+            agentId: id,
+            conversationIds: outcome.transcriptLeftovers,
+          });
+        }
         // The id was marked deleted before the unlink and the mark outlived the
         // directory: the roster skipped the agent for the rest of the run, and a
         // directory that came back later (`new SandAgentDb` recreates it) was
@@ -520,6 +689,7 @@ export class AgentLifecycle {
         this.tm.boxHandoff.boxHandoffs.delete(id);
         this.tm.boxHandoff.awaitingSink.clear(id);
         this.tm.roster.emitAsyncTasksForAgent(id);
+        this.noteRemoved(id);
         deleted.push(id);
       } catch (error) {
         failed.push({ agentId: id, error: errorLogTag(error), detail: errorMessage(error) });
@@ -530,17 +700,17 @@ export class AgentLifecycle {
     }
     if (!deletingActive || active == null) {
       await this.tm.roster.emitAgents();
-      return { transcript: getTranscript(), ...this.deletionOutcome(deleted, failed) };
+      return { transcript: getTranscript(), ...this.deletionOutcome(deleted, failed, transcriptLeftovers) };
     }
     try {
-      return await this.finishDeletingActiveAgent(active, ids, deleted, failed);
+      return await this.finishDeletingActiveAgent(active, ids, deleted, failed, transcriptLeftovers);
     } catch (error) {
       failed.push({ agentId: active.id, error: errorLogTag(error), detail: errorMessage(error) });
       console.error(
         `[sand] delete of active agent ${active.id} failed: ${errorLogTag(error)}: ${errorMessage(error)}`,
       );
       await this.tm.roster.emitAgents();
-      return { transcript: getTranscript(), ...this.deletionOutcome(deleted, failed) };
+      return { transcript: getTranscript(), ...this.deletionOutcome(deleted, failed, transcriptLeftovers) };
     }
   }
   private async finishDeletingActiveAgent(
@@ -548,14 +718,24 @@ export class AgentLifecycle {
     ids: ReadonlySet<string>,
     deleted: string[],
     failed: DeleteFailure[],
+    transcriptLeftovers: TranscriptLeftover[] = [],
   ): Promise<any> {
+    const activeSubagentIds = this.subagentConversationIds(active.id);
     await this.closeAgentHandles(active.id, active);
     this.tm.runnerRegistry.runners.delete(active.id);
     this.tm.sessions.liveSessions.delete(active.id);
     this.tm.sessions.pendingSessionOpens.delete(active.id);
     this.tm.runLifecycle.closeSessionWhenIdle(active);
-    await this.tm.sessionStore.deleteSession(active.id);
+    const activeOutcome = await this.tm.sessionStore.deleteSession(active.id, {
+      subagentIds: activeSubagentIds,
+    });
+    if (activeOutcome?.transcriptLeftovers?.length)
+      transcriptLeftovers.push({
+        agentId: active.id,
+        conversationIds: activeOutcome.transcriptLeftovers,
+      });
     this.tm.sessions.deletedAgentIds.delete(active.id);
+    this.noteRemoved(active.id);
     deleted.push(active.id);
     this.tm.onAgentForgotten?.(active.id);
     this.tm.pendingWakeStore?.clearAgent(active.id);
@@ -597,7 +777,7 @@ export class AgentLifecycle {
         entries,
       });
       await this.tm.roster.emitAgents();
-      return { transcript: entries, ...this.deletionOutcome(deleted, failed) };
+      return { transcript: entries, ...this.deletionOutcome(deleted, failed, transcriptLeftovers) };
     }
     try {
       const next = await this.tm.sessionStore.createFallbackSession(
@@ -611,7 +791,7 @@ export class AgentLifecycle {
       this.tm.sessions.loaded = true;
       this.tm.roster.emit({ type: "cleared" });
       await this.tm.roster.emitAgents();
-      return { transcript: getTranscript(), ...this.deletionOutcome(deleted, failed) };
+      return { transcript: getTranscript(), ...this.deletionOutcome(deleted, failed, transcriptLeftovers) };
     } catch (error) {
       if (!isSandAgentLimitError(error)) throw error;
       this.tm.sessions.activeSession = undefined;
@@ -620,7 +800,7 @@ export class AgentLifecycle {
       this.tm.sessions.loaded = false;
       this.tm.roster.emit({ type: "cleared" });
       await this.tm.roster.emitAgents();
-      return { transcript: getTranscript(), ...this.deletionOutcome(deleted, failed) };
+      return { transcript: getTranscript(), ...this.deletionOutcome(deleted, failed, transcriptLeftovers) };
     }
   }
 
@@ -670,8 +850,9 @@ export class AgentLifecycle {
     const title = text(profile?.title);
     const name = text(profile?.name);
     const description = text(profile?.description);
+    this.requireAgentId(agentId, "updateAgent");
     if (!this.tm.sessionStore.agentDirExists(agentId))
-      throw new SandAgentLifecycleError(
+      throw new SandAgentNotFoundError(
         `Agent ${agentId} no longer exists on disk.`,
       );
     // `undefined` means "this update says nothing about instructions" and the
@@ -740,10 +921,15 @@ export class AgentLifecycle {
    * id; the switches are the same operation on the same id and owe the same
    * answer. The refusal names the agent, because a caller holding several ids
    * cannot otherwise tell which one is gone.
+   *
+   * The command name travels with the call because the refusal now runs before
+   * the id is known to be usable: an id that never was a string used to reach
+   * `node:path` and answer with that call's own text instead of this sentence.
    */
-  private requireAgentOnDisk(agentId: string): void {
+  private requireAgentOnDisk(agentId: string, command: string): void {
+    this.requireAgentId(agentId, command);
     if (!this.tm.sessionStore.agentDirExists(agentId))
-      throw new SandAgentLifecycleError(
+      throw new SandAgentNotFoundError(
         `Agent ${agentId} no longer exists on disk.`,
       );
   }
@@ -751,7 +937,7 @@ export class AgentLifecycle {
     agentId: string,
     enabled: boolean,
   ): Promise<void> {
-    this.requireAgentOnDisk(agentId);
+    this.requireAgentOnDisk(agentId, "setAgentNotifyOnUpdates");
     this.tm.sessionStore.setSessionNotifyOnUpdates(agentId, enabled);
     await this.tm.roster.emitAgentUpdate(agentId);
   }
@@ -759,7 +945,7 @@ export class AgentLifecycle {
     agentId: string,
     hidden: boolean,
   ): Promise<void> {
-    this.requireAgentOnDisk(agentId);
+    this.requireAgentOnDisk(agentId, "setAgentHiddenFromSidebar");
     this.tm.sessionStore.setSessionHiddenFromSidebar(agentId, hidden);
     await this.tm.roster.emitAgentUpdate(agentId);
   }

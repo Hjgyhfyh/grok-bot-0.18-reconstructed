@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readdir, rm, stat } from "node:fs/promises";
+import { rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { getSandProfilePath, writeSandProfileFile, type SandAgentProfile } from "../../agents/agent-profile.js";
 import { getSandSettingsPath, writeSandSettingsFile } from "../../agents/settings-file.js";
 import { SandAgentDb, ensureAgentDbDirectory } from "./agent-db.js";
-import { getAgentDbPath, STORE_FILENAME } from "./session-paths.js";
+import { getAgentDbPath, listAgentDirectoryIds, STORE_FILENAME } from "./session-paths.js";
 import { buildSummary, readDbExtras } from "./session-summaries.js";
 import { automationStoreForDbPath, channelStoreForDbPath, workflowStoreForDbPath } from "./session-store-factories.js";
 import type { AgentWorkerPool } from "../../agent-isolation/agent-worker-pool.js";
@@ -52,7 +52,7 @@ export class SandSessionMaterialization {
 
   requireWorkerPool(): AgentWorkerPool { this.workerPool ??= this.host.createBlobWorkerPool(); return this.workerPool; }
   async closeWorkerPool(): Promise<void> { const pool = this.workerPool; if (pool == null) return; this.workerPool = null; await pool.closeAll(); }
-  async listAgentRecordIds(): Promise<string[]> { try { return (await readdir(this.host.rootDir, { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort(); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; } }
+  async listAgentRecordIds(): Promise<string[]> { return listAgentDirectoryIds(this.host.rootDir); }
   async countOwnedAgents(): Promise<number> { return (await this.listAgentRecordIds()).length; }
   enqueueMint<T>(run: () => Promise<T>): Promise<T> { const next = this.mintChain.then(run, run); this.mintChain = next.then(() => {}, () => {}); return next; }
 

@@ -1,4 +1,4 @@
-import { stat } from "node:fs/promises";
+import { readdir, stat } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -25,6 +25,23 @@ export function isStaleRootGcEnabled(env: NodeJS.ProcessEnv = process.env): bool
   return pinnedStaleRootGcEnabled;
 }
 export function getSandTranscriptsDir(homeDir = homedir()): string { return join(getSandRootDir(homeDir), "agent-transcripts"); }
+/**
+ * The one definition of "which agents exist on this host".
+ *
+ * A directory under `agents/` IS an agent. It may be blank, it may be one whose
+ * delete is in flight, it may be a placeholder no roster shows — it still
+ * occupies one of the fifty slots `isAgentCapReached` computes from, and a count
+ * that disagreed with this one made `countAgents` answer 49 while 50 directories
+ * sat on disk.
+ *
+ * It used to be written out twice, in `SandAgentSessionStore.listAgentIds` and
+ * in `SandSessionMaterialization.listAgentRecordIds`. Two copies of one rule is
+ * two chances for the cap and the counter to drift apart.
+ */
+export async function listAgentDirectoryIds(agentsRootDir: string): Promise<string[]> {
+  try { return (await readdir(agentsRootDir, { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort(); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+}
 export function getAgentDbPath(rootDir: string, agentId: string): string { assertValidSandAgentId(agentId); return join(rootDir, agentId, STORE_FILENAME); }
 export function getConnectorSecretsRoot(agentsRootDir = getSandAgentsRootDir()): string { return join(dirname(agentsRootDir), CONNECTOR_SECRETS_DIRNAME); }
 

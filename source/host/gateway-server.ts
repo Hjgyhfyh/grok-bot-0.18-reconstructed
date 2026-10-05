@@ -8,11 +8,34 @@ import { GATEWAY_LOCAL_EXEC_REQUESTS_PATH, GATEWAY_LOCAL_EXEC_RESPONSES_PATH } f
 import { parseTraceparent } from "../shared/observability/send-trace.js";
 import { GATEWAY_WEBAUTHN_REQUESTS_PATH, GATEWAY_WEBAUTHN_RESPONSES_PATH } from "../shared/webauthn-gateway.js";
 import { classifyGatewayCommandError } from "./gateway-command-error.js";
-import { GATEWAY_PREPARE_UPGRADE_PATH, SAND_GATEWAY_COMMANDS, SAND_GATEWAY_SLIM_COMMANDS, isLoopbackHost, stripInlineAvatarsFromEvent } from "./gateway-protocol.js";
+import { GATEWAY_PREPARE_UPGRADE_PATH, SAND_GATEWAY_COMMANDS, SAND_GATEWAY_SLIM_COMMANDS, isLoopbackHost, parseCommandArgs, stripInlineAvatarsFromEvent } from "./gateway-protocol.js";
+import { isAgentNotFoundError } from "./extensions/session/agent-errors.js";
 
 export class SandGatewayRequestError extends Error { constructor(message: string) { super(message); this.name = "SandGatewayRequestError"; } }
 export const GATEWAY_REQUEST_ID_HEADER = "x-sand-request-id"; export const SSE_HEARTBEAT_MS = 15_000; export const MAX_REQUEST_PAYLOAD_BYTES = 256 * 1024 * 1024; export const MAX_BODY_BYTES = Math.ceil(MAX_REQUEST_PAYLOAD_BYTES * 4 / 3) + 64 * 1024; export const GZIP_MIN_BYTES = 1_400; export const DISABLE_SSE_GZIP_ENV = "SAND_DISABLE_GATEWAY_SSE_GZIP";
-export function statusForCommandError(error: unknown): number { const name = error instanceof Error ? error.name : ""; return name === "SandAgentLimitError" || name === "SandSkillPublishError" ? 409 : 500; }
+/**
+ * The HTTP status a command failure is reported with.
+ *
+ * Three answers, and the third one is the one that was missing.
+ *
+ *  - `SandAgentLimitError` and `SandSkillPublishError` are `409`: the request was
+ *    well formed, the host understood it, and the state refuses it.
+ *  - "That agent id names nothing" is `404`. It used to be `500`, which told the
+ *    caller the server broke. Measured on a live box: a delete of an id nobody
+ *    created, an update of one, and either of the two sidebar switches all
+ *    answered `500 {"error":"No agent directory on disk for <id>"}` — and
+ *    `getHealth` said the host was fine. A client cannot tell that from a crash,
+ *    so it retries a request that can never succeed.
+ *  - Everything else stays `500`.
+ *
+ * The `404` is decided by `isAgentNotFoundError`, which matches one error class
+ * and a short list of names — never a message, and never the whole
+ * `SandAgentLifecycleError` family. That family also carries a delete that lost
+ * a race with a file handle and a summary that could not be built. Mapping it to
+ * `404` would tell a client to retry a delete it must not retry, which is a worse
+ * failure than the status code it replaces.
+ */
+export function statusForCommandError(error: unknown): number { const name = error instanceof Error ? error.name : ""; if (name === "SandAgentLimitError" || name === "SandSkillPublishError") return 409; if (isAgentNotFoundError(error)) return 404; return 500; }
 export async function readBody(req: AsyncIterable<unknown>): Promise<string> { const chunks: Buffer[] = []; let total = 0; for await (const chunk of req) { const buffer = chunk instanceof Buffer ? chunk : Buffer.from(chunk as ArrayBuffer); total += buffer.length; if (total > MAX_BODY_BYTES) throw new SandGatewayRequestError("Request body is too large."); chunks.push(buffer); } return Buffer.concat(chunks).toString("utf8"); }
 export function clientAcceptsGzip(req: IncomingMessage): boolean { const header = req.headers["accept-encoding"]; const value = Array.isArray(header) ? header.join(",") : header; return typeof value === "string" && value.toLowerCase().includes("gzip"); }
 export function clientWantsSlimAvatars(req: IncomingMessage): boolean { const header = req.headers[GATEWAY_SLIM_AVATARS_HEADER]; return (Array.isArray(header) ? header[0] : header) === "1"; }
@@ -33,7 +56,23 @@ export interface GatewayServerDeps {
   readonly webauthn?: { registerProvider(listener: (frame: unknown) => void): () => void; submitResponses(batch: unknown): void };
 }
 
-export async function routeCommand(deps: GatewayServerDeps, method: string, body: string, res: ServerResponse, req: IncomingMessage): Promise<void> { if (!Object.hasOwn(SAND_GATEWAY_COMMANDS, method)) return respondError(res, 404, `unknown gateway method: ${method}`); const table = clientWantsSlimAvatars(req) ? SAND_GATEWAY_SLIM_COMMANDS : SAND_GATEWAY_COMMANDS; const handler = (table as Record<string, (api: unknown, body: string) => unknown>)[method]; if (handler == null) return respondError(res, 404, `unknown gateway method: ${method}`); const requestId = headerValue(req, GATEWAY_REQUEST_ID_HEADER); const { traceparent: _parent, ...traceIds } = commandTrace(req); const startedAt = Date.now(); let result: unknown; try { result = await handler(deps.api, body); } catch (error) { if (deps.onCommandError != null && statusForCommandError(error) >= 500) { try { deps.onCommandError({ method, ...classifyGatewayCommandError(error), durationMs: Date.now() - startedAt, requestId, ...traceIds }); } catch {} } throw error; } if (deps.onCommandComplete != null) { try { deps.onCommandComplete({ method, durationMs: Date.now() - startedAt, requestId, ...traceIds }); } catch {} } respondJson(res, result, req); }
+/**
+ * Rejects a body that is not JSON before the command table parses it.
+ *
+ * Measured on a live box: `POST /api/deleteAgent {"id":` answered
+ * `500 {"error":"Unexpected end of JSON input"}` — one V8 sentence, no command,
+ * no field, and a status that blames the server for the caller's typo. The parse
+ * lives inside each table entry, so the dispatcher sees only the `SyntaxError`.
+ * Parsing once here as a gate costs a second parse of an already buffered string
+ * and leaves the table signature alone; a body that parses still reaches the same
+ * handler with the same bytes.
+ */
+export function refuseUnparsableBody(method: string, body: string, res: ServerResponse): boolean {
+  try { parseCommandArgs(body); } catch { respondError(res, 400, `Malformed ${method} request: the body is not valid JSON.`); return true; }
+  return false;
+}
+
+export async function routeCommand(deps: GatewayServerDeps, method: string, body: string, res: ServerResponse, req: IncomingMessage): Promise<void> { if (!Object.hasOwn(SAND_GATEWAY_COMMANDS, method)) return respondError(res, 404, `unknown gateway method: ${method}`); if (refuseUnparsableBody(method, body, res)) return; const table = clientWantsSlimAvatars(req) ? SAND_GATEWAY_SLIM_COMMANDS : SAND_GATEWAY_COMMANDS; const handler = (table as Record<string, (api: unknown, body: string) => unknown>)[method]; if (handler == null) return respondError(res, 404, `unknown gateway method: ${method}`); const requestId = headerValue(req, GATEWAY_REQUEST_ID_HEADER); const { traceparent: _parent, ...traceIds } = commandTrace(req); const startedAt = Date.now(); let result: unknown; try { result = await handler(deps.api, body); } catch (error) { if (deps.onCommandError != null && statusForCommandError(error) >= 500) { try { deps.onCommandError({ method, ...classifyGatewayCommandError(error), durationMs: Date.now() - startedAt, requestId, ...traceIds }); } catch {} } throw error; } if (deps.onCommandComplete != null) { try { deps.onCommandComplete({ method, durationMs: Date.now() - startedAt, requestId, ...traceIds }); } catch {} } respondJson(res, result, req); }
 
 export function openSseStream(req: IncomingMessage, res: ServerResponse, register: (write: (data: string) => void) => () => void): void { const gzipEnabled = process.env[DISABLE_SSE_GZIP_ENV] !== "1" && clientAcceptsGzip(req); res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache, no-transform", connection: "keep-alive", ...(gzipEnabled ? { "content-encoding": "gzip", vary: "Accept-Encoding" } : {}) }); const zipper = gzipEnabled ? createGzip({ flush: zlibConstants.Z_SYNC_FLUSH }) : null; zipper?.pipe(res); const sink = zipper ?? res; sink.write("retry: 1000\n\n"); const unsubscribe = register((data) => sink.write(`data: ${data}\n\n`)); const heartbeat = setInterval(() => sink.write(":ping\n\n"), SSE_HEARTBEAT_MS); res.on("close", () => { clearInterval(heartbeat); unsubscribe(); zipper?.destroy(); }); }
 export function parseSubscribedChannels(url: URL): Set<string> | undefined { const raw = url.searchParams.get("channels"); if (raw === null) return undefined; const channels = raw.split(",").map((value) => value.trim()).filter(Boolean); return channels.length > 0 ? new Set(channels) : undefined; }

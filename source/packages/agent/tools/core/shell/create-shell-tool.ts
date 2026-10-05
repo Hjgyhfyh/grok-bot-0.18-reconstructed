@@ -586,6 +586,19 @@ async function executeStream(ctx: Context, executor: ShellStreamExecutor, args: 
   return makeResultFromStream(args.command, args.workingDirectory, stdout, stderr, interleavedOutput, exit, policy);
 }
 
+/**
+ * A cancelled call and a call that never started are different events with
+ * different causes: one is the user's decision, the other is the environment's
+ * fault. `classifyError` in `tools/core.ts` already reads the abort correctly as
+ * `ToolErrorClassification.ABORTED`, and this function threw that reading away
+ * by falling through to the catch-all below, so the model was told
+ * "Command failed to spawn: Aborted" and spent the next turn trying to repair an
+ * environment that had never been broken.
+ */
+function isShellCancellation(error: unknown): boolean {
+  return error instanceof ToolCallAbortedError || (error instanceof Error && error.name === "AbortError");
+}
+
 function serializeShellError(error: unknown): ToolCall {
   const result = error instanceof ShellToolRejectedError
     ? { case: "rejected" as const, value: new ShellRejected({ command: error.command, workingDirectory: error.workingDirectory ?? "", reason: error.reason }) }
@@ -593,7 +606,13 @@ function serializeShellError(error: unknown): ToolCall {
       ? { case: "permissionDenied" as const, value: new ShellPermissionDenied({ command: error.command, workingDirectory: error.workingDirectory ?? "", error: error.error, isReadonly: error.isReadonly }) }
       : error instanceof ShellToolTimeoutError
         ? { case: "timeout" as const, value: new ShellTimeout({ command: error.command, workingDirectory: error.workingDirectory ?? "", timeoutMs: error.timeoutMs }) }
-        : { case: "spawnError" as const, value: new ShellSpawnError({ error: error instanceof Error ? error.message : String(error) }) };
+        : isShellCancellation(error)
+          // `aborted` plus `USER_ABORT` is the shape `formatters.ts` already
+          // renders as "Command was aborted by the user", and it is the shape a
+          // genuinely killed process produces, so the model sees one story for
+          // one cause.
+          ? { case: "failure" as const, value: new ShellFailure({ command: "", workingDirectory: "", exitCode: 0, signal: "SIGTERM", aborted: true, abortReason: ShellAbortReason.USER_ABORT }) }
+          : { case: "spawnError" as const, value: new ShellSpawnError({ error: error instanceof Error ? error.message : String(error) }) };
   return createShellToolCall(new ShellToolCall({ result: new ShellResult({ result }) }));
 }
 

@@ -13,6 +13,29 @@ if (!isWindowsRuntimeHost) {
   throw new Error("The reconstructed Windows application can only be packaged on Windows.");
 }
 
+/**
+ * Removes a directory that a stopped build may still have open.
+ *
+ * EBUSY and EPERM mean somebody is still holding a file, which on Windows is
+ * normal for a few seconds after a process is asked to quit. Everything else is
+ * a real failure and is raised immediately rather than retried into a confusing
+ * timeout.
+ */
+const REMOVAL_RETRYABLE_CODES = new Set(["EBUSY", "EPERM", "ENOTEMPTY"]);
+async function removeOutputApp(directory, attempts = 20) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await rm(directory, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      const code = error?.code;
+      if (!REMOVAL_RETRYABLE_CODES.has(code) || attempt >= attempts) throw error;
+      // 150ms, doubling to roughly 8s of total patience across the attempts.
+      await new Promise((resolve) => setTimeout(resolve, Math.min(150 * 2 ** (attempt - 1), 1_000)));
+    }
+  }
+}
+
 // Keep the checksum-pinned shipped renderer as the polished UI authority. Small
 // reconstructed UI extensions are installed by the clean preload, leaving the
 // original renderer chunks byte-for-byte intact.
@@ -21,7 +44,12 @@ const { builtAsar, builtAsarUnpacked, runtimeApp } = await buildFidelityReconstr
 // the macOS build there is no separate signed release audit to run: the payload
 // copied below is the reference itself.
 await mkdir(outputDir, { recursive: true });
-await rm(outputApp, { recursive: true, force: true });
+// Windows keeps a handle on an executable that is still running, so removing the
+// output directory fails with EBUSY while the previous build is up. Retrying for
+// a few seconds turns "stop the app first, and time it exactly right" into
+// "stop the app first"; a single unretried `rm` made the whole package step fail
+// on a timing detail the caller cannot see.
+await removeOutputApp(outputApp);
 // `ditto` is a macOS tool and has no Windows equivalent. `fs.cp` reproduces the
 // same metadata-preserving tree copy: `dereference: false` keeps the runtime's
 // directory layout exactly as shipped instead of resolving anything through a
