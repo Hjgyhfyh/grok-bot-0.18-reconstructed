@@ -49,6 +49,55 @@ export class RunnerRegistry {
     return hadActiveRun;
   }
 
+  /**
+   * The user's own stop, for one agent.
+   *
+   * `interruptAll` is the one primitive that reaches everything a turn owns: the
+   * foreground run, plus every subagent session it dispatched
+   * (`SandAgentRunner.interruptAll` at source/host/runner/sand-agent-runner.ts:1201
+   * walks `subagents.sessions` after aborting the active run). Everything the
+   * stop needs downstream hangs off that one abort — the model stream, a waiting
+   * permission ask, a running shell's process tree — so this deliberately adds no
+   * second path of its own.
+   *
+   * It reads the two maps and never calls `getRunner`. Creating a runner for an
+   * agent that has never run would be a side effect of asking whether it was
+   * busy, and the answer has to be safe to give for an agent that is not.
+   *
+   * The two reported facts are read at different moments on purpose.
+   * `hadRunningSubagents` is measured BEFORE the interrupt, because that is the
+   * only moment at which it means anything: afterwards every subagent is aborting
+   * whether or not it ever was running, and the same `false` would be returned
+   * for "stopped three subagents" and for "there was nothing to stop".
+   * `interrupted` is `interruptAll`'s own return, which is true only when an
+   * active run actually took the abort. `interruptAll` returns that single flag
+   * and says nothing about its subagent loop, so the two are reported apart
+   * rather than folded into one "did it work" boolean that cannot mean it.
+   */
+  interruptUserRun(
+    agentId: string,
+    reason: string,
+  ): { interrupted: boolean; hadRunningSubagents: boolean } {
+    const runner = this.runners.get(agentId);
+    const groupRunner = this.activeGroupMemberRunners.get(agentId);
+    if (runner == null && groupRunner == null) {
+      return { interrupted: false, hadRunningSubagents: false };
+    }
+    const hadRunningSubagents =
+      (runner?.hasRunningSubagents?.() === true) ||
+      (groupRunner?.hasRunningSubagents?.() === true);
+    // Both runners are called, unconditionally, before the flags are combined.
+    // They used to be folded into one `a || b`, which short-circuits: an agent
+    // with a live direct-chat runner answered `true` and the group-member runner
+    // was never asked, so the stop stopped the direct turn and left the group room
+    // talking. Both ids can be live at once — `group-chat-glue.ts` files the
+    // member runner under the member's own agent id — and a stop that reaches one
+    // of them is a stop that does not reach the room the user is watching.
+    const interruptedOwnRun = runner?.interruptAll?.(reason) === true;
+    const interruptedGroupRun = groupRunner?.interruptAll?.(reason) === true;
+    return { interrupted: interruptedOwnRun || interruptedGroupRun, hadRunningSubagents };
+  }
+
   attachRunner(runner: any): void {
     this.tm.attachRunnerFactory((session: any, hooks: any) => {
       runner.setAgentStore(session.agentStore, hooks.agentProfileProvider);

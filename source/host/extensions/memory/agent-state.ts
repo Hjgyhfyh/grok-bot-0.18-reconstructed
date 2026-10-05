@@ -9,8 +9,17 @@ import { CANONICAL_AVATAR_FILENAME, invalidateAvatarDataUrlCache, listConvention
 import { isBoxRootPath } from "../../box/box-transfer.js";
 import { FileMemoryStore, getProjectDir, getProjectMemoryShardDir, getUserMemoryShardDir, projectDirExists, type MemoryKind } from "./memory-service.js";
 
-export type StateWriteResult = { ok: true; message: string } | { ok: false; message: string };
-const ok = (message: string): StateWriteResult => ({ ok: true, message }), fail = (message: string): StateWriteResult => ({ ok: false, message });
+/**
+ * The union `SandStateWriter` declares in `runner/tools/sand-state-tool.ts` and
+ * the tool reads: `createSandStateTool` returns `outcome.detail` on success and
+ * `Not saved — ${outcome.reason}` on a refusal. This file used to spell the same
+ * union as `{ ok, message }`, so every successful `update_state` handed the
+ * model `undefined` and every refusal read "Not saved — undefined" — including
+ * the profile write below, which therefore renamed the agent in silence.
+ * Nothing in the repository reads `.message` off this result.
+ */
+export type StateWriteResult = { ok: true; detail: string } | { ok: false; reason: string };
+const ok = (detail: string): StateWriteResult => ({ ok: true, detail }), fail = (reason: string): StateWriteResult => ({ ok: false, reason });
 const blank = (value?: string | null): boolean => value == null || value.trim().length === 0;
 export const MEMORY_NOTE_PREFIX = "Note: ";
 export const AVATAR_MAX_BYTES = 5 * 1024 * 1024;
@@ -23,7 +32,17 @@ interface MembershipPort { read(): ReadonlySet<string>; join(slug: string): bool
 export interface AgentStateDeps {
   agentId: string; agentDir: string; sandRoot: string; memory: MemoryPort; membership: MembershipPort; channels: { remove(platform: string): boolean };
   automations: AutomationPort; workflows: WorkflowPort; now?: () => number;
-  readProfile(): Record<string, string> | null; writeProfile(profile: Record<string, string>): void; writeSettings(settings: Record<string, boolean>): void;
+  /**
+   * Writes this agent's own profile through the host, the same `updateAgent`
+   * the profile edit screen calls. It is a function and not a pair of file
+   * primitives because the host is what merges: it fills every field the
+   * caller left out from what is already stored, validates the instruction
+   * ceiling before anything is written, and re-emits the roster event the UI
+   * repaints on. A writer here would have to re-implement all three and would
+   * drift the moment the host grew a rule.
+   */
+  updateOwnProfile(patch: { name?: string; description?: string; title?: string }): Promise<unknown>;
+  writeSettings(settings: Record<string, boolean>): void;
   readBoxFile?(path: string): Promise<Uint8Array>; onAvatarChanged?(): void;
 }
 function shardFor(deps: AgentStateDeps, scope: "agent" | "user" | "project", project?: string): { store: MemoryPort; label: string } | StateWriteResult {
@@ -51,7 +70,28 @@ export function createSandAgentState(deps: AgentStateDeps) {
     async deleteAutomation({ id }: { id: string }) { const name = deps.automations.get(id)?.name ?? id; return deps.automations.remove(id) ? ok(`Deleted routine "${name}" (folder ${id}).`) : fail(`no routine with folder "${id}" exists.`); },
     async writeWorkflow(args: { id?: string; name: string; description?: string; body: string }) { const spec = { name: args.name, description: args.description ?? "", body: args.body, trigger: null }, value = args.id == null ? deps.workflows.create(spec) : deps.workflows.update(args.id, spec); return value == null ? fail(args.id == null ? "the workflow could not be saved — a name and a non-empty body are both required." : `no workflow with id "${args.id}" exists, or the new fields were invalid. Cursor-managed skills cannot be edited.`) : ok(`${args.id == null ? "Saved" : "Updated"} workflow "${value.name}" (id ${value.id}).`); },
     async deleteWorkflow({ id }: { id: string }) { return deps.workflows.remove(id) ? ok(`Deleted workflow ${id}.`) : fail(`no workflow with id "${id}" exists, or it is a Cursor-managed skill, which cannot be deleted.`); },
-    async updateProfile(args: { name?: string; description?: string }) { if (args.name === undefined && args.description === undefined) return fail("nothing to change — pass at least one of name or description."); if (args.name !== undefined && blank(args.name)) return fail("a blank name is not allowed."); const current = deps.readProfile() ?? {}; deps.writeProfile({ ...current, ...(args.name === undefined ? {} : { name: args.name.trim() }), ...(args.description === undefined ? {} : { description: args.description.trim() }) }); return ok(`Updated your ${[args.name !== undefined ? "name" : "", args.description !== undefined ? "description" : ""].filter(Boolean).join(", ")}.`); },
+    async updateProfile(args: { name?: string; description?: string; title?: string }) {
+      const fields = ["name", "description", "title"] as const;
+      const changed = fields.filter((field) => args[field] !== undefined);
+      if (changed.length === 0) return fail("nothing to change — pass at least one of name, title or description.");
+      if (args.name !== undefined && blank(args.name)) return fail("a blank name is not allowed.");
+      // The one production caller reaches this owner through `method()`, typed
+      // `(...args: any[]) => any`, so the compiler cannot enforce the binding the
+      // signature above states. The guard is what turns a missing writer into a
+      // sentence the model can act on: the previous version called
+      // `deps.readProfile`, which no caller ever supplied, and every profile
+      // write ended on `TypeError: deps.readProfile is not a function`.
+      if (typeof deps.updateOwnProfile !== "function") return fail("this session cannot write its own profile — no profile writer is bound to it.");
+      const patch: { name?: string; description?: string; title?: string } = {};
+      for (const field of changed) patch[field] = args[field]!.trim();
+      try {
+        const summary = await deps.updateOwnProfile(patch);
+        if (summary == null) return fail("your profile was not changed — the host answered with nothing. Say so rather than telling the user it worked.");
+        return ok(`Updated your ${changed.join(", ")}.`);
+      } catch (error) {
+        return fail(`your profile was not changed — ${error instanceof Error ? error.message : String(error)}`);
+      }
+    },
     async updateSettings(args: { hiddenFromSidebar?: boolean; notifyOnAgentUpdates?: boolean }) { const update = { ...(args.hiddenFromSidebar === undefined ? {} : { hiddenFromSidebar: args.hiddenFromSidebar }), ...(args.notifyOnAgentUpdates === undefined ? {} : { notifyOnAgentUpdates: args.notifyOnAgentUpdates }) }; if (Object.keys(update).length === 0) return fail("nothing to change — pass at least one setting field."); deps.writeSettings(update); return ok(`Updated your settings: ${Object.keys(update).join(", ")}.`); },
     async disconnectChannel({ platform }: { platform: string }) { return deps.channels.remove(platform) ? ok(`Disconnected ${platform}. The connector closes the live connection within a few seconds.`) : fail(`${platform} is not connected.`); },
     async createProject({ slug, name, description }: { slug: string; name: string; description?: string }) { const id = slug.trim(); if (!isSafeFolderId(id)) return fail(`"${id}" is not a valid project slug — use a short kebab-case id.`); if (blank(name)) return fail("a project needs a non-empty name."); const path = getProjectDir(deps.sandRoot, id), existed = projectDirExists(deps.sandRoot, id); if (!existed) { await mkdir(path, { recursive: true }); await writeFile(join(path, "project.md"), serializeWorkflowFile({name:name.trim(),description:description?.trim()??"",body:"",trigger:null}), "utf8"); } return deps.membership.join(id) ? ok(existed ? `Joined existing project "${id}" (create-is-join; project.md left as-is).` : `Created and joined project "${name.trim()}" (folder ${id}).`) : fail(`could not join project "${id}" — the slug is not path-safe.`); },

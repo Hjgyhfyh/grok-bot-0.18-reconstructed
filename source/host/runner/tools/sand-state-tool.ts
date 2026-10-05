@@ -22,7 +22,7 @@ export const OPERATIONS = {
     write: 'save or rewrite a reusable skill (name, description, body; id to rewrite). The description is REQUIRED and is what a reader uses to decide whether the skill applies, so write it as "use this when …". A workflow has no trigger — a saved task that runs on a schedule is a routine.',
     delete: "(id). Cursor-managed skills can't be edited or deleted.",
   },
-  profile: { set: "your name and/or description. For your picture use target avatar." },
+  profile: { set: "your own name, title and/or description. Only the fields you pass change; the rest keep their stored values. For your picture use target avatar." },
   settings: { set: "hidden_from_sidebar, notify_on_updates. Only the fields you pass change." },
   channel: { disconnect: "(platform). The connector closes the live connection within a few seconds." },
   project: {
@@ -56,6 +56,7 @@ export interface SandStateUpdate {
   readonly trigger?: StoredTrigger | readonly StoredTrigger[];
   readonly enabled?: boolean;
   readonly description?: string;
+  readonly title?: string;
   readonly body?: string;
   readonly hidden_from_sidebar?: boolean;
   readonly notify_on_updates?: boolean;
@@ -136,12 +137,13 @@ export const sandUpdateStateParameters = z.object({
   scope: z.enum(["agent", "user", "project"]).optional().describe("memory only. Defaults to agent (your own memory)."),
   project: z.string().trim().min(1).optional().describe('Project slug. Required for memory when scope is "project", and for every project action.'),
   id: z.string().trim().min(1).optional().describe("The routine's folder or the workflow's id. Required for every routine action except create, and for workflow delete. Omit on a workflow write to create a new one."),
-  name: z.string().trim().min(1).optional().describe("routine/workflow/project create: its name. Required on create and on a workflow write; on routine update, omit to keep the current name. profile: your new name."),
+  name: z.string().trim().min(1).optional().describe("routine/workflow/project create: its name. Required on create and on a workflow write; on routine update, omit to keep the current name. profile: your new name, which cannot be blank — pass a new one or omit it to keep the current name."),
   prompt: z.string().trim().min(1).optional().describe("routine only. What you should do each time it fires, written to your future self. Write it as an INTENT, not a frozen tool recipe: a connector's schema can change between fires, so describe the goal and let each run look the tool up. Required on create; on update, omit to keep the current prompt."),
   schedule: z.string().trim().min(1).optional().describe(`routine only. Shorthand for a cron trigger \u2014 "0 7 * * *", "@daily", "@every 2h" \u2014 interpreted in the user's local time. An hour with no minute takes the current minute off the <timestamp>: asked at 1:32, "daily at 2" is "32 2 * * *". Use this OR trigger, never both. On update, omit (with trigger) to keep the current fire condition.`),
   trigger: triggerSchema.optional(),
   enabled: z.boolean().optional().describe("routine create/update only. On create, defaults to true. On update, omit to leave the current arming alone (use pause/resume to toggle)."),
-  description: z.string().trim().optional().describe("workflow write: REQUIRED. One line on when to use the skill. profile: your new description. project create: optional summary."),
+  description: z.string().trim().optional().describe("workflow write: REQUIRED. One line on when to use the skill. profile: your new description, which a blank value clears. project create: optional summary."),
+  title: z.string().trim().optional().describe("profile only. Your new title — the short line shown under your name. Omit to keep the current one; a blank value clears it."),
   body: z.string().trim().min(1).optional().describe("workflow write only. The recipe, in markdown."),
   hidden_from_sidebar: z.boolean().optional().describe("settings set only. Removes your row from the user's sidebar; you stay fully functional and reachable through Cmd-K and the Hidden chats manager."),
   notify_on_updates: z.boolean().optional().describe('settings set only. The "Notify me about this assistant" toggle.'),
@@ -176,7 +178,7 @@ export interface SandStateWriter {
   deleteAutomation(args: { id: string }): Promise<Outcome>;
   writeWorkflow(args: { id?: string; name: string; description: string; body: string }): Promise<Outcome>;
   deleteWorkflow(args: { id: string }): Promise<Outcome>;
-  updateProfile(args: { name?: string; description?: string }): Promise<Outcome>;
+  updateProfile(args: { name?: string; description?: string; title?: string }): Promise<Outcome>;
   updateSettings(args: { hiddenFromSidebar?: boolean; notifyOnAgentUpdates?: boolean }): Promise<Outcome>;
   disconnectChannel(args: { platform: string }): Promise<Outcome>;
   createProject(args: { slug: string; name: string; description?: string }): Promise<Outcome>;
@@ -294,7 +296,7 @@ export async function applySandStateUpdate(args: SandStateUpdate, deps: SandStat
     case "routine.delete": return deps.state.deleteAutomation({ id: need(args.id, "id", args) });
     case "workflow.write": return writeWorkflow(args, deps);
     case "workflow.delete": return deps.state.deleteWorkflow({ id: need(args.id, "id", args) });
-    case "profile.set": return deps.state.updateProfile({ ...(args.name == null ? {} : { name: args.name }), ...(args.description == null ? {} : { description: args.description }) });
+    case "profile.set": return deps.state.updateProfile({ ...(args.name == null ? {} : { name: args.name }), ...(args.title == null ? {} : { title: args.title }), ...(args.description == null ? {} : { description: args.description }) });
     case "settings.set": return deps.state.updateSettings({ ...(args.hidden_from_sidebar == null ? {} : { hiddenFromSidebar: args.hidden_from_sidebar }), ...(args.notify_on_updates == null ? {} : { notifyOnAgentUpdates: args.notify_on_updates }) });
     case "channel.disconnect": return deps.state.disconnectChannel({ platform: need(args.platform, "platform", args) });
     case "project.create": return deps.state.createProject({ slug: need(args.project, "project", args), name: need(args.name, "name", args), ...(args.description == null ? {} : { description: args.description }) });

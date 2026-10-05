@@ -99,6 +99,11 @@ export const COORDINATOR_METHOD_TABLE = {
   respondToWidget: { args: "object", reply: "record-or-null" },
   resolveAutoReviewApproval: { args: "object", reply: "void" },
   resolveLocalToolPermission: { args: "object", reply: "void" },
+  // The user's stop, beside `sendPrompt` because it is the other half of the same
+  // conversation. `isCoordinatorMethod` is a pure table lookup, so an entry here is
+  // the whole gate: without it the renderer's roster client is refused with
+  // "no coordinator method named ..." before any request is made.
+  interruptAgentRun: { args: "object", reply: "record" },
   dismissWidget: { args: "object", reply: "record" },
   submitSecret: { args: "object", reply: "void" },
   reactToMessage: { args: "object", reply: "void" },

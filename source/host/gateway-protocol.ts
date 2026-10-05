@@ -20,6 +20,12 @@ export const SAND_GATEWAY_COMMANDS = {
   respondToWidget: (api: GatewayApi, body: string) => api.respondToWidget(parseCommandArgs(body)),
   resolveAutoReviewApproval: (api: GatewayApi, body: string) => api.resolveAutoReviewApproval(parseCommandArgs(body)),
   resolveLocalToolPermission: (api: GatewayApi, body: string) => api.resolveLocalToolPermission(parseCommandArgs(body)),
+  // The user's stop. It has to be in this table and not only on the host: the
+  // renderer reaches the host through this same command table
+  // (`gateway-client.ts` POSTs `/api/<method>`), so an entry here is what makes a
+  // stop reachable from the app at all. It was missing, and a missing table entry
+  // is silent — the method is simply never served and nothing throws.
+  interruptAgentRun: (api: GatewayApi, body: string) => api.interruptAgentRun(parseCommandArgs(body)),
   // The answer half of the round trip `resolveLocalToolPermission` above closes.
   // It used to have no entry at all: `getPendingRequestForAgent` existed on the
   // permission controller with no caller anywhere outside a test, so the only way

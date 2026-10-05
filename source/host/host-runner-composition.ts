@@ -1627,7 +1627,15 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           agentDir: dirname(session.dbPath),
           agentId: session.id,
           readBoxFile: (boxPath: string) =>
-            method(remoteBox, "downloadFile")?.(ctx, session.id, boxPath)
+            method(remoteBox, "downloadFile")?.(ctx, session.id, boxPath),
+          // An agent changing its own name, title or description goes through
+          // the very `updateAgent` the profile edit screen calls, with this
+          // agent's own id — so there is one writer, one merge and one roster
+          // event behind both callers. It used to reach for a profile file
+          // writer that no caller ever supplied, which is why every
+          // `update_state` profile write ended on a TypeError.
+          updateOwnProfile: (patch: { name?: string; description?: string; title?: string }) =>
+            method(transcript, "updateAgent")?.(session.id, patch)
         })
       : undefined;
 

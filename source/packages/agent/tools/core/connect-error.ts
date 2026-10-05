@@ -30,6 +30,28 @@ export function maybeNormalizeExecBoundaryError(error: unknown): unknown {
   if (isPodNotFoundExecBoundaryError(error) || isExecDaemonUnreachableExecBoundaryError(error) || isBridgeTransportClosedExecBoundaryError(error) || isEnvironmentUnreachableMessageError(error)) {
     return new RetryableToolEnvironmentOrchestrationError("The execution environment has become unreachable.", { cause: error });
   }
+  if (isCredentialWaitingError(error)) {
+    // Every Cursor-backed call dies the same way on a host that has no account:
+    // `auth-service.getAccessToken` throws `SandCredentialsWaitingError`, connect wraps
+    // the throw as `[unknown]`, and the switch below lands in `default:` — which told the
+    // model "this may be temporary. Try again." Measured on a host running
+    // `inferenceProvider: "custom"`: four `WebSearch` calls, four identical answers, and
+    // then a report to the user that web search was broken. It is not broken and it will
+    // not recover; there is nothing to wait for.
+    //
+    // The provider's own message promises a self-healing that this host cannot deliver
+    // ("renews this automatically ... this resolves on its own shortly"). That is the same
+    // false reassurance `classifierFailureFromError` in `create-shell-tool.ts` was written
+    // to strip, on a path that had no such guard, so the cause is kept in `cause` for the
+    // log and kept out of both messages.
+    const normalized = new CustomToolCallError(ToolErrorClassification.UNEXPECTED_ENVIRONMENT, {
+      clientVisibleErrorMessage: "Not available: this needs a signed-in Grok Bot account, and this host has none.",
+      modelVisibleErrorMessage: "This call cannot succeed on this host, and retrying it will not help: it needs a signed-in Grok Bot account and this host has no inference credential. Do not call this tool again. Tell the user it needs an account.",
+      error: "no inference credential for the Cursor backend",
+    });
+    setErrorCause(normalized, error);
+    return normalized;
+  }
   const code = getConnectErrorCode(error);
   if (code === undefined) return error;
   let message: string;
@@ -84,6 +106,22 @@ function isPodNotFoundExecBoundaryError(error: unknown): boolean { return collec
 function isExecDaemonUnreachableExecBoundaryError(error: unknown): boolean { return collectErrorText(error).some(text => text.toLowerCase().includes("exec-daemon is unreachable")); }
 function isBridgeTransportClosedExecBoundaryError(error: unknown): boolean { return collectErrorText(error).some(text => text.toLowerCase().includes("bridge transport is closed")); }
 function isEnvironmentUnreachableMessageError(error: unknown): boolean { return collectErrorText(error).some(text => text.toLowerCase().includes("execution environment has become unreachable")); }
+
+/**
+ * The one phrase that says a host has no credential at all, taken from
+ * `SAND_SHORTLIVED_CREDS_WAITING_MESSAGE` in `host/extensions/auth/auth-service.ts`.
+ *
+ * Matched as text, like every other predicate in this file, because this module sits in
+ * `packages/` and must not import from `host/`. The coupling is deliberate and one-way:
+ * that constant is the only place that message is written, and the test next to this
+ * file builds the error from the real constant, so a rewrite there fails the test here
+ * instead of silently restoring the false "try again" answer.
+ */
+const CREDENTIAL_WAITING_MARKER = "waiting for an inference credential";
+
+function isCredentialWaitingError(error: unknown): boolean {
+  return collectErrorText(error).some(text => text.toLowerCase().includes(CREDENTIAL_WAITING_MARKER));
+}
 
 function isExecBackendUnavailableError(error: unknown): boolean {
   if (error instanceof Error && (error.name === "ExecBackendUnavailableError" || error.name === "ControlledExecDisposedError" || error.name === AGENT_STREAM_START_TIMEOUT_ERROR_NAME)) return true;

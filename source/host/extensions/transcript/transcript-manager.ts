@@ -330,9 +330,21 @@ export class TranscriptManager {
     invoke(this.roster, "stopOutlineStreamCoalescing", []);
     for (const runner of this.runnerRegistry.runners.values())
       runner.cancelBackgroundShellRewatches?.();
+    // Shutdown is a stop nobody asked for by name, and it is the one stop that
+    // must not leak. A foreground shell is held by `createShellProcessGuard`,
+    // whose tree walk is reached only through the turn's abort signal; dropping
+    // the runners cancelled the rewatch POLLER and nothing else, so a live shell
+    // and everything it started outlived the host on Windows. Interrupting
+    // before the maps are cleared puts the same abort the user's stop uses in
+    // front of every live guard. It runs before, not after, the clear, because
+    // after the clear there is no runner left to interrupt.
+    for (const runner of this.runnerRegistry.runners.values())
+      runner.interruptAll?.("the app is shutting down");
     this.runnerRegistry.runners.clear();
     for (const runner of this.runnerRegistry.activeGroupMemberRunners.values())
       runner.cancelBackgroundShellRewatches?.();
+    for (const runner of this.runnerRegistry.activeGroupMemberRunners.values())
+      runner.interruptAll?.("the app is shutting down");
     this.runnerRegistry.activeGroupMemberRunners.clear();
     const sessions = new Set(this.sessions.liveSessions.values());
     if (this.sessions.activeSession != null)
@@ -428,6 +440,9 @@ export class TranscriptManager {
   }
   attachRunReadinessProbe(...args: any[]) {
     return invoke(this.runnerRegistry, "attachRunReadinessProbe", args);
+  }
+  interruptAgentRun(...args: any[]) {
+    return invoke(this.runnerRegistry, "interruptUserRun", args);
   }
 
   getActiveAgentDir(...args: any[]) {

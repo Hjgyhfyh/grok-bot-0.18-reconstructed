@@ -542,6 +542,32 @@ export function createHostGatewayApi(
       await method(localToolPermission, "resolveAsk")(args);
     },
     /**
+     * The stop. Until this existed the user had no way to end a turn they did
+     * not want any more of.
+     *
+     * The abort machinery was all present and all internal: the watchdog, agent
+     * deletion, a superseding message and a steering subagent could each end a
+     * run, and nothing a person can press could. This is the missing edge, not a
+     * new mechanism — it reaches the existing `interruptUserRun`, which calls the
+     * same `interruptAll` those internal callers use, so the model stream, a
+     * waiting permission ask, a running shell's process tree and every subagent
+     * session all stop for the reason the user gave.
+     *
+     * It answers what it actually did rather than what it was asked to do. An
+     * agent that is not running is `{interrupted:false}` and not an error: asking
+     * to stop something that already stopped is a normal thing to do, and a
+     * refusal here would train callers to stop asking.
+     */
+    interruptAgentRun: (args: any) => {
+      markActive("user_action");
+      const agentId = requirePath(args, "id", "interruptAgentRun");
+      const reason =
+        typeof args.reason === "string" && args.reason.trim().length > 0
+          ? args.reason
+          : "Interrupted by the user.";
+      return method(manager, "interruptAgentRun")(agentId, reason);
+    },
+    /**
      * The question an agent is blocked on, for a caller that never saw the card.
      *
      * `resolveLocalToolPermission` above is the only half of the round trip that
