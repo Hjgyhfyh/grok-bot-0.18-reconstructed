@@ -1,4 +1,5 @@
 import type { Context } from "../../packages/context/core.js";
+import { sandTurnDirectionEpochKey } from "../../shared/local-tool-permission-machinery.js";
 import type {
   ConversationStateStructure as ConversationStateStructureMessage,
 } from "../../packages/proto/generated/agent/v1/agent_pb.js";
@@ -115,6 +116,56 @@ function linkTurnRunContext(
   };
 }
 
+/**
+ * The two live methods a turn needs from the local-tool-permission controller.
+ *
+ * Only these two, deliberately: the turn opens a direction and reads its
+ * number. Everything else the controller owns (pending asks, standing
+ * approvals, remembered refusals) keeps its own implementation and is reached
+ * through the narrower toolset projection.
+ */
+export interface TurnLocalToolPermissionEpoch {
+  beginTurn(agentId: string): void;
+  directionEpoch(agentId: string): number;
+}
+
+/**
+ * The direction epoch ONE turn runs under.
+ *
+ * The 0.18 build wrote this expression exactly once per turn, into the turn's
+ * context, and every later read came out of the context:
+ *
+ *   host.isSubagentRunner
+ *     ? host.inheritedDirectionEpoch
+ *     : host.localToolPermission.directionEpoch(host.getConversationId())
+ *
+ * Nothing in `source/` ever wrote that key — `withLocalToolScope` read it on
+ * every scoped tool call and it was always absent, so `scope.directionEpoch`
+ * stayed `undefined` and the controller fell back to `this.directionEpoch(agentId)`,
+ * which is 0 until something calls `beginTurn`. With nothing calling
+ * `beginTurn`, that fallback was 0 for the life of the process.
+ *
+ * A subagent inherits rather than opens: a child has its own agent id, so its
+ * own map entry is 0 by construction, and a child that started a fresh
+ * direction would forget the parent's refusal for the same task — the exact
+ * thing `SAND_LOCAL_TOOLS_ABANDONED_MESSAGE` tells the model is permanent.
+ *
+ * Absent permission controller, or a subagent with nothing to inherit, means
+ * `undefined`: the context keeps the key's own `undefined` default, the scoped
+ * tool call omits `directionEpoch` from its scope, and the controller applies
+ * its own fallback. That is the pre-existing behaviour, unchanged.
+ */
+function resolveTurnDirectionEpoch(
+  input: ProductionTurnRunShellAdapterInput,
+): number | undefined {
+  const permission = input.localToolPermission;
+  if (permission === undefined) return undefined;
+  if (input.isSubagentRunner && input.inheritedDirectionEpoch !== undefined) {
+    return input.inheritedDirectionEpoch;
+  }
+  return permission.directionEpoch(input.getConversationId());
+}
+
 /** Exact host inputs around the existing turn-run-shell lifecycle. */
 export interface ProductionTurnRunShellAdapterInput {
   readonly createOwner: (input: {
@@ -144,6 +195,33 @@ export interface ProductionTurnRunShellAdapterInput {
   readonly inheritedAutomationId?: string;
   readonly subagents: TurnRunShellHost["subagents"];
   readonly getConversationId: () => string;
+  /**
+   * The live local-tool-permission controller, when the host bound one.
+   *
+   * It is optional because the permission extension is optional: an agent with
+   * no permission surface at all must still run, and a turn that finds no
+   * controller here carries no epoch rather than failing.
+   *
+   * Bind it together with `beginLocalToolPermissionTurn` below — the turn opens
+   * a direction through one and reads its number through the other.
+   */
+  readonly localToolPermission?: TurnLocalToolPermissionEpoch;
+  /**
+   * Opens the next direction for a conversation, once per turn.
+   *
+   * `turn-run-shell.ts` declares this hook and calls it before the turn is
+   * prepared; nothing implemented it, so `directionEpochs` stayed empty and
+   * every remembered refusal stayed stamped with epoch 0 forever.
+   */
+  readonly beginLocalToolPermissionTurn?: (conversationId: string) => void;
+  /**
+   * The parent's direction epoch, for a subagent.
+   *
+   * A subagent must never read its own number: its agent id is not in the
+   * controller's map, so `directionEpoch(childId)` is 0 even while the parent
+   * is several turns deep. It inherits instead.
+   */
+  readonly inheritedDirectionEpoch?: number;
   readonly runGeneration: () => number;
   readonly setActiveTurnRequestSource: (source: string | undefined) => void;
   readonly setActiveTurnAutomationId?: (automationId: string | undefined) => void;
@@ -272,6 +350,9 @@ export function createProductionTurnRunShellAdapter(
   let attemptDeadlineHooks:
     | { disarm: () => void; reset: () => void }
     | undefined;
+  // A turn with no permission controller simply has no method on the host,
+  // which is exactly what the shell's optional call expects.
+  const beginLocalToolPermissionTurn = input.beginLocalToolPermissionTurn;
   const host: TurnRunShellHost = {
     isSubagentRunner: input.isSubagentRunner,
     ...(input.subagentType === undefined ? {} : { subagentType: input.subagentType }),
@@ -288,6 +369,9 @@ export function createProductionTurnRunShellAdapter(
     ...(input.setActiveTurnAutomationId === undefined
       ? {}
       : { setActiveTurnAutomationId: input.setActiveTurnAutomationId }),
+    ...(beginLocalToolPermissionTurn === undefined
+      ? {}
+      : { beginLocalToolPermissionTurn }),
     beginAutoReviewUserMessageEpoch: input.beginAutoReviewUserMessageEpoch,
     setActiveRunInterrupted: input.setActiveRunInterrupted,
     setAwaitingUserSelection: input.setAwaitingUserSelection,
@@ -298,7 +382,15 @@ export function createProductionTurnRunShellAdapter(
       options: TurnRunOptions,
       context: TurnRunContext,
     ): Promise<PreparedTurn> {
-      const linked = linkTurnRunContext(input.context(), context.signal);
+      // The single write of the direction epoch for this turn. Everything
+      // downstream — the Agent owner, the MCP provider, the stream, and every
+      // `withLocalToolScope` tool call — reads it back out of this context, so
+      // the number cannot drift between two lookups of the live controller.
+      const directionEpoch = resolveTurnDirectionEpoch(input);
+      const turnBase = directionEpoch === undefined
+        ? input.context()
+        : input.context().with(sandTurnDirectionEpochKey, directionEpoch);
+      const linked = linkTurnRunContext(turnBase, context.signal);
       const updateRelay: ProductionTurnRunShellPreparedTurn["updateRelay"] = {};
       const emitUpdate = (update: ForwardedUpdate): void => {
         if (STREAM_OUTPUT_PRODUCED_TYPES.has(update.type) && !streamOutputProduced) {

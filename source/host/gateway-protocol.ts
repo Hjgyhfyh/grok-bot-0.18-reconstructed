@@ -20,6 +20,14 @@ export const SAND_GATEWAY_COMMANDS = {
   respondToWidget: (api: GatewayApi, body: string) => api.respondToWidget(parseCommandArgs(body)),
   resolveAutoReviewApproval: (api: GatewayApi, body: string) => api.resolveAutoReviewApproval(parseCommandArgs(body)),
   resolveLocalToolPermission: (api: GatewayApi, body: string) => api.resolveLocalToolPermission(parseCommandArgs(body)),
+  // The answer half of the round trip `resolveLocalToolPermission` above closes.
+  // It used to have no entry at all: `getPendingRequestForAgent` existed on the
+  // permission controller with no caller anywhere outside a test, so the only way
+  // to answer a question was the card that was pushed when it was created. A
+  // window that closed first left the agent blocked in silence until the ask
+  // expired on its own. `parseCommandArgs` like every entry here, because the
+  // dispatcher hands the handler the raw body.
+  listPendingLocalToolPermissions: (api: GatewayApi, body: string) => api.listPendingLocalToolPermissions(parseCommandArgs(body)),
   dismissWidget: (api: GatewayApi, body: string) => api.dismissWidget(parseCommandArgs(body)),
   submitSecret: (api: GatewayApi, body: string) => api.submitSecret(parseCommandArgs(body)),
   reactToMessage: (api: GatewayApi, body: string) => api.reactToMessage(parseCommandArgs(body)),

@@ -779,6 +779,12 @@ export function createShellTool(resourceAccessor: ShellToolResourceAccessor, opt
       useMinimalHarness: options.useMinimalHarness,
       enableJobCompletionNotifications: options.enableJobCompletionNotifications,
       enableTerminalFiles: options.enableTerminalFiles,
+      // The description has to name the interpreter this surface really spawns.
+      // `options.shellType` is the host's statement of that; without it the
+      // prompt resolves the shell from `process.platform` the same way the
+      // one-shot executor does. Either way the model is told, instead of
+      // guessing bash on a cmd.exe host.
+      shellType: options.shellType,
       awaitToolName: options.awaitToolIdentifier === undefined ? undefined : descriptionProps.allTools?.[options.awaitToolIdentifier]?.name ?? options.awaitToolIdentifier,
       readToolName: options.readToolIdentifier === undefined ? undefined : descriptionProps.allTools?.[options.readToolIdentifier]?.name ?? options.readToolIdentifier,
     }),

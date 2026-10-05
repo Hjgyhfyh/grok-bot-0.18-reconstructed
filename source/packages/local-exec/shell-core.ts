@@ -9,6 +9,7 @@ import { SHELL_OUTPUT_SUPPRESSED_NOTICE } from "../shell-exec/output-suppression
 import type { TerminalExecutor } from "../shell-exec/index.js";
 import { getSafeConversationId, TRANSCRIPTS_SUBDIR } from "../utils/workspace-paths.js";
 import { MAX_BUFFER_SIZE } from "./constants.js";
+import { createShellProcessGuard, killProcessTree } from "./process-tree.js";
 import type { SandboxRule } from "./sandbox-conversion.js";
 
 const REQUEST_SCOPED_SHELL_ENV_KEYS = ["CURSOR_CONVERSATION_ID", "CURSOR_AGENT_STORE_FILES_DIR", "CURSOR_AGENT_STORE_SHARED_PATHS"] as const;
@@ -228,7 +229,15 @@ export class BaseShellCoreExecutor {
     const sandboxPolicy = agentStoreSandboxPolicyFromEnv(args.sandboxPolicy, env); const policyType = sandboxPolicy?.perRepo?.type ?? sandboxPolicy?.perUser?.type ?? sandboxPolicy?.teamAdmin?.type ?? "insecure_none";
     if (sandboxPolicy !== undefined) yield { type: "start", sandboxed: policyType === "workspace_readonly" || policyType === "workspace_readwrite" };
     if (args.askpassConfig && !isWindows) { env.SUDO_ASKPASS = args.askpassConfig.helperPath; env.CURSOR_ASKPASS_SOCKET = args.askpassConfig.socketPath; env.CURSOR_ASKPASS_SECRET = args.askpassConfig.secret; }
-    for await (const event of this.executor.execute(ctx, args.command, { ...(args.signal === undefined ? {} : { signal: args.signal }), workingDirectory: cwd, env, ...(sandboxPolicy === undefined ? {} : { sandboxPolicy }), ...(this.workspacePath === undefined ? {} : { sandboxWorkspaceRoot: this.workspacePath }), pipeStdin: args.pipeStdin ?? false, ...(this.shellOutputBackpressureOptions?.bufferOutputEvents === undefined ? {} : { bufferOutputEvents: this.shellOutputBackpressureOptions.bufferOutputEvents }), ...(this.shellOutputBackpressureOptions?.outputLimiterOptions === undefined ? {} : { outputLimiterOptions: this.shellOutputBackpressureOptions.outputLimiterOptions }) })) {
+    // The executor is handed its own controller, not `args.signal`. It answers
+    // an abort with `child.kill()`, which on Windows is a TerminateProcess on
+    // the shell alone: `cmd.exe` dies and the `python` it started keeps running
+    // until something walks the tree. The guard walks it first, and only then
+    // lets the direct kill happen, because `taskkill /T` needs the shell to
+    // still be alive to walk down from.
+    const guard = createShellProcessGuard(args.signal, (pid) => { killProcessTree(pid); });
+    try {
+    for await (const event of this.executor.execute(ctx, args.command, { ...(guard.signal === undefined ? {} : { signal: guard.signal }), workingDirectory: cwd, env, ...(sandboxPolicy === undefined ? {} : { sandboxPolicy }), ...(this.workspacePath === undefined ? {} : { sandboxWorkspaceRoot: this.workspacePath }), pipeStdin: args.pipeStdin ?? false, ...(this.shellOutputBackpressureOptions?.bufferOutputEvents === undefined ? {} : { bufferOutputEvents: this.shellOutputBackpressureOptions.bufferOutputEvents }), ...(this.shellOutputBackpressureOptions?.outputLimiterOptions === undefined ? {} : { outputLimiterOptions: this.shellOutputBackpressureOptions.outputLimiterOptions }) })) {
       let text = "", size = 0;
       if (event.type === "stdout" || event.type === "stderr") {
         const channel = event.type;
@@ -250,10 +259,11 @@ export class BaseShellCoreExecutor {
       if (event.type === "stdout" && !stdoutTrimmed) { if (stdoutSize + size > MAX_BUFFER_SIZE) { stdoutTrimmed = true; yield { type: "stdout_trimmed", keptBytes: stdoutSize, limitBytes: MAX_BUFFER_SIZE }; } else { stdoutSize += size; if (text.length > 0) yield { type: "stdout", data: text }; } }
       else if (event.type === "suppressed_output" && !suppressionNoticeSent) { suppressionNoticeSent = true; yield { type: "stdout", data: SHELL_OUTPUT_SUPPRESSED_NOTICE }; }
       else if (event.type === "stderr" && !stderrTrimmed) { if (stderrSize + size > MAX_BUFFER_SIZE) { stderrTrimmed = true; yield { type: "stderr_trimmed", keptBytes: stderrSize, limitBytes: MAX_BUFFER_SIZE }; } else { stderrSize += size; if (text.length > 0) yield { type: "stderr", data: text }; } }
-      else if (event.type === "stdin_ready") yield { type: "stdin_ready", stdin: event.stdin, pid: event.pid };
+      else if (event.type === "stdin_ready") { guard.observePid(event.pid); yield { type: "stdin_ready", stdin: event.stdin, pid: event.pid }; }
       else if (event.type === "sandbox_denies") yield { type: "sandbox_denies", events: event.events };
       else if (event.type === "exit") { let outputLocation: OutputLocation | undefined; if (merged?.file && merged.path) { await new Promise<void>((done) => merged?.file?.end(done)); outputLocation = new OutputLocation({ filePath: merged.path, sizeBytes: BigInt(merged.size), lineCount: BigInt(merged.lineCount) }); } yield { type: "exit", code: event.code, aborted: event.aborted, ...(outputLocation === undefined ? {} : { outputLocation }), localExecutionTimeMs: Math.max(0, Math.round(performance.now() - started)) }; }
     }
+    } finally { guard.release(); }
   }
   getCwd(): Promise<string> { return this.executor.getCwd(); }
   getWorkspacePath(): string { if (!this.workspacePath) throw new Error("Workspace path is not configured"); return this.workspacePath; }

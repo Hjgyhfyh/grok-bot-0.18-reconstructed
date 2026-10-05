@@ -370,6 +370,24 @@ export interface ProductionTurnAutoReviewHostProjection {
       readonly directionEpoch?: number;
       readonly action?: string;
     }) => void;
+    /**
+     * Opens the next direction for one agent.
+     *
+     * `SandLocalToolPermissionController` has always had this method; it was
+     * simply not part of the projection the host hands to a turn, so no turn
+     * ever called it and `directionEpochs` stayed empty. Every refusal the
+     * controller remembers is stamped with the epoch it was remembered under,
+     * so an epoch that never moves is a refusal that never expires — which is
+     * what `SAND_LOCAL_TOOLS_ABANDONED_MESSAGE` promises ("it will not be
+     * asked again for this task") without any way to end that task.
+     *
+     * Optional on purpose: this projection is built by a defensive cast in
+     * `host-runner-composition.ts`, and a host that binds no permission
+     * controller at all must keep running with epoch 0 rather than throw.
+     */
+    readonly beginTurn?: (agentId: string) => void;
+    /** The epoch the current direction of `agentId` carries. */
+    readonly directionEpoch?: (agentId: string) => number;
   };
   readonly isListenerPlatformConnected?: (
     platform: string,

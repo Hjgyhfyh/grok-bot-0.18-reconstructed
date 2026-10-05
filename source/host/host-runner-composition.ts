@@ -115,6 +115,7 @@ import {
 } from "./runner/production-turn-agent-owner.js";
 import {
   createProductionTurnRunShellHostInput,
+  type TurnLocalToolPermissionEpoch,
 } from "./runner/production-turn-run-shell-adapter.js";
 import {
   createPromptCollectorGlue,
@@ -612,6 +613,35 @@ function asLocalToolPermissionProjection(
     awaitDesktopStandingDecision: args =>
       awaitDesktopStandingDecision.call(value, args),
     completeScope: scope => completeScope.call(value, scope),
+  };
+}
+
+/**
+ * The turn's view of the SAME controller `asLocalToolPermissionProjection`
+ * narrows — the two methods one turn needs to open a direction and to read its
+ * number.
+ *
+ * It is a separate projection on purpose. The toolset one keeps only
+ * `{awaitDesktopStandingDecision, completeScope}` and drops both of these, so
+ * handing its result to a turn shell leaves `resolveTurnDirectionEpoch` with
+ * nothing to read: the context never receives an epoch, the shell's
+ * `beginLocalToolPermissionTurn` hook has no controller to call, and every turn
+ * runs under 0 for the life of the process. Both methods are re-bound to the
+ * original object, so the controller keeps its own `directionEpochs` map.
+ */
+function asTurnLocalToolPermissionEpoch(
+  value: unknown,
+): TurnLocalToolPermissionEpoch | undefined {
+  if (typeof value !== "object" || value == null) return undefined;
+  const candidate = value as Record<string, unknown>;
+  const beginTurn = candidate.beginTurn;
+  const directionEpoch = candidate.directionEpoch;
+  if (typeof beginTurn !== "function" || typeof directionEpoch !== "function") {
+    return undefined;
+  }
+  return {
+    beginTurn: agentId => beginTurn.call(value, agentId),
+    directionEpoch: agentId => directionEpoch.call(value, agentId),
   };
 }
 
@@ -2090,6 +2120,13 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
     const projectedLocalToolPermission = asLocalToolPermissionProjection(
       localToolPermission,
     );
+    // The OTHER half of the same live controller, for the turn shell. The
+    // toolset projection above is not a substitute: it carries neither
+    // `beginTurn` nor `directionEpoch`, and passing it here would leave every
+    // turn running under epoch 0 with nothing failing.
+    const turnLocalToolPermission = asTurnLocalToolPermissionEpoch(
+      localToolPermission,
+    );
 
     const hostDependencies = (): ProductionTurnHostDependencies => {
       const readMediaDimensions = method(attachments, "readMediaDimensions");
@@ -2842,6 +2879,16 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
          * subagent scope is a hard error rather than a silent parent fallback.
          */
         scopeRunner?: unknown;
+        /**
+         * The direction the PARENT is running under, for a subagent's scope.
+         *
+         * A subagent must never read its own id out of the controller: that id
+         * is not in the controller's `directionEpochs` map, so the answer is 0
+         * even while the parent is several turns deep, and the child's scoped
+         * tool calls would then compare remembered refusals against the wrong
+         * direction.
+         */
+        readonly inheritedDirectionEpoch?: number;
       }): ReturnType<typeof createProductionTurnRunShellHostInput> => {
         const hostInput = createProductionTurnRunShellHostInput({
         createAgentOwnerInput: ({ requestId, runOptions, context, cancelThisRun, emitUpdate }) => {
@@ -3002,12 +3049,24 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
                   subagentStore: SubagentConversationStore;
                   ready?: Promise<void>;
                   scopeRunner?: unknown;
+                  /** The parent's live direction at the moment of dispatch. */
+                  inheritedDirectionEpoch?: number;
                 } = {
                   agentId: subagentIdentity.agentId,
                   isSubagentRunner: subagentIdentity.isSubagentRunner,
                   subagentType: args.subagentType,
                   subagentStore: subagentIdentity.conversationStore,
                   ready: subagentIdentity.ready,
+                  // Read HERE, at dispatch, and not cached in a closure built
+                  // earlier: the child works inside the task its parent is
+                  // running right now, so it must share the direction the
+                  // parent's current turn opened.
+                  ...(turnLocalToolPermission === undefined
+                    ? {}
+                    : {
+                        inheritedDirectionEpoch:
+                          turnLocalToolPermission.directionEpoch(session.id),
+                      }),
                 };
                 const child = deps.buildRunner({
                   ...runnerOptions,
@@ -3249,6 +3308,19 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
         },
         profilePromptSnapshots: () => session.db,
         isSubagentRunner: scope.isSubagentRunner,
+        // The live controller, NOT `projectedLocalToolPermission`. Without this
+        // pair `SandAgentRunner.localToolPermission` stays `undefined`, so the
+        // shell never gets its `beginLocalToolPermissionTurn` hook and
+        // `resolveTurnDirectionEpoch` has nothing to read: every turn runs under
+        // epoch 0 and no refusal is ever retired. Both production callers of
+        // this builder — the parent's own shell below and every `Task`
+        // subagent's — read it from here, so neither of them can miss it.
+        ...(turnLocalToolPermission === undefined
+          ? {}
+          : { localToolPermission: turnLocalToolPermission }),
+        ...(scope.inheritedDirectionEpoch === undefined
+          ? {}
+          : { inheritedDirectionEpoch: scope.inheritedDirectionEpoch }),
         subagents: { sessions: new Map() },
         getConversationId: () => scope.agentId,
         // The generation of THIS scope's runner. Reading the parent's here made

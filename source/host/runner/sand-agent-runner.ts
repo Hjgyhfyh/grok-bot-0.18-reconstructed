@@ -39,6 +39,7 @@ import {
 import {
   createProductionTurnRunShellAdapter,
   type ProductionTurnRunShellAdapterInput,
+  type TurnLocalToolPermissionEpoch,
 } from "./production-turn-run-shell-adapter.js";
 import type { ForwardedUpdate } from "./agent-adapters.js";
 import type {
@@ -256,6 +257,8 @@ export interface SandAgentRunnerOptions<T = unknown> {
     | "createSettleHost"
     | "profilePromptSnapshots"
     | "cancelThisRun"
+    | "localToolPermission"
+    | "inheritedDirectionEpoch"
   >;
 }
 
@@ -341,6 +344,19 @@ export class SandAgentRunner<T = unknown> {
   readonly subagentModelId: string | undefined;
   readonly inheritedRequestSource: string | undefined;
   readonly inheritedAutomationId: string | undefined;
+  /**
+   * The live local-tool-permission controller, when the host bound one.
+   *
+   * It carries the direction epoch, and nothing in `source/` ever advanced it:
+   * the shell hook that opens a direction was declared on
+   * `TurnRunShellHost` and left unimplemented, so every turn ran under epoch
+   * 0 and every refusal the controller remembered was stamped with 0. An
+   * absent controller is a normal host (the permission extension is optional)
+   * and must leave the turn running.
+   */
+  readonly localToolPermission: TurnLocalToolPermissionEpoch | undefined;
+  /** The parent's direction epoch when this runner is a subagent. */
+  readonly inheritedDirectionEpoch: number | undefined;
   readonly autoReviewController: SandAutoReviewController | undefined;
   readonly subagentTranscriptId: string | undefined;
 
@@ -358,6 +374,8 @@ export class SandAgentRunner<T = unknown> {
     this.subagentModelId = options.subagentModelId;
     this.inheritedRequestSource = options.requestSource;
     this.inheritedAutomationId = options.automationId;
+    this.localToolPermission = options.productionTurnRunShell?.localToolPermission;
+    this.inheritedDirectionEpoch = options.productionTurnRunShell?.inheritedDirectionEpoch;
     this.autoReviewController = options.autoReviewController;
     this.subagentTranscriptId = options.transcriptId;
     this.#onComputerUseUsage = options.onComputerUseUsage;
@@ -472,6 +490,24 @@ export class SandAgentRunner<T = unknown> {
           this.#activeTurnAutomationId = automationId;
         },
         beginAutoReviewUserMessageEpoch: () => this.beginAutoReviewUserMessageEpoch(),
+        ...(this.localToolPermission === undefined
+          ? {}
+          : { localToolPermission: this.localToolPermission }),
+        ...(this.inheritedDirectionEpoch === undefined
+          ? {}
+          : { inheritedDirectionEpoch: this.inheritedDirectionEpoch }),
+        // The runner is the only place that knows both halves of the pair: the
+        // controller it was built with, and the id the shell will ask about.
+        // Without this line the shell's optional hook stayed undefined, the
+        // controller's `directionEpochs` map stayed empty, and every turn ran
+        // under epoch 0 for the life of the process. A subagent is left without
+        // the hook on purpose: it inherits a direction, it never opens one.
+        ...(this.localToolPermission === undefined || this.isSubagentRunner
+          ? {}
+          : {
+            beginLocalToolPermissionTurn: () =>
+              this.localToolPermission?.beginTurn(this.getConversationId()),
+          }),
         setActiveRunInterrupted: value => {
           this.#activeRunInterrupted = value;
         },

@@ -449,6 +449,15 @@ export function withLocalToolScope<T extends TurnTool>(
       argsStream: AsyncIterable<string>,
       metadata: ToolMetadata,
     ) {
+      // Read, never computed.
+      //
+      // The turn's direction epoch is written into the run context exactly
+      // once, by the production turn-shell adapter, from
+      // `localToolPermission.directionEpoch(...)` for the agent or from the
+      // inherited value for a subagent. This call is the only reader. It used
+      // to have no writer anywhere in `source/`, so the key was always absent,
+      // `directionEpoch` was left off the scope, and the controller fell back
+      // to its own live epoch — which nothing advanced.
       const directionEpoch = context.get(sandTurnDirectionEpochKey);
       const scope = {
         agentId,
@@ -556,6 +565,382 @@ export function withToolTimeout<T extends TurnTool>(
         ]);
       } finally {
         if (timeout !== undefined) clearTimeout(timeout);
+      }
+    },
+  };
+}
+
+/**
+ * A turn had no way to notice that it was stuck.
+ *
+ * The measured turn took the same tool refusal twenty times in a row, invented a
+ * wrong explanation for it, and spent ten minutes looking for a way around it.
+ * The user watched a "working" indicator the whole time and got not one word.
+ *
+ * Nothing anywhere was watching, for two separate reasons.
+ *
+ * The first-token stall deadline cannot help here, and it is not broken. It is a
+ * deadline on ONE model response: it starts at 150 ms, doubles to 300 ms per
+ * retry, and `reset()` re-arms it every time the stream produces output
+ * (`source/host/runner/stream-attempt.ts:69`). An agent that makes dozens of
+ * separate tool calls produces output constantly and each call lasts
+ * milliseconds, so the gap between two outputs never approaches the deadline no
+ * matter how long the whole turn runs. It answers "is the model answering at
+ * all", and a stuck agent answers brilliantly. That is a different question, and
+ * this is it.
+ *
+ * The second reason is the one this file fixes. Nothing counted failures. The
+ * model was shown refusal number one, then refusal number two, and neither
+ * message said a first refusal had already happened. Refusal twenty looked
+ * exactly like refusal one, so the model had no reason to stop repeating itself
+ * and the user had nothing to read.
+ *
+ * So the turn now carries a ledger of its own:
+ *
+ *  - every failing call is fingerprinted by tool name plus its canonical
+ *    arguments, so "the same command" means the same command and a model that
+ *    varies anything starts a new run;
+ *  - a call that does not fail clears the ledger, because progress is the only
+ *    reset that cannot lie — a counter that survives a success would accuse the
+ *    model of looping when it was working;
+ *  - once the run passes {@link REPEATED_TOOL_FAILURE_NOTICE_AFTER}, the
+ *    refusal's own text grows a sentence naming the count and telling the model
+ *    to change approach or tell the user what is blocking it.
+ *
+ * Appending to the refusal text rather than emitting a separate event is
+ * deliberate. `executeToolResultOrError` in `source/packages/agent/tools/core.ts:152`
+ * sends the very same serialized tool call to BOTH readers: the model receives it
+ * as the tool result, and `interactionHandler.emitToolCallError` forwards it to
+ * the user's tool tray as a completed call. One string, two readers, no renderer
+ * change, and nothing to keep in sync. A broadcast the renderer does not paint
+ * would have reached neither, which is the failure mode this whole file is
+ * littered with warnings about.
+ *
+ * What is deliberately NOT counted: a command that ran and returned a non-zero
+ * exit code is a result, not a refusal, and deciding which exit codes are
+ * acceptable is not this file's call. A per-call timeout that fires six times is
+ * also not counted, because `withToolTimeout` already tells the model about each
+ * one and the wrapper sits inside it. A cancelled turn is never counted: the
+ * user's stop button is not the agent's loop.
+ */
+export const REPEATED_TOOL_FAILURE_NOTICE_AFTER = 5;
+
+/**
+ * The fixed phrase every notice starts with. Also the idempotence marker: an error
+ * object can pass through two nested wrappers on the way out, and a doubled
+ * sentence would read as a second, different warning.
+ */
+export const REPEATED_TOOL_FAILURE_NOTICE_MARKER = "You have now issued this exact";
+
+/** Reads the notice threshold. A missing or nonsensical value keeps the default. */
+export function resolveRepeatedToolFailureNoticeAfter(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const raw = env.SAND_REPEATED_TOOL_FAILURE_NOTICE_AFTER;
+  const parsed = raw === undefined || raw.trim().length === 0 ? Number.NaN : Number(raw);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : REPEATED_TOOL_FAILURE_NOTICE_AFTER;
+}
+
+export interface RepeatedToolFailureFingerprint {
+  readonly hash: string;
+  readonly text: string;
+}
+
+export interface RepeatedToolFailureStreak extends RepeatedToolFailureFingerprint {
+  readonly toolName: string;
+  readonly count: number;
+}
+
+export interface RepeatedToolFailureLedger {
+  /** Records a failed call and returns the length of the identical run ending here. */
+  noteFailure(
+    toolName: string,
+    fingerprint: RepeatedToolFailureFingerprint,
+  ): number;
+  /** A call that did not fail ends every run. */
+  noteSuccess(): void;
+  /** The run in progress, or `undefined` when nothing is being repeated. */
+  readStreak(): RepeatedToolFailureStreak | undefined;
+}
+
+/**
+ * A stable rendering of a tool call's arguments.
+ *
+ * Object keys are sorted on purpose. Two argument payloads that differ byte for
+ * byte but parse to the same object ARE the same call, and a model that only
+ * reordered a key has not changed anything it should be told about. A payload
+ * that is not JSON at all is compared as the trimmed text it was, which is still
+ * exact.
+ */
+function canonicalToolCallArguments(rawArguments: string): string {
+  const trimmed = rawArguments.trim();
+  if (trimmed.length === 0) return "";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return trimmed;
+  }
+  return canonicalJson(parsed);
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === undefined) return "null";
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, member]) => member !== undefined)
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  return `{${entries
+    .map(([key, member]) => `${JSON.stringify(key)}:${canonicalJson(member)}`)
+    .join(",")}}`;
+}
+
+/**
+ * A short FNV-1a key over the canonical form, so the ledger holds a small string
+ * rather than the whole argument payload. The canonical text is compared
+ * alongside it, so a 32-bit collision costs one wasted comparison and never a
+ * wrong accusation.
+ */
+export function repeatedToolFailureFingerprintOf(
+  toolName: string,
+  rawArguments: string,
+): RepeatedToolFailureFingerprint {
+  const text = canonicalToolCallArguments(rawArguments);
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index += 1) {
+    hash = Math.imul(hash ^ text.charCodeAt(index), 0x01000193) >>> 0;
+  }
+  return { hash: hash.toString(16).padStart(8, "0"), text };
+}
+
+export function createRepeatedToolFailureLedger(): RepeatedToolFailureLedger {
+  let streak: RepeatedToolFailureStreak | undefined;
+  const sameCall = (
+    toolName: string,
+    fingerprint: RepeatedToolFailureFingerprint,
+  ): boolean =>
+    streak !== undefined
+    && streak.toolName === toolName
+    && streak.hash === fingerprint.hash
+    && streak.text === fingerprint.text;
+  return {
+    noteFailure(toolName, fingerprint) {
+      streak = sameCall(toolName, fingerprint)
+        ? { ...streak!, count: streak!.count + 1 }
+        : { ...fingerprint, toolName, count: 1 };
+      return streak.count;
+    },
+    noteSuccess() {
+      streak = undefined;
+    },
+    readStreak() {
+      return streak;
+    },
+  };
+}
+
+/**
+ * One ledger per TURN, not per toolset.
+ *
+ * `toolsGenerator` runs again for every model step of a turn: `buildTurnTools` is
+ * called from `runModelStep` in `abstract-user-message-action-handler.ts`, and it
+ * builds a brand new tool array every time. A ledger created inside
+ * `buildTurnTools` would therefore restart at one after every single step — which
+ * is precisely the twenty-in-a-row case that needs counting. Keying a module-level
+ * WeakMap on the turn input keeps the count across the steps of one turn, drops it
+ * with the turn, and gives a subagent its own ledger because a subagent is a
+ * different turn.
+ */
+const repeatedToolFailureLedgers = new WeakMap<object, RepeatedToolFailureLedger>();
+
+export function repeatedToolFailureLedgerForTurn(turn: object): RepeatedToolFailureLedger {
+  const existing = repeatedToolFailureLedgers.get(turn);
+  if (existing !== undefined) return existing;
+  const created = createRepeatedToolFailureLedger();
+  repeatedToolFailureLedgers.set(turn, created);
+  return created;
+}
+
+/**
+ * The sentence both readers get on the refusal that ends a run.
+ *
+ * It says the count, because a count is checkable and "you seem to be looping"
+ * is not. It says what to do next, because a warning the model cannot act on only
+ * adds tokens.
+ */
+export function repeatedToolFailureNotice(streak: RepeatedToolFailureStreak): string {
+  return [
+    "",
+    `${REPEATED_TOOL_FAILURE_NOTICE_MARKER} ${streak.toolName} call ${streak.count} times in a row and it failed every time.`,
+    "You are not making progress. Do not issue this call again: the next identical call fails the same way.",
+    "Change the arguments, use a different tool, or send the user a message naming what you tried and what is blocking you.",
+  ].join("\n");
+}
+
+/**
+ * The text fields the shipped refusal serializers read.
+ *
+ * This list is finite on purpose. Every `serializeError` in the toolset builds its
+ * model-facing string out of `error.message`, the `ToolCallError` message pair, or
+ * the `reason` / `error` fields that `ShellToolRejectedError` and
+ * `ShellToolPermissionDeniedError` carry — see `serializeShellError` in
+ * `create-shell-tool.ts:602`. Appending to all of them is what makes the notice
+ * reach the model for every refusal shape instead of only the ones that happen to
+ * inherit from `Error` alone.
+ */
+const REPEATED_TOOL_FAILURE_TEXT_FIELDS = [
+  "message",
+  "reason",
+  "error",
+  "clientVisibleErrorMessage",
+  "modelVisibleErrorMessage",
+] as const;
+
+function appendRepeatedToolFailureNotice(
+  error: unknown,
+  notice: string,
+): boolean {
+  if (!(error instanceof Error)) return false;
+  const target = error as Error & {
+    reason?: unknown;
+    error?: unknown;
+    clientVisibleErrorMessage?: unknown;
+    modelVisibleErrorMessage?: unknown;
+  };
+  let appended = false;
+  for (const field of REPEATED_TOOL_FAILURE_TEXT_FIELDS) {
+    const current = field === "message" ? error.message : target[field];
+    if (typeof current !== "string") continue;
+    if (current.includes(REPEATED_TOOL_FAILURE_NOTICE_MARKER)) return true;
+    const next = `${current}${notice}`;
+    if (field === "message") error.message = next;
+    else target[field] = next;
+    appended = true;
+  }
+  return appended;
+}
+
+function readContextAbortSignal(value: unknown): AbortSignal | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const signal = (value as { readonly signal?: unknown }).signal;
+  return typeof signal === "object"
+    && signal !== null
+    && typeof (signal as AbortSignal).addEventListener === "function"
+    ? (signal as AbortSignal)
+    : undefined;
+}
+
+function isAsyncIterableOfChunks(value: unknown): value is AsyncIterable<string> {
+  return typeof value === "object"
+    && value !== null
+    && typeof (value as AsyncIterable<string>)[Symbol.asyncIterator] === "function";
+}
+
+/**
+ * Reads a tool call's arguments so the ledger can fingerprint the call, and hands
+ * the tool a replay of exactly what arrived.
+ *
+ * Buffering is what `withSafeParsedArgs` already does with this stream, and what
+ * `wrapDynamicInvocationToolWithTimeout` in `mcp-meta-tools.ts:75` does before it
+ * arms anything, so it is the established shape here and not a new cost. What is
+ * new is the abort race: this wrapper sits INSIDE `withToolTimeout`, so the
+ * per-call deadline is already armed while the drain runs, and a stream that never
+ * ends would otherwise leave a reader running behind a call the turn has already
+ * given up on — the exact orphan `withToolTimeout` was written to stop.
+ */
+async function bufferToolCallArguments(
+  rawArguments: unknown,
+  context: unknown,
+  toolName: string,
+): Promise<{ readonly text: string; readonly replay: unknown }> {
+  if (!isAsyncIterableOfChunks(rawArguments)) return { text: "", replay: rawArguments };
+  const iterator = rawArguments[Symbol.asyncIterator]();
+  const signal = readContextAbortSignal(context);
+  let detach: (() => void) | undefined;
+  const aborted = signal === undefined
+    ? undefined
+    : new Promise<never>((_resolve, reject) => {
+        const onAbort = (): void => reject(
+          new Error(
+            `The ${toolName} tool call was cancelled before its arguments finished arriving.`,
+          ),
+        );
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+        signal.addEventListener("abort", onAbort, { once: true });
+        detach = () => signal.removeEventListener("abort", onAbort);
+      });
+  let text = "";
+  try {
+    for (;;) {
+      const next = aborted === undefined
+        ? await iterator.next()
+        : await Promise.race([iterator.next(), aborted]);
+      if (next.done === true) break;
+      text += typeof next.value === "string" ? next.value : String(next.value);
+    }
+  } catch (error) {
+    void Promise.resolve(iterator.return?.()).catch(() => {});
+    throw error;
+  } finally {
+    detach?.();
+  }
+  return { text, replay: (async function* () { yield text; })() };
+}
+
+/**
+ * Counts identical failing calls for one turn and grows the refusal text once the
+ * run is long enough to be worth interrupting for.
+ *
+ * Ordering follows completion order, not issue order. When a model step issues
+ * several parallel calls the ledger sees them as they settle, which is the order
+ * the model itself will read them in the next turn's context.
+ */
+export function withRepeatedToolFailureNotice<T extends TurnTool>(
+  tool: T,
+  ledger: RepeatedToolFailureLedger,
+  noticeAfter: number = resolveRepeatedToolFailureNoticeAfter(),
+): T {
+  return {
+    ...tool,
+    async execute(...args: readonly unknown[]) {
+      const context = args[0];
+      // A failure while the turn is being cancelled is the user's stop button, not
+      // a loop, and neither is a throw whose own name says the call was aborted.
+      // Both are counted out rather than counted up.
+      const cancelled = readContextAbortSignal(context)?.aborted === true;
+      // A drain that never finishes means there is no call to fingerprint and nothing
+      // to tell the model it repeated, so this failure is deliberately not counted.
+      const buffered = await bufferToolCallArguments(args[2], context, tool.name);
+      const fingerprint = repeatedToolFailureFingerprintOf(tool.name, buffered.text);
+      const forwarded = [...args];
+      forwarded[2] = buffered.replay;
+      try {
+        const value = await tool.execute(...forwarded);
+        ledger.noteSuccess();
+        return value;
+      } catch (error) {
+        const abortedByName = error instanceof Error
+          && (error.name === "AbortError"
+            || error.name === "ToolCallAbortedError"
+            || error.name === "InteractionListenerStreamClosedError");
+        if (!cancelled && !abortedByName) {
+          const streak = ledger.noteFailure(tool.name, fingerprint);
+          if (streak > noticeAfter) {
+            appendRepeatedToolFailureNotice(
+              error,
+              repeatedToolFailureNotice({
+                ...fingerprint,
+                toolName: tool.name,
+                count: streak,
+              }),
+            );
+          }
+        }
+        throw error;
       }
     },
   };
@@ -1606,13 +1991,18 @@ export function buildTurnTools(
   const placed = dynamicToolsEnabled
     ? offered.map(withDynamicToolPlacement)
     : offered;
+  // One ledger per turn, shared by every tool this turn carries and by every toolset
+  // this turn builds. `withToolTimeout` stays the outermost wrapper so the per-call
+  // deadline still covers the argument drain the notice wrapper performs.
+  const repeatedFailures = repeatedToolFailureLedgerForTurn(turn);
   const guarded = placed.map((tool) => {
+    const observed = withRepeatedToolFailureNotice(tool, repeatedFailures);
     if (
       dynamicInvocationRegistry !== undefined
       && tool.dynamicToolMetaRole === "invocation"
     ) {
       return wrapDynamicInvocationToolWithTimeout(
-        tool as StreamingTurnTool,
+        observed as StreamingTurnTool,
         dynamicInvocationRegistry,
         host.isComputerUseSubagent,
       ) as unknown as TurnTool;
@@ -1621,7 +2011,7 @@ export function buildTurnTools(
       tool.name,
       host.isComputerUseSubagent,
     );
-    return withToolTimeout(tool, executionTimeoutMs, () =>
+    return withToolTimeout(observed, executionTimeoutMs, () =>
       createToolCallExecutionTimeoutError({
         toolName: tool.name,
         executionTimeoutMs,

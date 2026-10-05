@@ -541,6 +541,43 @@ export function createHostGatewayApi(
       requireText(args, "resolution", "resolveLocalToolPermission");
       await method(localToolPermission, "resolveAsk")(args);
     },
+    /**
+     * The question an agent is blocked on, for a caller that never saw the card.
+     *
+     * `resolveLocalToolPermission` above is the only half of the round trip that
+     * existed. The other half — `getPendingRequestForAgent` on the controller —
+     * had no caller in the repository outside a test, and no gateway command read
+     * it. The card is a push: `bindLocalPermissionSurface` in
+     * `host-runner-composition.ts` subscribes to the controller and emits the ask
+     * as a `local-tool-permission` transcript entry, so the question exists for the
+     * user only from the moment the renderer happens to be listening for that one
+     * agent. A window closed before that emit, or an agent whose conversation is
+     * not the open one, leaves the tool call blocked inside `authorize` behind a
+     * referenced ten-minute timer that holds the event loop open. Nothing on
+     * screen says a question is waiting, and when the ask expires on its own the
+     * agent is told the user never answered — which is true and is not what
+     * happened.
+     *
+     * The answer is a LIST, not a single object and not a `404`. At most one ask
+     * per agent is open at a time in practice, but the shape has to survive an
+     * agent that opens a second one while this caller was mid-poll, and an empty
+     * list has to read as "nobody is waiting on you" — the normal state of every
+     * agent, polled on a timer — rather than as a missing endpoint. `requirePath`
+     * names `agentId` in the refusal for the same reason the neighbours above do:
+     * a caller holding `{}` is told which field to fix instead of being handed a
+     * V8 sentence about a `Map`.
+     *
+     * It is a pull. It answers whoever asks, at the moment they ask. It does not
+     * make the user look at the question; see `tests/list-pending-local-tool-permissions.test.mjs`
+     * for what is still missing on the interface side of this.
+     */
+    listPendingLocalToolPermissions: (args: any) => {
+      markActive("user_action");
+      const ask = method(localToolPermission, "getPendingRequestForAgent")(
+        requirePath(args, "agentId", "listPendingLocalToolPermissions"),
+      );
+      return ask == null ? [] : [ask];
+    },
     dismissWidget: (args: any) => {
       markActive("user_action");
       method(telemetry.analytics, "trackEvent")("sand.widget.dismissed", {
@@ -1111,10 +1148,63 @@ export function createHostGatewayApi(
     refreshMcp: async ({ completion, routedAction, routedArgs }: any) => {
       if (routedAction === "list-tools") return await listRoutedMcpTools();
       if (routedAction === "execute-tool") return await executeRoutedMcpTool(routedArgs);
+      /**
+       * `routedAction` arrived and it named neither of the two legal values.
+       *
+       * The discriminator used to have no fall-through. Anything that matched
+       * neither `if` above reached the `restart()` line below, so
+       * `{"routedAction":"execute-tools"}` — one character of typo — reconnected
+       * every MCP server, executed no tool, and answered `200`, which is exactly
+       * what a routed-tool client reads as "your tool answered". A caller whose
+       * request was wrong could not tell that from a successful reload, and
+       * neither the status nor the body named the field.
+       *
+       * The refusal runs BEFORE the `completion` leg on purpose: an unknown
+       * action and a pending handshake in the same body is still an unknown
+       * action, and reading `completion` first would reopen the same hole with
+       * one more field in it.
+       *
+       * `routedArgs` without an action is the same mistake the other way round —
+       * the caller named the tool and lost the verb — and it is refused with the
+       * name of the field it lost instead of with a reload.
+       */
+      if (routedAction !== undefined) {
+        throw malformed(
+          "refreshMcp",
+          `"routedAction" must be "list-tools" or "execute-tool", and ${
+            typeof routedAction === "string" && routedAction.length > 0
+              ? JSON.stringify(routedAction)
+              : arrivalType(routedAction)
+          } arrived.`,
+        );
+      }
+      if (routedArgs !== undefined) {
+        throw malformed(
+          "refreshMcp",
+          '"routedAction" must be "list-tools" or "execute-tool" when "routedArgs" is present.',
+        );
+      }
       if (completion != null) {
         await deps.handleDesktopMcpAuthCompletion(completion);
         return;
       }
+      /**
+       * An absent `routedAction` with an absent `completion` is the reload the
+       * shipped desktop asks for, and it is not a lost request.
+       *
+       * `refreshHostMcp` in `source/electron-main/mcp/mcp-desktop.ts` sends
+       * exactly `completion == null ? {} : { completion }`, and seven marketplace
+       * IPC handlers call it: `sand:mcp-install`, `sand:mcp-update-plugin-install`,
+       * `sand:mcp-remove`, `sand:mcp-uninstall-plugin`, `sand:mcp-auth`,
+       * `sand:mcp-rename-account` and `sand:mcp-remove-account`. The desktop
+       * mutates MCP state through its OWN `SandMcpManager`; this host owns a
+       * separate manager that caches the account config and the live clients.
+       * The 0.18 bundle says so in the comment above its own `refreshMcp`:
+       * "reload it here so a server the user just added or authenticated in the
+       * marketplace is reconnected and surfaced to the agent without a host
+       * restart". Refusing `{}` would break every install, removal, rename and
+       * re-auth.
+       */
       await method(deps.extensions.api("mcp").management, "restart")();
     },
     listRoutedMcpTools,
