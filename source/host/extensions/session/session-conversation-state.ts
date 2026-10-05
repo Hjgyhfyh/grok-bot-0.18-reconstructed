@@ -14,9 +14,9 @@ export class SandSessionConversationState{
   async getAgentOutline(id:string):Promise<unknown>{const session=await this.host.openSession(id);try{return await this.getSessionOutline(session)}finally{await session.agentStore.dispose();session.db.close()}}
   private readDb<T>(agentId:string,read:(db:SandAgentDb)=>T,fallback:T):T{let db:SandAgentDb|undefined;try{db=new SandAgentDb(getAgentDbPath(this.host.rootDir,agentId),{recoverOnCorruption:false});return read(db)}catch{return fallback}finally{db?.close()}}
   readAgentTranscriptEntries(agentId:string){return this.readDb(agentId,(db)=>db.getTranscriptEntries(),[])}
-  readAgentTranscriptPage(agentId:string,query:{beforeSeq?:number;sinceMs?:number;untilMs:number;limit:number}){return this.readDb(agentId,(db)=>db.getTranscriptPage(query),{entries:[]})}
-  readAgentTranscriptWindow(agentId:string,query:{beforeSeq?:number;limit:number}){return this.readDb(agentId,(db)=>db.getTranscriptWindow(query),{entries:[],threadCounts:{}})}
-  readAgentTranscriptTail(agentId:string,query:{beforeSeq?:number;limit:number}){return this.readDb(agentId,(db)=>db.getTranscriptTail(query),{entries:[]})}
+  readAgentTranscriptPage(agentId:string,query:{beforeSeq?:number;sinceMs?:number;untilMs?:number;limit?:number}){return this.readDb(agentId,(db)=>db.getTranscriptPage(query),{entries:[]})}
+  readAgentTranscriptWindow(agentId:string,query:{beforeSeq?:number;limit?:number}){return this.readDb(agentId,(db)=>db.getTranscriptWindow(query),{entries:[],threadCounts:{}})}
+  readAgentTranscriptTail(agentId:string,query:{beforeSeq?:number;limit?:number}){return this.readDb(agentId,(db)=>db.getTranscriptTail(query),{entries:[]})}
   readAgentThread(agentId:string,rootId:string){return this.readDb(agentId,(db)=>db.getThread(rootId),{entries:[]})}
   async getAgentTranscriptEntries(id:string):Promise<TranscriptEntry[]>{const session=await this.host.openSession(id);try{return await this.getTranscriptEntries(session)}finally{await session.agentStore.dispose();session.db.close()}}
 }

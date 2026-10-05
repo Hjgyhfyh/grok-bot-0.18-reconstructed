@@ -72,6 +72,42 @@ function method(api: DynamicGatewayApi, name: string): DynamicMethod {
 }
 
 /**
+ * A request field that must arrive as a non-empty string.
+ *
+ * These commands read their arguments deep inside the extension, past the
+ * gateway edge, where a missing string arrives as `undefined` and the first
+ * thing the callee does with it is `.trim()`. The host then answered `500` with
+ * the raw V8 text — `Cannot read properties of undefined (reading 'trim')` —
+ * which names no command, no field and no remedy, and reads like a broken
+ * server rather than a malformed request.
+ *
+ * The check runs before the extension is called, so it only changes the message
+ * for a request that was already going to fail: nothing that used to be accepted
+ * is refused here, and nothing that used to answer `{accepted:false}` changes
+ * its answer.
+ */
+function requireText(args: unknown, field: string, command: string): string {
+  const value = (args as Record<string, unknown> | null | undefined)?.[field];
+  if (typeof value !== "string") {
+    throw new Error(
+      `Malformed ${command} request: "${field}" must be a string, and ${typeof value} arrived.`,
+    );
+  }
+  return value;
+}
+
+/** A request field that must arrive as a string, and may be empty. */
+function requirePath(args: unknown, field: string, command: string): string {
+  const value = (args as unknown as Record<string, unknown> | null | undefined)?.[field];
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(
+      `Malformed ${command} request: "${field}" must be a non-empty string.`,
+    );
+  }
+  return value;
+}
+
+/**
  * Restores the shipped gateway method table. Each method delegates to the
  * extension that owned the behavior in the artifact; the host layer retains
  * cross-cutting nonce dedupe, telemetry, cleanup, feature gates, and status
@@ -234,6 +270,9 @@ export function createHostGatewayApi(
     }));
   };
   const executeRoutedMcpTool = async (args: any) => {
+    requireText(args, "name", "executeRoutedMcpTool");
+    requireText(args, "toolName", "executeRoutedMcpTool");
+    requireText(args, "providerIdentifier", "executeRoutedMcpTool");
     const mcp = deps.extensions.api("mcp").mcp;
     const executor = method(mcp, "createExecutor")(undefined, undefined, { agentId: args.agentId });
     return await method(executor, "execute")({}, {
@@ -280,6 +319,7 @@ export function createHostGatewayApi(
     },
 
     sendPrompt: async (args: any) => {
+      requireText(args, "prompt", "sendPrompt");
       const agentId =
         (typeof args.agentId === "string" && args.agentId.length > 0
           ? args.agentId
@@ -313,6 +353,7 @@ export function createHostGatewayApi(
       method(manager, "promptAcceptanceStatus")(args),
     respondToWidget: (args: any) => {
       markActive("user_action");
+      requireText(args, "value", "respondToWidget");
       method(telemetry.analytics, "trackEvent")("sand.widget.responded", {
         agent_id: args.agentId
       });
@@ -340,14 +381,17 @@ export function createHostGatewayApi(
       });
       return method(manager, "dismissWidget")(args);
     },
-    submitSecret: (args: any) =>
-      method(manager, "submitSecret")(
+    submitSecret: (args: any) => {
+      requireText(args, "value", "submitSecret");
+      return method(manager, "submitSecret")(
         args.entryId,
         args.value,
         args.agentId
-      ),
+      );
+    },
     reactToMessage: (args: any) => {
       markActive("user_action");
+      requireText(args, "emoji", "reactToMessage");
       method(telemetry.analytics, "trackEvent")("sand.reaction.added", {
         agent_id: args.agentId
       });
@@ -492,6 +536,12 @@ export function createHostGatewayApi(
       ),
     createAgentAutomation: async (args: any) => {
       markActive("user_action");
+      requirePath(args, "id", "createAgentAutomation");
+      if (typeof (args.spec as any)?.trigger !== "object" || args.spec.trigger === null) {
+        throw new Error(
+          `Malformed createAgentAutomation request: "spec.trigger" must be an object.`,
+        );
+      }
       const countBefore = (await method(manager, "getAgentAutomations")(
         args.id
       )).length;
@@ -612,6 +662,8 @@ export function createHostGatewayApi(
     getAgentChannels: (args: any) =>
       method(automations, "getAgentChannels")(args.id),
     connectChannel: async (args: any) => {
+      requirePath(args, "platform", "connectChannel");
+      requireText(args, "token", "connectChannel");
       method(manager, "connectChannel")(args.id, args.platform, args.token);
       return method(automations, "getAgentChannels")(args.id);
     },
@@ -758,8 +810,17 @@ export function createHostGatewayApi(
     completeMcpOAuth: async () => undefined,
     requestWebAuthnCeremony: (args: any) =>
       method(deps.extensions.api("webauthn-proxy"), "requestCeremony")(args),
-    setBoxSecrets: ({ secrets }: any) =>
-      method(deps.extensions.api("secrets"), "set")({ secrets }),
+    setBoxSecrets: (args: any) => {
+      // `Object.entries(undefined)` inside the secrets store answered `500
+      // {"error":"Cannot convert undefined or null to object"}`, which reads as
+      // a broken secret store rather than a request that carried no secrets.
+      if (typeof args?.secrets !== "object" || args.secrets === null || Array.isArray(args.secrets)) {
+        throw new Error(
+          `Malformed setBoxSecrets request: "secrets" must be an object, and ${Array.isArray(args?.secrets) ? "an array" : args?.secrets === null ? "null" : typeof args?.secrets} arrived.`,
+        );
+      }
+      return method(deps.extensions.api("secrets"), "set")({ secrets: args.secrets });
+    },
     getBoxSecretsStatus: () =>
       method(deps.extensions.api("secrets"), "getStatus")()
   };

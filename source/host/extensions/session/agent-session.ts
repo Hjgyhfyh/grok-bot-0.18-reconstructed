@@ -63,9 +63,9 @@ export interface ConversationStatePort {
   getAgentOutline(agentId: string): Promise<unknown>;
   getAgentTranscriptEntries(agentId: string): Promise<TranscriptEntry[]>;
   readAgentTranscriptEntries(agentId: string): TranscriptEntry[];
-  readAgentTranscriptPage(agentId: string, query: { beforeSeq?: number; sinceMs?: number; untilMs: number; limit: number }): ReturnType<SandAgentDb["getTranscriptPage"]>;
-  readAgentTranscriptWindow(agentId: string, query: { beforeSeq?: number; limit: number }): ReturnType<SandAgentDb["getTranscriptWindow"]>;
-  readAgentTranscriptTail(agentId: string, query: { beforeSeq?: number; limit: number }): ReturnType<SandAgentDb["getTranscriptTail"]>;
+  readAgentTranscriptPage(agentId: string, query: { beforeSeq?: number; sinceMs?: number; untilMs?: number; limit?: number }): ReturnType<SandAgentDb["getTranscriptPage"]>;
+  readAgentTranscriptWindow(agentId: string, query: { beforeSeq?: number; limit?: number }): ReturnType<SandAgentDb["getTranscriptWindow"]>;
+  readAgentTranscriptTail(agentId: string, query: { beforeSeq?: number; limit?: number }): ReturnType<SandAgentDb["getTranscriptTail"]>;
   readAgentThread(agentId: string, rootId: string): ReturnType<SandAgentDb["getThread"]>;
 }
 export interface AgentSessionStoreOptions {

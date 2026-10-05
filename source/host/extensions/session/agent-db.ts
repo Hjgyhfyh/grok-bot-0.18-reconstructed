@@ -272,9 +272,9 @@ export class SandAgentDb {
       listTranscriptTail: this.statements.listTranscriptTail as TranscriptPageStatements["listTranscriptTail"]
     };
   }
-  getTranscriptPage(query: { beforeSeq?: number; sinceMs?: number; untilMs: number; limit: number }) { return this.closed ? { entries: [] } : readTranscriptPage(this.transcriptPageStatements(), query); }
-  getTranscriptWindow(query: { beforeSeq?: number; limit: number }) { return this.closed ? { entries: [] } : readTranscriptWindow(this.transcriptPageStatements(), query, entries => this.threadCountsFor(entries as TranscriptEntry[])); }
-  getTranscriptTail(query: { beforeSeq?: number; limit: number }) { return this.closed ? { entries: [] } : readTranscriptTail(this.transcriptPageStatements(), query); }
+  getTranscriptPage(query: { beforeSeq?: number; sinceMs?: number; untilMs?: number; limit?: number }) { return this.closed ? { entries: [] } : readTranscriptPage(this.transcriptPageStatements(), query); }
+  getTranscriptWindow(query: { beforeSeq?: number; limit?: number }) { return this.closed ? { entries: [] } : readTranscriptWindow(this.transcriptPageStatements(), query, entries => this.threadCountsFor(entries as TranscriptEntry[])); }
+  getTranscriptTail(query: { beforeSeq?: number; limit?: number }) { return this.closed ? { entries: [] } : readTranscriptTail(this.transcriptPageStatements(), query); }
   getThread(rootId: string) { if (this.closed) return { entries: [] }; const root = this.getEntryById(rootId); const descendants = threadDescendants(rootId, this.getBranchedEntries()); return { entries: root == null ? descendants : [root, ...descendants] }; }
   getBranchedEntries(): TranscriptEntry[] { if (this.closed) return []; return (this.statements.listBranchedEntries!.all() as Array<{ entry?: unknown }>).flatMap((row) => typeof row.entry === "string" ? (parseTranscriptEntry(row.entry) as TranscriptEntry | null) ?? [] : []); }
   threadCountsFor(entries: readonly TranscriptEntry[]): Record<string, number> { const counts = branchReplyCounts(this.getBranchedEntries()); const result: Record<string, number> = {}; for (const entry of entries) { const count = counts.get(entry.id); if (count !== undefined) result[entry.id] = count; } return result; }
