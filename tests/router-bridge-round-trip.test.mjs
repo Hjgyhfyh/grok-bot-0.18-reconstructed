@@ -94,7 +94,10 @@ function handlersFor(desktopStore, box) {
       pushed.push(settings);
       if (box.reachable === false) return null;
       box.applied.push(settings);
-      // What `SettingsService.setHostSettings` does on the far side of the wire.
+      // What `SettingsService.setHostSettings` does on the far side of the wire. The endpoint is
+      // handed over with its `fallbackModelId` key intact — including `null` — because that key is the
+      // one instruction the box store needs, and a stub that strips it would silently pass a test
+      // about clearing the spare.
       if (settings.inferenceProvider !== undefined) box.store.setInferenceProvider(settings.inferenceProvider);
       if (settings.inferenceCustomEndpoint === null) box.store.setInferenceCustomEndpoint(undefined);
       else if (settings.inferenceCustomEndpoint !== undefined) box.store.setInferenceCustomEndpoint(settings.inferenceCustomEndpoint);
@@ -181,6 +184,50 @@ test("a save that cannot reach the box leaves the stored route exactly as it was
   assert.equal(desktop.getInferenceProvider(), "openrouter", "a save that failed must not leave the previous route half-written");
   assert.deepEqual(desktop.getInferenceCustomEndpoint(), ENDPOINT, "and must not drop the endpoint it already had");
   assert.equal(boxStore.getInferenceProvider(), "custom", "the box must not have taken a partial write either");
+});
+
+/*
+  The Router panel's Save sends `{ baseUrl, modelId }` — no spare — so an ordinary Save of an
+  already-demoted endpoint used to delete the spare, make the demotion unreachable, and put the next
+  turn back on the model the user had just watched fail.
+
+  This file owns the half the store-level test cannot reach: the two bridge legs. `main-edge` used to
+  normalise the request through `normalizeSandInferenceCustomEndpoint` before the store ever saw it,
+  which threw away the distinction between "the panel said nothing about the spare" and "the panel
+  cleared the spare". It also echoed its own normalised object back to the panel and pushed it at the
+  box, so both copies of the route agreed on the wrong answer. The test below drives the real handler
+  against a real desktop store and a real box store, with the panel's own payload shape, and checks
+  all three legs: the desktop file, the panel read, and what reached the box.
+*/
+test("an ordinary panel Save keeps the spare the stored endpoint already had", async () => {
+  const SPARE = "deepseek-v4.1-flash";
+  const demotedEndpoint = { baseUrl: "https://api.example.com/v1", modelId: "space-bunny", fallbackModelId: SPARE };
+  const boxStore = makeStore(await freshStoreFile("box-keep-spare.json"));
+  const desktopSettingsPath = await freshStoreFile("desktop-keep-spare.json");
+  const desktop = makeStore(desktopSettingsPath);
+  desktop.setInferenceCustomEndpoint(demotedEndpoint);
+  desktop.setInferenceCustomModelDemotion({ fromModelId: "space-bunny", toModelId: SPARE, reason: "model_not_found", httpStatus: 400, at: new Date().toISOString() });
+  boxStore.setInferenceCustomEndpoint(demotedEndpoint);
+  boxStore.setInferenceCustomModelDemotion({ fromModelId: "space-bunny", toModelId: SPARE, reason: "model_not_found", httpStatus: 400, at: new Date().toISOString() });
+  const box = { store: boxStore, reachable: true, applied: [] };
+  const { handlers, pushed } = handlersFor(desktop, box);
+
+  // Exactly what `RRouterCredential`'s save handler builds.
+  const saved = await handlers.setInferenceRouter({ provider: "custom", endpoint: { baseUrl: "https://api.example.com/v1", modelId: "space-bunny" } });
+
+  assert.equal(saved.endpoint?.fallbackModelId, SPARE, "the panel was handed back an endpoint with its spare deleted");
+  assert.equal(saved.endpoint?.fallbackModelId, makeStore(desktopSettingsPath).getInferenceCustomEndpoint()?.fallbackModelId, "the panel read and the desktop file disagree about the spare");
+  assert.equal(makeStore(desktopSettingsPath).getInferenceCustomModelDemotion()?.toModelId, SPARE, "the ordinary Save made the demotion unreachable, so the next turn asks for the retired model again");
+  assert.equal(boxStore.getInferenceCustomEndpoint()?.fallbackModelId, SPARE, "the box was sent an endpoint with its spare deleted, so the two copies of this route disagree");
+  assert.equal(boxStore.getInferenceCustomModelDemotion()?.toModelId, SPARE, "the box lost the demotion on an ordinary Save");
+  const pushedEndpoint = pushed.at(-1).inferenceCustomEndpoint;
+  assert.equal(pushedEndpoint?.fallbackModelId, SPARE, "the wire carried an endpoint with its spare deleted");
+
+  // An explicit null is still the way to clear it, and it reaches the box too.
+  const cleared = await handlers.setInferenceRouter({ provider: "custom", endpoint: { baseUrl: "https://api.example.com/v1", modelId: "space-bunny", fallbackModelId: null } });
+  assert.equal(cleared.endpoint?.fallbackModelId, undefined, "an explicit null did not clear the spare");
+  assert.equal(boxStore.getInferenceCustomEndpoint()?.fallbackModelId, undefined, "an explicit null did not reach the box");
+  assert.equal(boxStore.getInferenceCustomModelDemotion(), undefined, "the box kept a demotion whose spare the user cleared");
 });
 
 test("the panel read path never reports the account-backed provider, whatever the file says", async () => {

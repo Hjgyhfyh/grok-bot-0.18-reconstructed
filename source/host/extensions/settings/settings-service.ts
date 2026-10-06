@@ -6,7 +6,7 @@ import { normalizeSandLocalToolPermission, type SandLocalToolPermission } from "
 import type { SandAutoReviewInstructions } from "../../../shared/sand-auto-review-instructions.js";
 import type { SidebarSection } from "../../../shared/sidebar-sections.js";
 import { SandSettingsStore } from "../../../shared/node/settings/sand-settings-store.js";
-import { isSandInferenceProvider, normalizeSandInferenceCustomEndpoint, type SandInferenceCustomEndpoint, type SandInferenceProvider } from "../../../shared/inference-router.js";
+import { isSandInferenceProvider, normalizeSandInferenceCustomModelDemotion, type SandInferenceCustomEndpoint, type SandInferenceProvider, type SandInferenceWriteEndpoint } from "../../../shared/inference-router.js";
 
 export function isValidIanaTimeZone(value: string): boolean { try { new Intl.DateTimeFormat("en", { timeZone: value }).format(); return true; } catch { return false; } }
 
@@ -16,6 +16,12 @@ export interface HostSettingsUpdate {
   userTimeZone?: string; userTimeZoneOverride?: string; agentDefaultModel?: SandAgentModelSelection | null; computerUseModel?: SandAgentModelSelection | null;
   autoReviewInstructions?: SandAutoReviewInstructions; localToolPermission?: unknown; webauthnProxyEnabled?: boolean; pinnedAgentIds?: string[];
   sidebarSections?: SidebarSection[]; hasSeenOnboarding?: boolean; featureFlagOverrides?: Record<string, boolean>; inferenceProvider?: unknown; inferenceCustomEndpoint?: unknown;
+  /**
+   * The sticky demotion of the custom endpoint onto its spare model. `null` clears it, which is how
+   * a human says "use my primary model again"; an object is refused unless it is a record this build
+   * could have written itself.
+   */
+  inferenceCustomModelDemotion?: unknown;
 }
 
 export class SettingsService {
@@ -30,7 +36,7 @@ export class SettingsService {
     const agentDefaultModel = this.store.getAgentDefaultModel(); const computerUseModel = this.store.getComputerUseModel();
     const scope = this.store.getMcpCustomInstructionsAccountScope(); const pinnedAgentIds = this.store.getPinnedAgentIds();
     const sidebarSections = this.store.getSidebarSections(); const hasSeenOnboarding = this.store.getHasSeenOnboarding();
-    return { notifications: this.store.getNotificationConfig(), mcpCustomInstructions: this.store.getMcpCustomInstructions(), mcpCustomInstructionsByServerId: this.store.getMcpCustomInstructionsByServerId(), mcpDisabledToolsByServerId: this.store.getMcpDisabledToolsByServerId(), ...(scope === undefined ? {} : { mcpCustomInstructionsAccountScope: scope }), mcpBoxServers: this.store.getMcpBoxServers(), autoReviewInstructions: this.store.getAutoReviewInstructions(), localToolPermission: this.store.getLocalToolPermission(), webauthnProxyEnabled: this.store.getWebauthnProxyEnabled(), inferenceProvider: this.store.getInferenceProvider(), inferenceCustomEndpoint: this.store.getInferenceCustomEndpoint() ?? null, inferenceRouterUsage: this.store.getInferenceRouterUsage(), ...(userTimeZone === undefined ? {} : { userTimeZone }), ...(userTimeZoneOverride === undefined ? {} : { userTimeZoneOverride }), ...(agentDefaultModel === undefined ? {} : { agentDefaultModel }), ...(computerUseModel === undefined ? {} : { computerUseModel }), ...(pinnedAgentIds === undefined ? {} : { pinnedAgentIds }), sidebarSections: sidebarSections ?? [], ...(hasSeenOnboarding === undefined ? {} : { hasSeenOnboarding }) };
+    return { notifications: this.store.getNotificationConfig(), mcpCustomInstructions: this.store.getMcpCustomInstructions(), mcpCustomInstructionsByServerId: this.store.getMcpCustomInstructionsByServerId(), mcpDisabledToolsByServerId: this.store.getMcpDisabledToolsByServerId(), ...(scope === undefined ? {} : { mcpCustomInstructionsAccountScope: scope }), mcpBoxServers: this.store.getMcpBoxServers(), autoReviewInstructions: this.store.getAutoReviewInstructions(), localToolPermission: this.store.getLocalToolPermission(), webauthnProxyEnabled: this.store.getWebauthnProxyEnabled(), inferenceProvider: this.store.getInferenceProvider(), inferenceCustomEndpoint: this.store.getInferenceCustomEndpoint() ?? null, inferenceCustomModelDemotion: this.store.getInferenceCustomModelDemotion() ?? null, inferenceRouterUsage: this.store.getInferenceRouterUsage(), ...(userTimeZone === undefined ? {} : { userTimeZone }), ...(userTimeZoneOverride === undefined ? {} : { userTimeZoneOverride }), ...(agentDefaultModel === undefined ? {} : { agentDefaultModel }), ...(computerUseModel === undefined ? {} : { computerUseModel }), ...(pinnedAgentIds === undefined ? {} : { pinnedAgentIds }), sidebarSections: sidebarSections ?? [], ...(hasSeenOnboarding === undefined ? {} : { hasSeenOnboarding }) };
   }
   setHostSettings(update: HostSettingsUpdate) {
     const previousUserTimeZone = this.store.getUserTimeZone(); this.store.setNotificationConfig(update.notifications ?? {});
@@ -51,7 +57,16 @@ export class SettingsService {
     if (isSandInferenceProvider(update.inferenceProvider)) this.store.setInferenceProvider(update.inferenceProvider);
     if (update.inferenceCustomEndpoint !== undefined) {
       if (update.inferenceCustomEndpoint === null) this.store.setInferenceCustomEndpoint(undefined);
-      else { const customEndpoint = normalizeSandInferenceCustomEndpoint(update.inferenceCustomEndpoint); if (customEndpoint !== undefined) this.store.setInferenceCustomEndpoint(customEndpoint); }
+      else this.store.setInferenceCustomEndpoint(update.inferenceCustomEndpoint as SandInferenceWriteEndpoint);
+    }
+    // The demotion is written by a failed turn, not by a UI, so this is the one path that lets a
+    // human put the primary model back without editing the settings file by hand.
+    if (update.inferenceCustomModelDemotion !== undefined) {
+      if (update.inferenceCustomModelDemotion === null) this.store.setInferenceCustomModelDemotion(undefined);
+      else {
+        const demotion = normalizeSandInferenceCustomModelDemotion(update.inferenceCustomModelDemotion);
+        if (demotion !== undefined) this.store.setInferenceCustomModelDemotion(demotion);
+      }
     }
     if (update.featureFlagOverrides !== undefined) for (const listener of [...this.featureFlagOverrideListeners]) listener(update.featureFlagOverrides);
     if (update.computerUseModel === null) this.store.setComputerUseModel(undefined); else if (isSandAgentModelSelection(update.computerUseModel)) this.store.setComputerUseModel(update.computerUseModel);
@@ -68,7 +83,11 @@ export class SettingsService {
   setLocalToolPermission(value: SandLocalToolPermission): void { this.store.setLocalToolPermission(value); }
   getInferenceProvider(): SandInferenceProvider { return this.store.getInferenceProvider(); }
   getInferenceCustomEndpoint(): SandInferenceCustomEndpoint | undefined { return this.store.getInferenceCustomEndpoint(); }
-  setInferenceCustomEndpoint(value: SandInferenceCustomEndpoint | undefined): void { this.store.setInferenceCustomEndpoint(value); }
+  setInferenceCustomEndpoint(value: SandInferenceWriteEndpoint | undefined): void { this.store.setInferenceCustomEndpoint(value); }
+  /** The demotion in force, or `null`. This is what lets a reader say the app is on the spare. */
+  getInferenceCustomModelDemotion(): unknown { return this.store.getInferenceCustomModelDemotion() ?? null; }
+  /** Clears the demotion, so the next turn asks for the model the endpoint names again. */
+  clearInferenceCustomModelDemotion(): void { this.store.setInferenceCustomModelDemotion(undefined); }
   getInferenceRouterUsage() { return this.store.getInferenceRouterUsage(); }
   recordInferenceUsage(provider: SandInferenceProvider, usage: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number }): void { this.store.recordInferenceUsage(provider, usage); }
   getWebauthnProxyEnabled(): boolean { return this.store.getWebauthnProxyEnabled(); }

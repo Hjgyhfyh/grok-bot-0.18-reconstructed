@@ -9,7 +9,7 @@ import { DEFAULT_SAND_AUTO_REVIEW_INSTRUCTIONS, normalizeSandAutoReviewInstructi
 import { SidebarSections, type SidebarSection } from "../../sidebar-sections.js";
 import { coerceToEnabledTrack, isSandUpdateTrack, type SandUpdateTrack } from "../../update-track.js";
 import { isSandAgentModelSelection, type SandAgentModelSelection } from "../../agents/sand-agent-model.js";
-import { emptySandInferenceRouterUsage, isSandInferenceProvider, normalizeSandInferenceCustomEndpoint, resolveServedInferenceProvider, type SandInferenceCustomEndpoint, type SandInferenceProvider, type SandInferenceRouterUsage } from "../../inference-router.js";
+import { activeCustomModelDemotion, emptySandInferenceRouterUsage, isSandInferenceProvider, normalizeSandInferenceCustomEndpoint, normalizeSandInferenceCustomModelDemotion, normalizeSandInferenceWriteEndpoint, resolveServedInferenceProvider, sandInferenceFallbackModelId, type SandInferenceCustomEndpoint, type SandInferenceCustomModelDemotion, type SandInferenceProvider, type SandInferenceRouterUsage, type SandInferenceWriteEndpoint } from "../../inference-router.js";
 import { DEFAULT_SAND_BOX_RUNTIME, isSandBoxRuntime, type SandBoxRuntime } from "../../box-runtime.js";
 
 export const SETTINGS_VERSION = 1;
@@ -29,6 +29,13 @@ export interface SandStoredSettings {
   userTimeZone?: string; userTimeZoneOverride?: string; autoReviewInstructions?: SandAutoReviewInstructions;
   localToolPermission?: SandLocalToolPermission; localToolPermissionCeiling?: SandLocalToolPermission;
   inferenceProvider?: SandInferenceProvider; inferenceRouterUsage?: SandInferenceRouterUsage; inferenceCustomEndpoint?: SandInferenceCustomEndpoint;
+  /**
+   * The sticky demotion of the custom endpoint onto its spare model. A separate top-level key, and
+   * not a field of `inferenceCustomEndpoint`, on purpose: the desktop rewrites the endpoint object
+   * wholesale on every Router save and on every coordinator resync, so a demotion stored inside it
+   * would be erased by an ordinary settings write and the broken model would come back.
+   */
+  inferenceCustomModelDemotion?: SandInferenceCustomModelDemotion;
   boxRuntime?: SandBoxRuntime;
   mcpCustomInstructionsAccountScope?: string; pinnedAgentIds?: string[]; sidebarSections?: SidebarSection[];
 }
@@ -73,6 +80,7 @@ function parseSettings(value: unknown): SandStoredSettings | null {
   if (isSandLocalToolPermission(raw.localToolPermissionCeiling)) result.localToolPermissionCeiling = raw.localToolPermissionCeiling;
   if (isSandInferenceProvider(raw.inferenceProvider)) result.inferenceProvider = raw.inferenceProvider;
   const customEndpoint = normalizeSandInferenceCustomEndpoint(raw.inferenceCustomEndpoint); if (customEndpoint !== undefined) result.inferenceCustomEndpoint = customEndpoint;
+  const demotion = normalizeSandInferenceCustomModelDemotion(raw.inferenceCustomModelDemotion); if (demotion !== undefined) result.inferenceCustomModelDemotion = demotion;
   if (isSandBoxRuntime(raw.boxRuntime)) result.boxRuntime = raw.boxRuntime;
   if (typeof raw.inferenceRouterUsage === "object" && raw.inferenceRouterUsage != null && !Array.isArray(raw.inferenceRouterUsage)) {
     const usage = emptySandInferenceRouterUsage();
@@ -106,6 +114,7 @@ const SAND_MANAGED_SETTINGS_KEYS: ReadonlySet<string> = new Set([
   "updateTrackOverride", "themePreference", "agentDefaultModel", "computerUseModel", "notifications",
   "userTimeZone", "userTimeZoneOverride", "autoReviewInstructions", "localToolPermission",
   "localToolPermissionCeiling", "inferenceProvider", "inferenceRouterUsage", "inferenceCustomEndpoint",
+  "inferenceCustomModelDemotion",
   "boxRuntime", "mcpCustomInstructionsAccountScope", "pinnedAgentIds", "sidebarSections"
 ]);
 
@@ -249,7 +258,80 @@ export class SandSettingsStore {
   // never agreed to, so a refused value is not written in the first place.
   setInferenceProvider(value: SandInferenceProvider): void { const served = resolveServedInferenceProvider(value); this.update((s) => ({ ...s, inferenceProvider: served })); }
   getInferenceCustomEndpoint(): SandInferenceCustomEndpoint | undefined { return this.load().inferenceCustomEndpoint; }
-  setInferenceCustomEndpoint(value: SandInferenceCustomEndpoint | undefined): void { this.update((s) => { const { inferenceCustomEndpoint: _old, ...rest } = s; const endpoint = normalizeSandInferenceCustomEndpoint(value); return endpoint === undefined ? rest : { ...rest, inferenceCustomEndpoint: endpoint }; }); }
+  // The endpoint and the demotion are written by different paths — the Router panel writes the
+  // endpoint, a failed turn writes the demotion — so this is the one write that could erase a
+  // demotion by accident.
+  //
+  // The rule, stated once because three defects lived in the space between its cases:
+  //
+  //   * NO `fallbackModelId` key in the offered endpoint  => leave the stored spare ALONE. This is
+  //     the shape the Router panel actually sends (`{ baseUrl, modelId }`,
+  //     `scripts/lib/router-renderer-patch.mjs`), so an ordinary Save must not be read as "delete
+  //     my spare". Reading it that way is measured: the demotion stayed in the file but stopped
+  //     matching the endpoint, `getInferenceCustomModelDemotion()` answered `undefined`, and
+  //     `resolveEffectiveCustomModelId` returned `space-bunny` again on the very next turn.
+  //   * `fallbackModelId: null`                            => the ONE explicit way to clear it.
+  //   * a usable `fallbackModelId` (a non-empty token this build can put on the wire) => that
+  //     spare, trimmed.
+  //   * anything else (`""`, `"   "`, `42`, an object, a token with a space in it) => read as
+  //     "this endpoint has no spare". It is NOT an instruction to clear a working one, and it is
+  //     NOT a reason to refuse the whole endpoint: refusing it killed the primary route and told
+  //     the user their base URL and model were wrong when both were fine.
+  //
+  // A spare that reaches the store is taken to belong to a route with the primary it was saved
+  // with, so it is carried only while the endpoint's own identity (base URL and primary model)
+  // survives the write. A record that demoted off the old primary, or onto a spare that is no
+  // longer the endpoint's spare, is dropped rather than left in the file to reappear later: a
+  // record that stops matching is exactly what `activeCustomModelDemotion` refuses to route with.
+  setInferenceCustomEndpoint(value: SandInferenceWriteEndpoint | undefined): void {
+    this.update((s) => {
+      const { inferenceCustomEndpoint: previous, inferenceCustomModelDemotion: _demotion, ...rest } = s;
+      if (value === undefined) return rest;
+      const offered = normalizeSandInferenceWriteEndpoint(value);
+      if (offered === undefined) return rest;
+      const sameRoute = previous !== undefined &&
+        previous.modelId.trim() === offered.modelId &&
+        previous.baseUrl.trim() === offered.baseUrl;
+      const fallbackModelId = offered.fallbackModelId === undefined
+        ? (sameRoute ? sandInferenceFallbackModelId(previous.fallbackModelId) : undefined)
+        : offered.fallbackModelId ?? undefined;
+      const endpoint: SandInferenceCustomEndpoint = {
+        baseUrl: offered.baseUrl,
+        modelId: offered.modelId,
+        ...(fallbackModelId === undefined ? {} : { fallbackModelId })
+      };
+      const stored = normalizeSandInferenceCustomModelDemotion(s.inferenceCustomModelDemotion);
+      const demotionSurvives = stored !== undefined && previous !== undefined && sameRoute &&
+        stored.fromModelId === endpoint.modelId &&
+        stored.toModelId === fallbackModelId;
+      return {
+        ...rest,
+        inferenceCustomEndpoint: endpoint,
+        ...(demotionSurvives ? { inferenceCustomModelDemotion: stored } : {})
+      };
+    });
+  }
+  /**
+   * The demotion in force, or `undefined`.
+   *
+   * Returns nothing when the endpoint is gone, has no spare, or no longer names the primary the
+   * record demoted off — the same conditions `activeCustomModelDemotion` uses, applied here so a
+   * stale record is invisible to every reader rather than re-derived by each of them.
+   */
+  getInferenceCustomModelDemotion(): SandInferenceCustomModelDemotion | undefined {
+    const stored = this.load();
+    const endpoint = stored.inferenceCustomEndpoint;
+    if (endpoint === undefined || stored.inferenceCustomModelDemotion === undefined) return undefined;
+    return activeCustomModelDemotion(endpoint, stored.inferenceCustomModelDemotion);
+  }
+  /** Stores a demotion, or clears it when given `undefined`. Junk is refused rather than written. */
+  setInferenceCustomModelDemotion(value: SandInferenceCustomModelDemotion | undefined): void {
+    this.update((s) => {
+      const { inferenceCustomModelDemotion: _old, ...rest } = s;
+      const demotion = normalizeSandInferenceCustomModelDemotion(value);
+      return demotion === undefined ? rest : { ...rest, inferenceCustomModelDemotion: demotion };
+    });
+  }
   getInferenceRouterUsage(): SandInferenceRouterUsage { return this.load().inferenceRouterUsage ?? emptySandInferenceRouterUsage(); }
   recordInferenceUsage(provider: SandInferenceProvider, usage: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number }): void {
     const safe = (value: number | undefined): number => Number.isFinite(value) && value! >= 0 ? Math.round(value!) : 0;

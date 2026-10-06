@@ -6,6 +6,12 @@ import {
   isProviderCapacityError,
   isTransientStreamError,
 } from "../../runner/transient-stream-error.js";
+import {
+  providerRefusalFallbackDetail,
+  providerRefusalFallbackTitle,
+  providerRefusalOf,
+  providerRefusalSentence,
+} from "./provider-refusal-reason.js";
 
 export const PROVIDER_OVERLOAD_ERROR_TITLE = "Model provider is overloaded";
 export const PROVIDER_OVERLOAD_ERROR_DETAIL =
@@ -340,6 +346,13 @@ export function mapErrorDetailButtons(
 // HTTP status, a `Retry-After` count and a machine kind — exactly the way
 // `describeProviderTurnFailure` composes the transcript notice. `rawDetail` is backend
 // authored too, so it goes through the same refusal test before it leaves.
+//
+// One exception, added later and deliberately narrow: a 400 or a 422 reads its own sentence
+// out of the provider body through `provider-refusal-reason.ts`. That module exists because
+// "nothing that came off the wire is ever read" was true and was the defect: the provider had
+// said `Model space-bunny-free is not supported` and the user was told to shorten a 0.2 MB
+// conversation. It is not a copy-out — it quotes at most a validated identifier, so the leak
+// this comment describes cannot happen through it either. The tables below are unchanged.
 // ---------------------------------------------------------------------------
 
 const MAX_BACKEND_TEXT_LENGTH = 400;
@@ -535,10 +548,20 @@ function runErrorSentenceOf(
           : `The model provider is rate limiting this key (HTTP 429) and asked to wait about ${waitSeconds}s. Sending the message again after that usually works.`,
     };
   }
-  if (status === 400 || status === 422)
+  if (status === 400 || status === 422) {
+    // The provider named a cause in its own body — a model it does not have, a key it
+    // refused, a context it counted and refused, a content rule it matched. Reading it is
+    // safe: `provider-refusal-reason.ts` never echoes provider prose, it quotes at most a
+    // validated model id. Sending the user "a shorter conversation usually helps" when the
+    // provider said the model does not exist was measured wrong advice on a real box.
+    const refusal = providerRefusalOf(error);
     return {
-      detail: `The model provider refused the request (HTTP ${status}). A shorter conversation or a different model usually helps.`,
+      detail:
+        refusal == null
+          ? `${providerRefusalFallbackTitle(status)} ${providerRefusalFallbackDetail()}`
+          : providerRefusalSentence(refusal),
     };
+  }
   if (status !== undefined && status >= 500)
     return {
       detail: `The model provider failed with a server error (HTTP ${status}). The fault is on the provider side; sending the message again usually works.`,

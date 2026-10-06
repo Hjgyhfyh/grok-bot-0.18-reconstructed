@@ -1,9 +1,14 @@
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { isMessageAddress } from "../../../shared/message-reference.js";
 import { sandDualSurfaceToolTelemetry } from "../../../shared/agents/agent-tool-names.js";
 import { SAND_REACTION_AGENT } from "../../../shared/transcript.js";
 import { UNKNOWN_CONNECTOR_TAG } from "../../../shared/observability/connector-auth-telemetry.js";
 import { sandErrorDetail } from "../../ports/telemetry.js";
+import type { SandInferenceCustomModelDemotion } from "../../../shared/inference-router.js";
+import { SandSettingsStore } from "../../../shared/node/settings/sand-settings-store.js";
+import { getSandRootDir } from "../../host-paths.js";
+import { applyCustomModelDemotionForFailure } from "../inference/custom-model-demotion.js";
 import {
   isContextOverflowDeadEnd,
   isConversationTooLargeRefusal,
@@ -32,6 +37,14 @@ import {
   TURN_CANCELLED_ERROR_TITLE,
   USER_CANCELLED_ERROR_KIND,
 } from "./agent-run-error.js";
+import {
+  providerFailureHttpStatus,
+  providerRefusalFallbackDetail,
+  providerRefusalFallbackTitle,
+  providerRefusalDetail,
+  providerRefusalOf,
+  providerRefusalTitle,
+} from "./provider-refusal-reason.js";
 import { ErrorDetails } from "../../../packages/proto/generated/aiserver/v1/utils_pb.js";
 import {
   createSendMessageEntry,
@@ -252,7 +265,36 @@ export function classifyAgentError(error: unknown): Record<string, unknown> {
 // whose arguments can hold the credential, so anything copied out of the error
 // object is a leak waiting to happen. Selecting a sentence by shape cannot leak,
 // because nothing that came off the wire is ever read.
+//
+// One exception, added later and deliberately narrow: a 400 or a 422 reads its cause
+// out of the provider body through `provider-refusal-reason.ts`, which quotes at most a
+// validated identifier and never echoes provider prose. Refusing to read the body was
+// the defect: the provider said `Model space-bunny-free is not supported` and the notice
+// in this chat told the user a shorter conversation would help.
 // ---------------------------------------------------------------------------
+
+/**
+ * The sentence the transcript notice carries when the route is on the spare.
+ *
+ * Written from the record's own closed fields, never from the provider's message: the same reason
+ * `provider-refusal-reason.ts` refuses to quote provider prose. It names the model, says why, and
+ * says how a human gets back — the demotion is sticky until someone changes it, and a user who is
+ * not told that will not know the model they typed stopped being used.
+ *
+ * This is the ONE copy. There used to be a second, byte-identical copy in
+ * `custom-model-demotion.ts` that nothing in production read: the failing turn below calls this one,
+ * while the test asserted against the other. A sentence that no reader and no writer share is a test
+ * that passes about a string the app never renders, so the dead copy was deleted rather than kept.
+ *
+ * It is also attached only to the failure that RECORDED the demotion. Attaching it to every later
+ * failure — including a 500, a 429 and a connection reset, none of which change the route — told the
+ * user their route had just moved when it had not.
+ */
+export function customModelDemotionSentence(
+  demotion: SandInferenceCustomModelDemotion,
+): string {
+  return `The model "${demotion.fromModelId}" is retired for this endpoint: every later turn will use the spare model "${demotion.toModelId}" until you change the model or the spare in Settings → Router.`;
+}
 
 export const PROVIDER_FAILURE_NOTICE = "provider_failure";
 export const EMPTY_DELIVERY_NOTICE = "empty_delivery";
@@ -299,17 +341,13 @@ function walkFailureNodes(
 /**
  * The HTTP status an OpenAI-compatible provider answered with. `APICallError` keeps
  * it on `statusCode`; a couple of transports spell it `status`.
+ *
+ * The traversal lives in `provider-refusal-reason.ts` because the demotion trigger needs the same
+ * answer to decide whether a failure is a request-level refusal at all, and a second copy of the walk
+ * would drift. This name stays as the turn path's entry point to it.
  */
 export function providerHttpStatusOf(error: unknown): number | undefined {
-  let status: number | undefined;
-  walkFailureNodes(error, (node) => {
-    if (status !== undefined) return;
-    const raw = node.statusCode ?? node.status;
-    const value = typeof raw === "number" ? raw : Number(raw);
-    if (Number.isInteger(value) && value >= 100 && value <= 599)
-      status = value;
-  });
-  return status;
+  return providerFailureHttpStatus(error);
 }
 
 /**
@@ -442,9 +480,12 @@ export function describeProviderTurnFailure(
         ? "Too many requests reached the provider. Sending the message again after a short wait usually works."
         : `Too many requests reached the provider, which asked to wait about ${waitSeconds}s. Sending the message again after that usually works.`;
   } else if (status === 400 || status === 422) {
-    title = `The model provider refused the request (HTTP ${status}).`;
-    detail =
-      "The provider rejected the request itself. A shorter conversation or a different model usually helps.";
+    // The same body the tray reads, through the same module, so the notice in the chat and
+    // the tray cannot disagree about why the turn died. A 400 whose body named a cause gets
+    // that cause; a 400 whose body named nothing says so instead of guessing.
+    const refusal = providerRefusalOf(error);
+    title = refusal == null ? providerRefusalFallbackTitle(status) : providerRefusalTitle(refusal);
+    detail = refusal == null ? providerRefusalFallbackDetail() : providerRefusalDetail(refusal);
   } else if (status !== undefined && status >= 500) {
     title = `The model provider failed with a server error (HTTP ${status}).`;
     detail =
@@ -826,10 +867,29 @@ export class TurnRuntime {
         // The tray is a global notification that the next message pushes off screen; the
         // agent's own history is where the user comes looking for why this turn said
         // nothing. Written before the tray so a tray failure cannot lose the reason.
+        //
+        // The demotion is recorded and announced here, not inside `describeProviderTurnFailure`,
+        // because that function is a pure description of a failure and this is the one place a
+        // turn's error actually lands. A refusal that proves the custom endpoint's primary model is
+        // wrong retires that model for every later turn; anything else — a rate limit, a 500, a
+        // dropped socket, a stall, a context overflow — leaves the route exactly as the user set it.
+        //
+        // The sentence names the spare only when THIS failure is the one that moved the route
+        // (`demotion.recorded`). `demotion.demotion` is also set when an earlier turn demoted and
+        // this one merely failed on top of it, and a 500 or an `ECONNRESET` appended to a live
+        // demotion used to read as though that failure had changed the model. The route was right
+        // in that case; only the wording lied.
+        const demotion = await applyCustomModelDemotionForFailure(
+          new SandSettingsStore(join(getSandRootDir(), "settings.json")),
+          error,
+        );
         const notice = describeProviderTurnFailure(error);
         if (notice != null)
           this.recordTurnNotice(session, {
             ...notice,
+            ...(demotion.recorded && demotion.demotion !== undefined
+              ? { text: `${notice.text} ${customModelDemotionSentence(demotion.demotion)}` }
+              : {}),
             noticeKind: PROVIDER_FAILURE_NOTICE,
           });
         if (epoch === this.tm.sendPipeline.currentTurnEpoch(session)) {

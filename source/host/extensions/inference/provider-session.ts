@@ -9,7 +9,7 @@ import { jsonSchema, streamText, tool, type CoreMessage, type LanguageModelV1, t
 import { BasePromptBuilder, BasePromptExecutor } from "../../../packages/chat-inference/base.js";
 import { conversationIdKey } from "../../../packages/chat-inference-proto/client.js";
 import type { Context } from "../../../packages/context/core.js";
-import { isSandInferenceCustomEndpoint, type SandInferenceCustomEndpoint, type SandInferenceProvider } from "../../../shared/inference-router.js";
+import { isSandInferenceCustomEndpoint, resolveEffectiveCustomModelId, type SandInferenceCustomEndpoint, type SandInferenceProvider } from "../../../shared/inference-router.js";
 import { resolveClaudeCodeCliPath } from "../../../shared/node/inference-router-local.js";
 import { getSandRootDir } from "../../host-paths.js";
 import { SandSettingsStore } from "../../../shared/node/settings/sand-settings-store.js";
@@ -119,6 +119,25 @@ function customEndpoint(): SandInferenceCustomEndpoint {
   const stored: unknown = new SandSettingsStore(join(getSandRootDir(), "settings.json")).getInferenceCustomEndpoint();
   if (!isSandInferenceCustomEndpoint(stored)) throw new Error("The custom endpoint is not configured. Set its base URL and model in Settings → Router.");
   return stored;
+}
+
+function customSettingsStore(): SandSettingsStore {
+  return new SandSettingsStore(join(getSandRootDir(), "settings.json"));
+}
+
+/**
+ * The model one custom turn must use, spare included.
+ *
+ * The single answer to "which model", and the only place the stored demotion is read on the turn
+ * path. `ProviderPromptExecutor` resolves it once and both `getModelId()` and the `.chat(...)` call
+ * read that one resolution, so the model the prompt session reports and the model in the POST body
+ * cannot disagree.
+ */
+function customEffectiveModelId(): string {
+  const store = customSettingsStore();
+  const stored: unknown = store.getInferenceCustomEndpoint();
+  if (!isSandInferenceCustomEndpoint(stored)) throw new Error("The custom endpoint is not configured. Set its base URL and model in Settings → Router.");
+  return resolveEffectiveCustomModelId(stored, store.getInferenceCustomModelDemotion());
 }
 
 // OpenCode Go refuses every request that arrives without a session identity —
@@ -507,8 +526,12 @@ function openRouterExecutor(messages: readonly ProviderMessage[], invocationId: 
   return { fullStream: redactRoutedCredentialStream(result.fullStream, credential), response: result.response, usage: result.usage, extendedUsage, providerMetadata: result.providerMetadata, invocationId: Promise.resolve(invocationId) };
 }
 
-function customExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void, sessionId?: string, ctx?: unknown, options?: RoutedStreamCallOptions) {
+function customExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void, sessionId?: string, ctx?: unknown, options?: RoutedStreamCallOptions, resolvedModelId?: string) {
   const endpoint = customEndpoint();
+  // The demoted model is resolved once and used twice: here, and by `createProviderPromptSession`
+  // for `getModelId()`. A caller that hands one in is the prompt session, which already resolved it;
+  // a caller that does not is `runRoutedProviderText`, and this read is its one answer.
+  const modelId = resolvedModelId ?? resolveEffectiveCustomModelId(endpoint, customSettingsStore().getInferenceCustomModelDemotion());
   const credential = customCredential();
   const model: LanguageModelV1 = createOpenAI({
     apiKey: credential,
@@ -525,29 +548,62 @@ function customExecutor(messages: readonly ProviderMessage[], invocationId: stri
     // is no `defaultHeaders` option in `@ai-sdk/openai` 1.3.24: that name belongs to the
     // unrelated `openai` v4 SDK, and nothing in this repo uses it.
     headers: customEndpointHeaders(endpoint.baseUrl, sessionId ?? processSessionId()),
-  }).chat(endpoint.modelId as any);
+  }).chat(modelId as any);
   const tools = toToolSet(definitions, executeTool);
   const result = streamText({ model, system: GROK_ROUTER_SYSTEM_PROMPT, messages: messages as CoreMessage[], ...(tools === undefined ? {} : { tools }), toolCallStreaming: true, maxSteps: tools === undefined ? 1 : 8, ...routedStreamTextParams(ctx, options) });
-  const extendedUsage = Promise.all([result.usage, result.steps]).then(([value, steps]) => ({ inputTokens: value.promptTokens, outputTokens: value.completionTokens, cacheReadTokens: cachedPromptTokens(steps), cacheWriteTokens: 0, maxTokens: resolveRoutedContextWindow(endpoint.modelId) }));
+  const extendedUsage = Promise.all([result.usage, result.steps]).then(([value, steps]) => ({ inputTokens: value.promptTokens, outputTokens: value.completionTokens, cacheReadTokens: cachedPromptTokens(steps), cacheWriteTokens: 0, maxTokens: resolveRoutedContextWindow(modelId) }));
   if (onUsage != null) void extendedUsage.then(onUsage);
   return { fullStream: redactRoutedCredentialStream(result.fullStream, credential), response: result.response, usage: result.usage, extendedUsage, providerMetadata: result.providerMetadata, invocationId: Promise.resolve(invocationId) };
 }
 
 class ProviderPromptExecutor extends BasePromptExecutor<ProviderMessage> {
-  constructor(readonly provider: RoutedProvider, initialMessages?: readonly ProviderMessage[], readonly onUsage?: (usage: UsageRecord) => void) { super(new BasePromptBuilder(initialMessages)); }
+  /**
+   * The model this executor will ask for. Resolved on first use and then held, so the model the
+   * prompt session reports and the model in the POST body are one string and cannot drift apart.
+   *
+   * Lazy rather than eager for the same reason the old code late-bound `getModelId()`: a session
+   * built for a route whose endpoint is missing threw when it was used, not when it was named, and
+   * this keeps that timing. Held rather than re-read on every call because two reads of a file that
+   * a failed turn can rewrite between them could name two different models inside one turn. A route
+   * with no demotion and no spare resolves to the endpoint's own `modelId`, unchanged.
+   */
+  private routedModelId?: string;
+  constructor(readonly provider: RoutedProvider, initialMessages?: readonly ProviderMessage[], readonly onUsage?: (usage: UsageRecord) => void) {
+    super(new BasePromptBuilder(initialMessages));
+  }
+  private resolveModelId(): string {
+    if (this.provider === "codex") return configuredCodexModel();
+    if (this.provider === "claude-code") return "claude-code";
+    if (this.provider === "custom") return customEffectiveModelId();
+    return process.env.SAND_OPENROUTER_MODEL?.trim() || "openai/gpt-5.2";
+  }
+  /** The one resolution. Both `getModelId()` and `stream()` read this and nothing else. */
+  getModelId(): string { return (this.routedModelId ??= this.resolveModelId()); }
+  /** Shares an already-made resolution, so a sibling executor over the same route cannot disagree. */
+  adoptModelId(modelId: string): void { this.routedModelId ??= modelId; }
   stream(ctx: unknown, invocationId = crypto.randomUUID(), definitions?: readonly Loose[], options?: RoutedStreamCallOptions) {
     if (this.provider === "codex") return codexExecutor(this.getMessages(), invocationId, definitions, undefined, this.onUsage);
     if (this.provider === "claude-code") return claudeExecutor(this.getMessages(), invocationId, this.onUsage);
     // Only the custom route asks for a session identity, and it takes the real conversation
     // id off the turn context so the header survives every turn of the same conversation.
-    if (this.provider === "custom") return customExecutor(this.getMessages(), invocationId, definitions, undefined, this.onUsage, contextConversationId(ctx), ctx, options);
+    if (this.provider === "custom") return customExecutor(this.getMessages(), invocationId, definitions, undefined, this.onUsage, contextConversationId(ctx), ctx, options, this.getModelId());
     return openRouterExecutor(this.getMessages(), invocationId, definitions, undefined, this.onUsage, ctx, options);
   }
 }
 
 export function createProviderPromptSession(provider: RoutedProvider): { getModelId(): string; getExecutor(state?: unknown): PromptExecutor } {
-  const modelId = provider === "codex" ? configuredCodexModel() : provider === "claude-code" ? "claude-code" : provider === "custom" ? customEndpoint().modelId : process.env.SAND_OPENROUTER_MODEL?.trim() || "openai/gpt-5.2";
-  return { getModelId: () => modelId, getExecutor: state => new ProviderPromptExecutor(provider, Array.isArray(state) ? state as ProviderMessage[] : undefined, usage => recordRoutedUsage(provider, usage)) };
+  // One instance, one resolution, one answer. `getExecutor` hands back an executor carrying the
+  // model this session already resolved, so the model the transcript names through `getModelId()`
+  // and the model in the POST body are the same string rather than two reads of the same file.
+  const session = new ProviderPromptExecutor(provider, undefined, usage => recordRoutedUsage(provider, usage));
+  return {
+    getModelId: () => session.getModelId(),
+    getExecutor: state => {
+      const executor = new ProviderPromptExecutor(provider, Array.isArray(state) ? state as ProviderMessage[] : undefined, usage => recordRoutedUsage(provider, usage));
+      executor.adoptModelId(session.getModelId());
+      return executor;
+    }
+  };
 }
 
 export async function runRoutedProviderText(provider: RoutedProvider, messages: readonly ProviderMessage[], options?: {
