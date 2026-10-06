@@ -34,7 +34,18 @@ export interface PluginLoadFailure { pluginDbId?: string | undefined; pluginId?:
 export function pluginAuthBlocksFromFailures(failures: readonly PluginLoadFailure[]): PluginAuthBlock[] { const blocks: PluginAuthBlock[] = [], seen = new Set<string>(); for (const failure of failures) { if (classifyCloneError(failure.errorMessage) !== "user_git_access") continue; const pluginId=failure.pluginDbId??failure.pluginId??"",key=pluginId||`name:${failure.pluginName}`;if(seen.has(key))continue;seen.add(key);blocks.push({pluginId,pluginName:failure.pluginName,...(failure.marketplaceName==null?{}:{marketplaceName:failure.marketplaceName})}) } return blocks; }
 export interface ListedCacheKey { marketplaceSlug:string;pluginId:string }
 export function pruneUninstalledPluginDirs(cacheRoot:string,listed:readonly ListedCacheKey[],indexedFilePaths:readonly string[]):void{const keep=new Set(listed.map((key)=>getPluginInstallCachePath(cacheRoot,key)));let slugs;try{slugs=readdirSync(cacheRoot,{withFileTypes:true})}catch{return}for(const slug of slugs){if(!slug.isDirectory())continue;const slugDir=join(cacheRoot,slug.name);let plugins;try{plugins=readdirSync(slugDir,{withFileTypes:true})}catch{continue}for(const plugin of plugins){if(!plugin.isDirectory())continue;const dir=join(slugDir,plugin.name);if(keep.has(dir)||indexedFilePaths.some((path)=>path.startsWith(`${dir}${sep}`)))continue;try{rmSync(dir,{recursive:true,force:true})}catch{}}}}
-export interface LoadedPlugins { plugins: readonly InstalledPlugin[]; authBlocked: PluginAuthBlock[]; listedPluginIds: string[]; listedCacheKeys: ListedCacheKey[]; publisherFacts: ReadonlyMap<string,PublisherFacts>; currentUserId: number|null }
+export interface LoadedPlugins { plugins: readonly InstalledPlugin[]; authBlocked: PluginAuthBlock[]; listedPluginIds: string[]; listedCacheKeys: ListedCacheKey[]; publisherFacts: ReadonlyMap<string,PublisherFacts>; currentUserId: number|null
+  /**
+   * True when the account listing could not be read at all, as opposed to reading
+   * it and finding nothing.
+   *
+   * WHAT CHANGED. `loadFromMarketplaceSource` swallows a failing
+   * `listEnabledPlugins` and returns `{plugins: [], failures: [], sourceUnavailable:
+   * true}` (`source/packages/cursor-plugins/loader.ts:113`). That flag used to stop
+   * here, so the caller saw the same empty `plugins` a signed-in account with
+   * nothing installed produces. It does not travel any further.
+   */
+  sourceUnavailable: boolean }
 export interface MarketplaceListEntry { pluginId: string; pluginDbId?: string | null; marketplace?: { name?: string | null } | null }
 export interface SharedInstalledPluginsLoaderDeps {
   sandRootDir: string;
@@ -72,17 +83,42 @@ export function createSharedInstalledPluginsLoader(deps: SharedInstalledPluginsL
     const result = await loadFromMarketplaceSource({ client, userId: "sand", cacheManager: new DefaultPluginCacheManager(undefined, { cacheRoot: join(pluginsRoot, "cache") }), pruneOldVersions: true, onPluginsListed: async (entries) => { for (const entry of entries) { if (entry.pluginDbId != null && entry.pluginDbId.length > 0) listedPluginIds.add(entry.pluginDbId); const slug = entry.marketplace?.name; if (slug != null && slug.length > 0) listedCacheKeys.push({ marketplaceSlug: slug, pluginId: entry.pluginId }); } } });
     for (const failure of result.failures) deps.log(`[sand:plugin-skills] plugin ${failure.pluginName} failed to load: ${failure.errorMessage}`);
     for (const plugin of result.plugins) { const pluginId = getPluginDbId(plugin.identifier); if (pluginId != null && pluginId.length > 0) listedPluginIds.add(pluginId); }
-    return { plugins: result.plugins, authBlocked: pluginAuthBlocksFromFailures(result.failures), listedPluginIds: [...listedPluginIds], listedCacheKeys, publisherFacts, currentUserId: currentUserIdForPass };
+    return { plugins: result.plugins, authBlocked: pluginAuthBlocksFromFailures(result.failures), listedPluginIds: [...listedPluginIds], listedCacheKeys, publisherFacts, currentUserId: currentUserIdForPass, sourceUnavailable: result.sourceUnavailable };
   };
 }
 export interface PluginSkillsServiceOptions { sandRootDir:string;load():Promise<LoadedPlugins>;log?(message:string):void;reportSync?(event:Record<string,unknown>):void;now?:()=>number;prune?:(cacheRoot:string,listed:readonly ListedCacheKey[],paths:readonly string[])=>void }
 export class SandPluginSkillsService {
-  private disposed=false;private inFlight:Promise<PluginSkillRecord[]>|null=null;private pending:{trigger:string;promise:Promise<PluginSkillRecord[]>}|null=null;
+  private disposed=false;private inFlight:Promise<PluginSkillRecord[]>|null=null;private pending:{trigger:string;promise:Promise<PluginSkillRecord[]>}|null=null;private unreachable=false;
   constructor(readonly options:PluginSkillsServiceOptions){}
   start():void{this.syncInBackground("startup")}handleAuthChange():void{this.syncInBackground("auth_change")}dispose():void{this.disposed=true}
   current():PluginSkillRecord[]{return this.currentIndex()?.skills??[]}currentIndex():PluginSkillsCache|null{return readPluginSkillsCache(getPluginSkillsDir(this.options.sandRootDir))}currentAuthBlocked():PluginAuthBlock[]{return this.currentIndex()?.authBlocked??[]}
+  /** True while the last pass could not read the account listing at all. */
+  sourceUnavailable():boolean{return this.unreachable}
   private syncInBackground(trigger:string):void{void this.sync(trigger).catch(()=>{})}
   async sync(trigger:string):Promise<PluginSkillRecord[]>{if(this.disposed)return this.current();if(this.inFlight==null)return this.startPass(trigger);if(this.pending==null){const running=this.inFlight,promise=(async()=>{try{await running}catch{}const next=this.pending?.trigger??trigger;this.pending=null;return this.disposed?this.current():this.startPass(next)})();this.pending={trigger,promise}}else this.pending.trigger=trigger;return this.pending.promise}
   private startPass(trigger:string):Promise<PluginSkillRecord[]>{const pass=this.runPass(trigger);this.inFlight=pass;const clear=()=>{if(this.inFlight===pass)this.inFlight=null};pass.then(clear,clear);return pass}
-  private async runPass(trigger:string):Promise<PluginSkillRecord[]>{const started=(this.options.now??Date.now)();try{const loaded=await this.options.load();if(this.disposed)return this.current();const previous=this.currentIndex();let records=pluginContentsToSkillRecords(loaded.plugins,loaded.publisherFacts),listed=new Set(loaded.listedPluginIds),loadedIds=new Set(loaded.plugins.flatMap((plugin)=>plugin.loadError!=null||!plugin.installPath?[]:(id=>id==null?[]:[id])(getPluginDbId(plugin.identifier))));records=[...records,...(previous?.skills??[]).filter((record)=>listed.has(record.pluginId)&&!loadedIds.has(record.pluginId))];writePluginSkillsCache(getPluginSkillsDir(this.options.sandRootDir),{currentUserId:loaded.currentUserId??previous?.currentUserId??null,skills:records,authBlocked:loaded.authBlocked});(this.options.prune??pruneUninstalledPluginDirs)(join(getPluginsRootDir(this.options.sandRootDir),"cache"),loaded.listedCacheKeys,records.map((record)=>record.filePath));this.options.reportSync?.({trigger,outcome:"ok",changed:previous==null?records.length>0:skillRecordsIdentity(previous.skills)!==skillRecordsIdentity(records),skillCount:records.length,durationMs:(this.options.now??Date.now)()-started});return records}catch(error){this.options.log?.(`[sand:plugin-skills] sync (${trigger}) failed: ${error instanceof Error?error.message:String(error)}`);this.options.reportSync?.({trigger,outcome:"failed",errorClass:error instanceof Error?error.name:typeof error,durationMs:(this.options.now??Date.now)()-started});throw error}}
+  /**
+   * One sync pass.
+   *
+   * WHAT CHANGED. A pass whose account listing could not be read at all now stops
+   * before it touches anything. It used to fall through with an empty `plugins`,
+   * which is indistinguishable from "you have nothing installed", and then rebuilt
+   * the index from that empty list — dropping every previously indexed skill,
+   * overwriting `plugin-skills/cache.json` with `skills: []`, and handing
+   * `pruneUninstalledPluginDirs` an empty `listed` so it `rmSync`ed every
+   * `<sandRoot>/plugins/cache/<marketplace>/<plugin>` directory. Telemetry got
+   * `outcome: "ok"` for all of it. The pass now throws, which reaches the existing
+   * failure branch: the log names the trigger, telemetry gets `outcome: "failed"`,
+   * and the caller of `syncPluginSkills` learns that nothing was synced.
+   *
+   * The written `currentUserId` no longer falls back to the previous pass's value
+   * either. `publisherFacts` beside it is rebuilt from this pass's listing, so the
+   * `?? previous?.currentUserId` produced a FRESH ownership table checked against a
+   * STALE identity, and
+   * `FileWorkflowStore.pluginSkillToWorkflow` turns that pair into
+   * `publishedByCurrentUser` — the flag that lets `update` rewrite a file inside a
+   * plugin's install directory, and that `resync`/`unpublish` gate on. A pass that
+   * cannot say who is signed in now writes no identity at all.
+   */
+  private async runPass(trigger:string):Promise<PluginSkillRecord[]>{const started=(this.options.now??Date.now)();try{const loaded=await this.options.load();if(this.unreachable=loaded.sourceUnavailable)throw new Error(`[sand:plugin-skills] could not read the installed-plugin listing for the ${trigger} sync, so the existing plugin skills and their installed files were left in place`);if(this.disposed)return this.current();const previous=this.currentIndex();let records=pluginContentsToSkillRecords(loaded.plugins,loaded.publisherFacts),listed=new Set(loaded.listedPluginIds),loadedIds=new Set(loaded.plugins.flatMap((plugin)=>plugin.loadError!=null||!plugin.installPath?[]:(id=>id==null?[]:[id])(getPluginDbId(plugin.identifier))));records=[...records,...(previous?.skills??[]).filter((record)=>listed.has(record.pluginId)&&!loadedIds.has(record.pluginId))];writePluginSkillsCache(getPluginSkillsDir(this.options.sandRootDir),{currentUserId:loaded.currentUserId??null,skills:records,authBlocked:loaded.authBlocked});(this.options.prune??pruneUninstalledPluginDirs)(join(getPluginsRootDir(this.options.sandRootDir),"cache"),loaded.listedCacheKeys,records.map((record)=>record.filePath));this.options.reportSync?.({trigger,outcome:"ok",changed:previous==null?records.length>0:skillRecordsIdentity(previous.skills)!==skillRecordsIdentity(records),skillCount:records.length,durationMs:(this.options.now??Date.now)()-started});return records}catch(error){this.options.log?.(`[sand:plugin-skills] sync (${trigger}) failed: ${error instanceof Error?error.message:String(error)}`);this.options.reportSync?.({trigger,outcome:"failed",errorClass:error instanceof Error?error.name:typeof error,durationMs:(this.options.now??Date.now)()-started});throw error}}
 }

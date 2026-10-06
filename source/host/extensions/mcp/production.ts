@@ -64,7 +64,11 @@ export function createMcpProductionExtras(
   const log = (message: string): void => context.host.log(message);
   const pluginPort = (service: McpPluginSkillsService): PluginSkillsPort => ({
     sync: async (trigger) => (await service.sync(trigger)).map(record => toPluginSkillInfo(record)),
-    status: () => ({ authBlocked: service.currentAuthBlocked() }),
+    // `authBlocked` alone answers "is a plugin blocked by git credentials?", which
+    // is `[]` for a signed-out build and for a build whose last listing failed.
+    // `sourceUnavailable` is what tells those two apart, so a caller reading this
+    // record never mistakes a dead backend for a healthy, empty one.
+    status: () => ({ authBlocked: service.currentAuthBlocked(), sourceUnavailable: service.sourceUnavailable() }),
     removeLiveReferences: (sourceUrls) => removeWorkflowLiveReferences(sandRootDir, sourceUrls)
   });
 

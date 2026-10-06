@@ -324,8 +324,12 @@ test("shutdown interrupts the runners instead of only cancelling the rewatch pol
     path.join(repoRoot, "source", "host", "extensions", "transcript", "transcript-manager.ts"),
     "utf8",
   );
-  const dispose = managerSource.slice(managerSource.indexOf("this.unwatchActiveSession()"));
-  assert.ok(dispose.length > 0, "the dispose block could not be located, so this guard is not looking at the code it claims to");
+  const disposeAnchor = managerSource.indexOf("this.unwatchActiveSession()");
+  // The index is checked before the slice, not after it: `slice(-1)` returns the
+  // LAST CHARACTER of the file, so a `length > 0` check on the slice passes even
+  // when the needle is gone and this guard is reading one character of nothing.
+  assert.notEqual(disposeAnchor, -1, "the dispose block could not be located, so this guard is not looking at the code it claims to");
+  const dispose = managerSource.slice(disposeAnchor);
 
   const clearRunners = dispose.indexOf("this.runnerRegistry.runners.clear()");
   const clearGroup = dispose.indexOf("this.runnerRegistry.activeGroupMemberRunners.clear()");

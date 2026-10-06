@@ -105,6 +105,32 @@ function Get-GatewayOwner {
         Select-Object -First 1 -ExpandProperty OwningProcess
 }
 
+# Is a box host alive right now, according to the lock it took?
+#
+# `Get-GatewayOwner` asks a different question - "is anything listening on
+# 8790" - and the two answers disagree in the window that matters: a host that
+# holds `host.lock` and has not bound its gateway yet. That window is real, not
+# theoretical. On this host the box exec-daemon answers its first Ping only
+# after it has spawned, and `host.start()` then brings up ~35 extensions before
+# the gateway listens; `box.log` shows several seconds between the two. Ask the
+# wrong question inside it and the answer is "not running" for a host that is
+# mid-startup and about to serve.
+#
+# The lock file is the authority, because `acquireHostLock` is what wrote it and
+# what reads it. The pid inside it is only believed when the process it names is
+# a live `host-main`: a recycled pid must not read as a running box.
+function Get-HostLockOwner {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $pid_ = $null
+    try { $pid_ = [int]([System.IO.File]::ReadAllText($Path)).Trim() } catch { return $null }
+    if (-not $pid_ -or $pid_ -le 0) { return $null }
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $pid_" -ErrorAction SilentlyContinue
+    if ($null -eq $proc) { return $null }
+    if (-not $proc.CommandLine -or $proc.CommandLine -notlike '*host-main*') { return $null }
+    return $pid_
+}
+
 # 32 bytes from the OS CSPRNG, base64url so the value survives an Authorization
 # header unchanged.
 function New-LocalBoxGatewayToken {
@@ -200,20 +226,27 @@ function Resolve-LocalBoxGatewayToken {
 }
 
 if (Test-Path -LiteralPath $hostCjs) {
+    # Two independent answers to "is a box already running", and the second one
+    # is the one that closes the single-instance hole: the port answers only
+    # once the host is serving, while the lock answers from the moment the host
+    # takes it. Either one means "do not start another".
     $existing = Get-GatewayOwner
+    $lockOwner = Get-HostLockOwner -Path (Join-Path $boxRoot 'host.lock')
+    if (-not $existing) { $existing = $lockOwner }
     # A token the running host already holds wins over a fresh one; otherwise a
     # second launch would leave the desktop with a credential nobody accepts.
     $gatewayToken = Resolve-LocalBoxGatewayToken -Root $boxRoot -PreferRunningGateway:([bool]$existing)
     if ($existing) {
         Write-Host "box        : already running (pid $existing)"
     } else {
-        # A stale lock from an unclean shutdown would make the next start fail.
-        Remove-Item (Join-Path $boxRoot 'host.lock') -Force -ErrorAction SilentlyContinue
-        # The host reads its secrets from the box store, not from the environment:
-        # process.env does not survive the hand-off into the agent worker. This
-        # file is therefore plaintext by necessity; the ACL below is the only
-        # thing between the decrypted API keys and the agent, which runs as this
-        # same user. See the header note.
+        # `host.lock` used to be deleted here, on the theory that "a stale lock
+        # from an unclean shutdown would make the next start fail". Measured, it
+        # does not: `acquireHostLock` reads the pid in that file and already
+        # reclaims it when the process is gone, when the file is unreadable and
+        # when the pid is some other program entirely. Deleting it removed the
+        # only evidence the lock carried, and in the window where a host has
+        # taken the lock but not yet bound 8790 that evidence was the difference
+        # between one host and two hosts serving the same data root.
         $boxSecretStore = Join-Path $boxRoot 'box-secrets.json'
         $boxSecrets = [ordered]@{ version = 1; secrets = [ordered]@{} }
         foreach ($name in $secrets.Keys) { $boxSecrets.secrets[$name] = $secrets[$name] }

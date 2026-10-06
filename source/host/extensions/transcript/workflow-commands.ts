@@ -14,6 +14,7 @@ import {
 import { WORKFLOW_REFERENCE_NODE_TYPE } from "../../../shared/workflows.js";
 import { AUTOMATION_WAKE_CUE } from "../../../shared/automations.js";
 import { formatTimestamp } from "../../../shared/automation-schedule.js";
+import { SandAgentNotFoundError } from "../session/agent-errors.js";
 import type { TranscriptManagerLike } from "./transcript-hub.js";
 
 function buildWorkflowRunPrompt(
@@ -61,6 +62,27 @@ export class WorkflowCommands {
   watchedWorkflows: any;
 
   constructor(readonly tm: TranscriptManagerLike) {}
+
+  /**
+   * Refuses a change to the routines of an agent that is not on disk.
+   *
+   * The same guard `AutomationRuntime` carries, for the same measurement: the
+   * routine commands never checked, and every one of them answered `200` with an
+   * empty or unchanged list for an id that names nothing. Measured on this
+   * machine over a real `SandAgentSessionStore`, each of `createAgentWorkflow`,
+   * `updateAgentWorkflow`, `setAgentWorkflowEnabled`, `removeAgentWorkflow` and
+   * `importAgentWorkflowMarkdown` returned normally for a deleted agent, so a
+   * stale routine edit reported itself as saved against an agent that is gone.
+   *
+   * The class is `SandAgentNotFoundError`, which `statusForCommandError` maps to
+   * `404` — the same answer the sidebar switches give for the same fact.
+   */
+  private requireAgentOnDisk(agentId: string, command: string): void {
+    if (!this.tm.sessionStore.agentDirExists(agentId))
+      throw new SandAgentNotFoundError(
+        `Agent ${agentId} no longer exists on disk.`,
+      );
+  }
 
   enqueueWorkflowMutation<T>(args: {
     agentId: string;
@@ -134,6 +156,7 @@ export class WorkflowCommands {
     agentId: string,
     spec: WorkflowSpec,
   ): Promise<WorkflowRecord[]> {
+    this.requireAgentOnDisk(agentId, "createAgentWorkflow");
     return this.enqueueWorkflowMutation({
       agentId,
       activeMutation: (active) => {
@@ -149,6 +172,7 @@ export class WorkflowCommands {
     workflowId: string,
     spec: WorkflowSpec,
   ): Promise<WorkflowRecord[]> {
+    this.requireAgentOnDisk(agentId, "updateAgentWorkflow");
     return this.enqueueWorkflowMutation({
       agentId,
       activeMutation: (active) => {
@@ -159,26 +183,36 @@ export class WorkflowCommands {
         this.tm.sessionStore.updateAgentWorkflow(agentId, workflowId, spec),
     });
   }
-  async setAgentWorkflowEnabled(
+  setAgentWorkflowEnabled(
     agentId: string,
     workflowId: string,
     isEnabled: boolean,
   ): Promise<WorkflowRecord[]> {
-    const active = this.tm.sessions.activeSession;
-    if (active?.id === agentId) {
-      active.workflows.setEnabledForAgent(workflowId, isEnabled);
-      return limitSurfacedWorkflows(active.workflows.listAll());
-    }
-    return this.tm.sessionStore.setAgentWorkflowEnabled(
+    this.requireAgentOnDisk(agentId, "setAgentWorkflowEnabled");
+    // This used to touch the store directly, so it was the only one of the four
+    // mutations that skipped the per-agent queue and the lifecycle record. A
+    // routine paused here changed nothing the scheduler or the audit trail could
+    // see: no `automation-changed` event, no `sand.automation.lifecycle` row,
+    // and no serialization against a create or with a run recording its own diff.
+    return this.enqueueWorkflowMutation({
       agentId,
-      workflowId,
-      isEnabled,
-    );
+      activeMutation: (active) => {
+        active.workflows.setEnabledForAgent(workflowId, isEnabled);
+        return limitSurfacedWorkflows(active.workflows.listAll());
+      },
+      inactiveMutation: () =>
+        this.tm.sessionStore.setAgentWorkflowEnabled(
+          agentId,
+          workflowId,
+          isEnabled,
+        ),
+    });
   }
   deleteAgentWorkflow(
     agentId: string,
     workflowId: string,
   ): Promise<WorkflowRecord[]> {
+    this.requireAgentOnDisk(agentId, "deleteAgentWorkflow");
     return this.enqueueWorkflowMutation({
       agentId,
       activeMutation: (active) => {
@@ -195,6 +229,7 @@ export class WorkflowCommands {
     markdown: string,
     fallbackName?: string,
   ): Promise<unknown> {
+    this.requireAgentOnDisk(agentId, "importAgentWorkflowMarkdown");
     const active = this.tm.sessions.activeSession;
     if (active?.id !== agentId)
       return this.tm.sessionStore.importAgentWorkflowMarkdown(
@@ -219,6 +254,7 @@ export class WorkflowCommands {
     source: string,
     fallbackName?: string,
   ): Promise<unknown> {
+    this.requireAgentOnDisk(agentId, "importAgentWorkflowSource");
     const active = this.tm.sessions.activeSession;
     if (active?.id !== agentId)
       return this.tm.sessionStore.importAgentWorkflowSource(
@@ -247,6 +283,7 @@ export class WorkflowCommands {
     );
   }
   async portAgentLocalSkills(agentId: string): Promise<unknown> {
+    this.requireAgentOnDisk(agentId, "portAgentLocalSkills");
     const active = this.tm.sessions.activeSession;
     if (active?.id !== agentId)
       return this.tm.sessionStore.portAgentLocalSkills(agentId);
@@ -260,6 +297,7 @@ export class WorkflowCommands {
     agentId: string,
     workflowId: string,
   ): Promise<void> {
+    this.requireAgentOnDisk(agentId, "runAgentWorkflowNow");
     const workflow = await this.getWorkflowForAgent(agentId, workflowId);
     if (workflow == null) return;
     const automation = workflowToAutomation(workflow);

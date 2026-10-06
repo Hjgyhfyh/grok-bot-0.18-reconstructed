@@ -389,8 +389,21 @@ export class AgentLifecycle {
     const summary = (await this.tm.sessionStore.listAgents()).find(
       (agent: any) => agent.id === sourceId,
     );
+    // The one agent command that used to answer this fact as a server fault.
+    // `updateAgent`, `deleteAgents` and both sidebar switches raise
+    // `SandAgentNotFoundError` for an id that is not on disk, and
+    // `statusForCommandError` turns exactly that class into `404`. Measured on a
+    // live box, `POST /api/duplicateAgent {"id":"<deleted>"}` answered
+    // `500 {"error":"That agent no longer exists."}` one command away from the
+    // `404` its siblings give for the same id in the same state — so a client
+    // holding a stale duplicate button retried a request that can never succeed
+    // and showed a failure banner for an agent that is simply gone. The group
+    // refusal below stays a plain lifecycle error: "this exists and cannot be
+    // copied" is a different fact from "this id names nothing".
     if (summary == null)
-      throw new SandAgentLifecycleError("That agent no longer exists.");
+      throw new SandAgentNotFoundError(
+        `Agent ${sourceId} no longer exists.`,
+      );
     if (summary.isGroup)
       throw new SandAgentLifecycleError("Groups can't be duplicated yet.");
     const opened = await this.tm.sessionStore.mintAgent(
@@ -692,6 +705,21 @@ export class AgentLifecycle {
         this.noteRemoved(id);
         deleted.push(id);
       } catch (error) {
+        // The mark `interruptAgentForDeletion` set is what `session-roster.ts`
+        // filters on, and this catch is the only place left where the agent is
+        // known to still be on disk. Nothing undid it here: `runDeleteAgents`
+        // collects the failure and carries on, so the `catch` in `deleteAgents`
+        // that exists to undo the mark never ran. Measured on a live box, after a
+        // delete that lost a race with an open file handle: `deleteAgents` answered
+        // `200` with the id in `failed` and a message telling the user to delete
+        // the folder by hand, `listAgents` no longer listed the agent, and
+        // `countAgents` — the walk the fifty-agent cap is computed from — still
+        // counted it. The user was told the agent was not deleted and then could
+        // not find it, could not delete it from the list, and still had it against
+        // the cap. The mark is dropped below the unlink on the success path for
+        // the same reason; a failure needs it dropped for the same reason.
+        if (this.tm.sessionStore.agentDirExists(id))
+          this.tm.sessions.deletedAgentIds.delete(id);
         failed.push({ agentId: id, error: errorLogTag(error), detail: errorMessage(error) });
         console.error(
           `[sand] delete of agent ${id} failed: ${errorLogTag(error)}: ${errorMessage(error)}`,
@@ -899,8 +927,17 @@ export class AgentLifecycle {
     isUnread: boolean,
     atMs?: number,
   ): Promise<void> {
-    const active = this.tm.sessions.activeSession;
-    if (active?.id === agentId) {
+    // The two switches below already refuse an id that is not on disk, and
+    // `updateAgent` refuses it too. These two did not, so a stale sidebar action
+    // reached the store, which cannot open a database that is not there, and the
+    // answer was `500` carrying the text of `ensureAgentDbDirectory` and the
+    // absolute path. Measured on a live box against a deleted id, one command
+    // apart: `setAgentHiddenFromSidebar` 404, `setAgentUnread` 500 with a
+    // sentence that tells the person reading it to call a function they cannot
+    // call. Nothing is written either way — the directory is not rebuilt — so the
+    // only thing that changed was which sentence arrived.
+    this.requireAgentOnDisk(agentId, "setAgentUnread");
+    const active = this.tm.sessions.activeSession;    if (active?.id === agentId) {
       if (isUnread) {
         await this.tm.sessionStore.seedSessionActivityFromDbMtime(active);
         active.db.markUnread(atMs);
@@ -953,6 +990,11 @@ export class AgentLifecycle {
     agentId: string,
     pngBytes: Uint8Array,
   ): Promise<unknown> {
+    // Same refusal as the two switches and the unread toggle, for the same
+    // reason: `setAgentAvatarBytesById` opens the store by id, so an id that is
+    // not on disk used to answer `500` with the store's own sentence and the
+    // absolute path instead of the `404` its siblings give.
+    this.requireAgentOnDisk(agentId, "setAgentAvatarBytes");
     const active = this.tm.sessions.activeSession,
       stamp = this.tm.roster.reserveSnapshotStamp();
     const summary =

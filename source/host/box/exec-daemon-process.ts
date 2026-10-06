@@ -4,6 +4,8 @@ import { createConnection } from "node:net";
 import path from "node:path";
 
 import { createContext } from "../../packages/context/core.js";
+import { findSystemErrno } from "../../shared/system-errno.js";
+import { queryPowerShellUtf8 } from "../../shared/node/powershell-utf8.js";
 import { pingBoxClassified } from "./box-remote-accessor.js";
 import type { ErasedProductionBoxGeneratedPorts } from "./production.js";
 import { DEFAULT_AUTH_TOKEN, EXEC_DAEMON_PORT } from "./loopback-sand-box.js";
@@ -73,6 +75,12 @@ export interface BoxExecDaemonPortReleaseOptions {
   readonly timeoutMs?: number;
   readonly pollMs?: number;
   readonly previousHostPid?: number | null;
+  /**
+   * Whether THIS start killed the host that owned the port. The log line says
+   * "evicted its predecessor" only when that is true; on a stale lock it said
+   * so anyway, naming a kill that never happened.
+   */
+  readonly evicted?: boolean;
   readonly isPortBound?: (host: string, port: number) => Promise<boolean>;
   readonly holderPidFor?: (host: string, port: number) => number | null;
   readonly delay?: (milliseconds: number) => Promise<void>;
@@ -95,6 +103,14 @@ export class BoxExecDaemonPortHeldError extends Error {
     readonly target: string,
     holderPid: number | null,
     previousHostPid: number | null = null,
+    /**
+     * Whether THIS start killed a live host to get here. It did not, when the
+     * lock outcome was `reclaimed-dead`: the pid in `host.lock` was already dead
+     * before the start, and the old message called that "evicted" anyway - so it
+     * named the live host as the culprit and compared the holder against a
+     * process this start never touched.
+     */
+    readonly evicted = true,
   ) {
     super(
       `refusing contaminated box exec-daemon startup: ${target} is already bound` +
@@ -103,9 +119,13 @@ export class BoxExecDaemonPortHeldError extends Error {
           : ` by pid ${holderPid}`) +
         (previousHostPid == null
           ? ""
-          : `, after this host evicted its predecessor pid ${previousHostPid}`) +
+          : evicted
+            ? `, after this host evicted its predecessor pid ${previousHostPid}`
+            : `, after this start found predecessor pid ${previousHostPid} already dead`) +
         (holderPid != null && previousHostPid != null && holderPid !== previousHostPid
-          ? "; the holder is NOT the host this start evicted, so it is a foreign listener and this host will not stop it"
+          ? evicted
+            ? "; the holder is NOT the host this start evicted, so it is a foreign listener and this host will not stop it"
+            : "; the holder is a listener this host cannot claim, so it is left running"
           : holderPid != null && previousHostPid != null
             ? "; the holder is the predecessor this start evicted, so its socket outlived the wait above"
             : ""),
@@ -136,6 +156,247 @@ export function resolveBoxExecDaemonPortReleaseBudget(
         : 0,
     previousHostPid: previousHost?.previousPid ?? null,
   };
+}
+
+export const BOX_EXEC_DAEMON_ORPHAN_STOP_TIMEOUT_MS = 5_000;
+export const BOX_EXEC_DAEMON_ORPHAN_STOP_POLL_MS = 50;
+
+export interface BoxExecDaemonProcessProbe {
+  readonly pid: number;
+  readonly command: string | null;
+  readonly parentPid: number | null;
+}
+
+export interface BoxExecDaemonPortAvailability {
+  readonly available: boolean;
+  readonly waitedMs: number;
+  readonly holderPid: number | null;
+  readonly previousHostPid: number | null;
+  /** True only when THIS start killed a live host and is waiting out its socket. */
+  readonly evicted: boolean;
+  readonly reclaimedPids: readonly number[];
+}
+
+export interface EnsureBoxExecDaemonPortAvailableOptions {
+  readonly host?: string;
+  readonly port?: number;
+  readonly entryPath: string;
+  readonly previousHost?: { readonly outcome?: string; readonly previousPid?: number } | undefined;
+  /** Overrides the pid named in the refusal, for callers that know better. */
+  readonly previousHostPid?: number | null;
+  readonly timeoutMs?: number;
+  readonly pollMs?: number;
+  readonly portReleaseTimeoutMs?: number;
+  readonly isPortBound?: (host: string, port: number) => Promise<boolean>;
+  readonly holderPidsFor?: (host: string, port: number) => number[];
+  readonly readCommand?: (pid: number) => string | null;
+  readonly readParentPid?: (pid: number) => number | null;
+  readonly isProcessAlive?: (pid: number) => boolean;
+  readonly terminate?: (pid: number) => void;
+  readonly delay?: (milliseconds: number) => Promise<void>;
+  readonly now?: () => number;
+  readonly log?: Pick<Console, "log" | "error">;
+}
+
+/**
+ * Splits a command line into arguments, honouring double quotes.
+ *
+ * `spawn` quotes an argument that contains a space, and this install path does
+ * contain spaces on every packaged build, so a plain `split(/\s+/)` would cut
+ * `C:\Program Files\...\main.cjs` in half and never recognise its own daemon.
+ */
+export function splitCommandArguments(command: string): string[] {
+  const args: string[] = [];
+  let current = "";
+  let quoted = false;
+  let started = false;
+  for (const character of command) {
+    if (character === "\"") { quoted = !quoted; started = true; continue; }
+    if (!quoted && /\s/.test(character)) {
+      if (started) args.push(current);
+      current = "";
+      started = false;
+      continue;
+    }
+    current += character;
+    started = true;
+  }
+  if (started) args.push(current);
+  return args;
+}
+
+function comparablePath(value: string): string {
+  const withoutNamespace = value.startsWith("\\\\?\\") ? value.slice(4) : value;
+  return withoutNamespace.replace(/\//g, "\\").toLowerCase();
+}
+
+/**
+ * Whether this process was started FROM this host's own exec-daemon entry.
+ *
+ * Both halves must be provable, because the reclaim that uses this stops a
+ * process: the argument has to be the exact entry this start resolved, not a
+ * substring of it. A path merely contained in some other command line is not
+ * evidence of anything.
+ */
+export function commandCarriesBoxExecDaemonEntry(command: string | null, entryPath: string): boolean {
+  if (command == null || entryPath == null || entryPath.length === 0) return false;
+  const wanted = comparablePath(entryPath);
+  return splitCommandArguments(command).some(argument => comparablePath(argument) === wanted);
+}
+
+function defaultIsProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function defaultTerminate(pid: number): void {
+  try { process.kill(pid, "SIGTERM"); } catch {}
+}
+
+/**
+ * The command line and the parent pid of one pid, in one query.
+ *
+ * Best effort, exactly like `readPortHolderPids`: a CIM provider that is wedged,
+ * missing or too slow answers "unknown", and unknown is never proof. A throw
+ * becomes a null, so a platform that cannot answer produces a refusal to
+ * reclaim rather than a reclaim on a guess.
+ */
+export function readProcessCommandAndParent(
+  pid: number,
+  platform: NodeJS.Platform = process.platform,
+): { readonly command: string | null; readonly parentPid: number | null } {
+  if (!Number.isInteger(pid) || pid <= 0) return { command: null, parentPid: null };
+  try {
+    if (platform === "win32") {
+      const output = queryPowerShellUtf8(`$p=Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if ($null -ne $p) { @{CommandLine=$p.CommandLine;ParentProcessId=$p.ParentProcessId}|ConvertTo-Json -Compress }`, { timeoutMs: 5_000 });
+      if (output.trim().length === 0) return { command: null, parentPid: null };
+      const parsed = JSON.parse(output) as { CommandLine?: unknown; ParentProcessId?: unknown };
+      const parentPid = Number(parsed.ParentProcessId);
+      return {
+        command: typeof parsed.CommandLine === "string" ? parsed.CommandLine : null,
+        parentPid: Number.isInteger(parentPid) && parentPid > 0 ? parentPid : 0,
+      };
+    }
+    const output = execFileSync("ps", ["-p", String(pid), "-o", "ppid=", "-o", "command="], { encoding: "utf8", timeout: 2_000, windowsHide: true });
+    const lines = output.split(/\r?\n/).map(line => line.trim()).filter(line => line.length > 0);
+    const first = lines[0];
+    if (first == null || first.length === 0) return { command: null, parentPid: null };
+    const [ppid, ...rest] = first.split(/\s+/);
+    const parentPid = Number.parseInt(ppid ?? "", 10);
+    return {
+      command: rest.join(" "),
+      parentPid: Number.isInteger(parentPid) && parentPid > 0 ? parentPid : 0,
+    };
+  } catch {
+    return { command: null, parentPid: null };
+  }
+}
+
+/**
+ * Decides whether one port holder may be stopped.
+ *
+ * Both halves are required, and neither alone is enough:
+ *
+ *  - the command line carries the exact entry this host starts, so the holder is
+ *    this app's own daemon and not a stranger that happens to hold 1337;
+ *  - the parent is gone, so nobody is left who can still stop it properly. A
+ *    daemon whose host is alive - a second box, or the host this start just
+ *    evicted and is waiting for - belongs to a running app and is left alone.
+ *
+ * "Cannot tell" answers no on both counts, so a missing CIM provider degrades to
+ * today's refusal instead of to a signal sent on a guess.
+ */
+export function isReclaimableBoxExecDaemonOrphan(
+  probe: BoxExecDaemonProcessProbe,
+  entryPath: string,
+  isProcessAlive: (pid: number) => boolean = defaultIsProcessAlive,
+): boolean {
+  if (!commandCarriesBoxExecDaemonEntry(probe.command, entryPath)) return false;
+  if (probe.parentPid === null) return false;
+  return !isProcessAlive(probe.parentPid);
+}
+
+/**
+ * Everything between "the lock is mine" and "the port is bound", in one place.
+ *
+ * The refusal that used to live inline in `startBoxExecDaemonProcess` is
+ * preserved exactly: a port that is still held after the wait, and that this
+ * host cannot prove it owns, is refused and named. What is new is that a holder
+ * this host CAN prove is its own orphaned daemon is stopped and waited for
+ * again, which is the difference between a host that comes back after an abrupt
+ * kill and a host that refuses the same message forever.
+ */
+export async function ensureBoxExecDaemonPortAvailable(
+  options: EnsureBoxExecDaemonPortAvailableOptions,
+): Promise<BoxExecDaemonPortAvailability> {
+  const host = options.host ?? "127.0.0.1";
+  const port = options.port ?? EXEC_DAEMON_PORT;
+  const budget = resolveBoxExecDaemonPortReleaseBudget(options.previousHost);
+  const timeoutMs = Math.max(0, options.timeoutMs ?? options.portReleaseTimeoutMs ?? budget.timeoutMs);
+  const pollMs = Math.max(1, options.pollMs ?? BOX_EXEC_DAEMON_PORT_RELEASE_POLL_MS);
+  const previousHostPid = options.previousHostPid ?? budget.previousHostPid;
+  const evicted = options.previousHost?.outcome === "took-over";
+  const isPortBound = options.isPortBound ?? isPortAcceptingConnections;
+  const holderPidsFor = options.holderPidsFor ?? ((target, targetPort) => readPortHolderPids(targetPort));
+  const sleep = options.delay ?? delay;
+  const now = options.now ?? (() => Date.now());
+  const isAlive = options.isProcessAlive ?? defaultIsProcessAlive;
+  const terminate = options.terminate ?? defaultTerminate;
+  const readProcess = (pid: number): BoxExecDaemonProcessProbe => {
+    if (options.readCommand !== undefined && options.readParentPid !== undefined) {
+      return { pid, command: options.readCommand(pid), parentPid: options.readParentPid(pid) };
+    }
+    const observed = readProcessCommandAndParent(pid);
+    return { pid, command: observed.command, parentPid: observed.parentPid };
+  };
+
+  const release = await waitForBoxExecDaemonPortRelease({
+    host,
+    port,
+    timeoutMs,
+    pollMs,
+    previousHostPid,
+    ...(options.log === undefined ? {} : { log: options.log }),
+    ...(options.isPortBound === undefined ? {} : { isPortBound: options.isPortBound }),
+    ...(options.holderPidsFor === undefined
+      ? {}
+      : { holderPidFor: () => holderPidsFor(host, port)[0] ?? null }),
+  });
+  if (release.released) {
+    return { available: true, waitedMs: release.waitedMs, holderPid: null, previousHostPid, evicted, reclaimedPids: [] };
+  }
+
+  const reclaimedPids: number[] = [];
+  for (const pid of holderPidsFor(host, port)) {
+    if (!isReclaimableBoxExecDaemonOrphan(readProcess(pid), options.entryPath, isAlive)) continue;
+    options.log?.log(`[box-exec-daemon] reclaiming orphaned exec-daemon pid ${pid} on ${host}:${port}: its host is gone and it is running this host's own entry`);
+    terminate(pid);
+    const deadline = now() + BOX_EXEC_DAEMON_ORPHAN_STOP_TIMEOUT_MS;
+    while (isAlive(pid) && now() < deadline) await sleep(BOX_EXEC_DAEMON_ORPHAN_STOP_POLL_MS);
+    if (isAlive(pid)) { options.log?.log(`[box-exec-daemon] orphaned exec-daemon pid ${pid} did not exit within ${BOX_EXEC_DAEMON_ORPHAN_STOP_TIMEOUT_MS}ms`); continue; }
+    reclaimedPids.push(pid);
+  }
+
+  if (reclaimedPids.length > 0) {
+    const after = await waitForBoxExecDaemonPortRelease({
+      host,
+      port,
+      timeoutMs: timeoutMs === 0 ? BOX_EXEC_DAEMON_ORPHAN_STOP_TIMEOUT_MS : timeoutMs,
+      pollMs,
+      previousHostPid,
+      ...(options.log === undefined ? {} : { log: options.log }),
+      ...(options.isPortBound === undefined ? {} : { isPortBound: options.isPortBound }),
+      ...(options.holderPidsFor === undefined
+        ? {}
+        : { holderPidFor: () => holderPidsFor(host, port)[0] ?? null }),
+    });
+    if (after.released) {
+      return { available: true, waitedMs: release.waitedMs + after.waitedMs, holderPid: null, previousHostPid, evicted, reclaimedPids };
+    }
+    return { available: false, waitedMs: release.waitedMs + after.waitedMs, holderPid: after.holderPid, previousHostPid, evicted, reclaimedPids };
+  }
+
+  return { available: false, waitedMs: release.waitedMs, holderPid: release.holderPid, previousHostPid, evicted, reclaimedPids };
 }
 
 export function resolveBoxExecDaemonEntry(hostEntry = process.argv[1]): string {
@@ -267,7 +528,7 @@ export async function waitForBoxExecDaemonPortRelease(
     if (!(await isPortBound(host, port))) {
       const waitedMs = now() - startedAt;
       options.log?.log(
-        `[box-exec-daemon] ${host}:${port} was still bound after this host evicted its predecessor` +
+        `[box-exec-daemon] ${host}:${port} was still bound after this start released its predecessor` +
           `${previousHostPid == null ? "" : ` pid ${previousHostPid}`}; it came free after ${waitedMs}ms`,
       );
       return { released: true, waitedMs, holderPid: null, previousHostPid };
@@ -294,19 +555,21 @@ export async function startBoxExecDaemonProcess(options: BoxExecDaemonProcessOpt
   const port = options.port ?? EXEC_DAEMON_PORT;
   const authToken = options.authToken ?? DEFAULT_AUTH_TOKEN;
   const log = options.log ?? console;
-  const budget = resolveBoxExecDaemonPortReleaseBudget(options.previousHost);
-  const release = await waitForBoxExecDaemonPortRelease({
+  const availability = await ensureBoxExecDaemonPortAvailable({
     host,
     port,
-    timeoutMs: options.portReleaseTimeoutMs ?? budget.timeoutMs,
-    previousHostPid: options.previousHostPid ?? budget.previousHostPid,
+    entryPath: options.entryPath,
+    previousHost: options.previousHost,
+    ...(options.portReleaseTimeoutMs === undefined ? {} : { portReleaseTimeoutMs: options.portReleaseTimeoutMs }),
+    ...(options.previousHostPid === undefined ? {} : { previousHostPid: options.previousHostPid }),
     log,
   });
-  if (!release.released) {
+  if (!availability.available) {
     throw new BoxExecDaemonPortHeldError(
       `${host}:${port}`,
-      release.holderPid,
-      release.previousHostPid,
+      availability.holderPid,
+      availability.previousHostPid,
+      availability.evicted,
     );
   }
   await access(options.entryPath);

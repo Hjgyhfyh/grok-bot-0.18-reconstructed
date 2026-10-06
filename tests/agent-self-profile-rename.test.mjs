@@ -434,9 +434,10 @@ test("the production call site binds the profile writer to updateAgent on this a
     path.join(repoRoot, "source", "host", "host-runner-composition.ts"),
     "utf8",
   );
-  const site = source.slice(source.indexOf('method(memory, "createAgentState")'));
-  assert.equal(site.length > 0, true,
+  const anchor = source.indexOf('method(memory, "createAgentState")');
+  assert.notEqual(anchor, -1,
     "the composer no longer mentions createAgentState, so this guard is looking at nothing");
+  const site = source.slice(anchor);
   const bindings = site.split("updateOwnProfile:").length - 1;
   assert.equal(bindings, 1,
     `expected the composer to bind updateOwnProfile exactly once, found ${bindings}`);

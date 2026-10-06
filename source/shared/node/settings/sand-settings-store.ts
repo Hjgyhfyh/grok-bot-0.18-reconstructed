@@ -3,7 +3,7 @@ import { dirname } from "node:path";
 
 import { DEFAULT_SAND_THEME_PREFERENCE, isSandThemePreference, type SandThemePreference } from "../../desktop.js";
 import { SAND_DISABLED_NOTIFICATION_CONFIG } from "../../host-settings.js";
-import { SAND_DEFAULT_LOCAL_TOOL_PERMISSION, isSandLocalToolPermission, resolveSandLocalToolPermission, type SandLocalToolPermission } from "../../local-tool-permission.js";
+import { SAND_DEFAULT_LOCAL_TOOL_PERMISSION, isSandLocalToolPermission, normalizeSandLocalToolPermission, resolveSandLocalToolPermission, type SandLocalToolPermission } from "../../local-tool-permission.js";
 import { clampMcpCustomInstruction, getDefaultMcpCustomInstruction } from "../../mcp-custom-instructions.js";
 import { DEFAULT_SAND_AUTO_REVIEW_INSTRUCTIONS, normalizeSandAutoReviewInstructions, type SandAutoReviewInstructions } from "../../sand-auto-review-instructions.js";
 import { SidebarSections, type SidebarSection } from "../../sidebar-sections.js";
@@ -93,12 +93,74 @@ function parseSettings(value: unknown): SandStoredSettings | null {
   return result;
 }
 
+/**
+ * Every top-level key this build writes. `SETTINGS_VERSION` is a single constant that no build
+ * bumps, so two builds can both own a `version: 1` file and each can hold a field the other has
+ * never heard of. Anything outside this set belongs to whichever build wrote it, and a write from
+ * this build must not decide that field no longer exists.
+ */
+const SAND_MANAGED_SETTINGS_KEYS: ReadonlySet<string> = new Set([
+  "version", "mcpBoxServers", "autoUpdateWhenIdleOptIn", "egressTunnelEnabled", "webauthnProxyEnabled",
+  "mcpCustomInstructions", "mcpCustomInstructionsByServerId", "mcpDisabledToolsByServerId",
+  "conciergeConsent", "settingsMigrations", "hasSeenOnboarding", "hasSeenOnboardingAccountScope",
+  "updateTrackOverride", "themePreference", "agentDefaultModel", "computerUseModel", "notifications",
+  "userTimeZone", "userTimeZoneOverride", "autoReviewInstructions", "localToolPermission",
+  "localToolPermissionCeiling", "inferenceProvider", "inferenceRouterUsage", "inferenceCustomEndpoint",
+  "boxRuntime", "mcpCustomInstructionsAccountScope", "pinnedAgentIds", "sidebarSections"
+]);
+
 export class SandSettingsStore {
   constructor(readonly settingsPath: string) {}
+  /** The file as bytes, or `undefined` when there is none to read. */
+  private readStoredText(): string | undefined { try { return readFileSync(this.settingsPath, "utf8"); } catch { return undefined; } }
+  /** The file parsed as the plain object this store can carry keys in, or `null`. */
+  private parseStoredObject(text: string | undefined): Record<string, unknown> | null {
+    if (text === undefined) return null;
+    try { const parsed: unknown = JSON.parse(text.replace(/^\uFEFF/, "")); return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null; }
+    catch { return null; }
+  }
   load(): SandStoredSettings {
     if (!existsSync(this.settingsPath)) return emptySettings();
-    try { const parsed = parseSettings(JSON.parse(readFileSync(this.settingsPath, "utf8").replace(/^\uFEFF/, "")) as unknown); return parsed == null ? emptySettings() : this.applyPendingMigrations(parsed); }
-    catch { return emptySettings(); }
+    const parsed = parseSettings(this.parseStoredObject(this.readStoredText()) as unknown);
+    // An unreadable file answered `emptySettings()` and nothing warned, because the reader looked
+    // harmless. Reading stays that way — the app has to run against a file it cannot understand.
+    // `persist` is where the file is at risk, and it refuses there.
+    if (parsed == null) return emptySettings();
+    return this.applyPendingMigrations(parsed);
+  }
+  /**
+   * Top-level keys this build does not manage, taken from the file itself.
+   *
+   * `SETTINGS_VERSION` is one constant that no build bumps, so two builds can both own a
+   * `version: 1` file and each can hold a field the other has never heard of. `persist` used to
+   * re-serialise only the fields this build knows, so the first ordinary write from either build
+   * erased the other's field, with no warning and no backup. These keys are carried through
+   * untouched; the managed keys in `settings` always win.
+   */
+  private foreignKeys(raw: Record<string, unknown> | null): Record<string, unknown> {
+    if (raw === null || raw.version !== SETTINGS_VERSION) return {};
+    const foreign: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(raw)) if (!SAND_MANAGED_SETTINGS_KEYS.has(key)) foreign[key] = value;
+    return foreign;
+  }
+  persist(settings: SandStoredSettings): void {
+    const text = this.readStoredText();
+    const raw = this.parseStoredObject(text);
+    // `parseSettings` answers `null` for a `version` this build does not know, and `load()` turned
+    // that into `emptySettings()`. A file that is not even a JSON object answers the same way. The
+    // reader looked harmless, so nothing warned — the damage came from this write, which put those
+    // defaults straight back over the user's file. A file this build cannot read is the one file it
+    // cannot rewrite from its own contents, so the first refusal takes a copy and holds. Once the
+    // copy exists the write proceeds: the user's settings are recoverable, and a genuinely corrupt
+    // file must not freeze every setting in the app.
+    if (text !== undefined && (raw === null || parseSettings(raw) == null)) {
+      const kept = `${this.settingsPath}.unreadable-v${SETTINGS_VERSION}`;
+      if (!existsSync(kept)) { try { writeFileSync(kept, text, "utf8"); return; } catch {} }
+    }
+    mkdirSync(dirname(this.settingsPath), { recursive: true });
+    const temp = `${this.settingsPath}.${process.pid}.tmp`;
+    writeFileSync(temp, JSON.stringify({ ...this.foreignKeys(raw), ...settings }, null, 2), "utf8");
+    renameSync(temp, this.settingsPath);
   }
   private applyPendingMigrations(settings: SandStoredSettings): SandStoredSettings {
     const done = new Set(settings.settingsMigrations);
@@ -118,27 +180,33 @@ export class SandSettingsStore {
     try { this.persist(migrated); } catch {}
     return migrated;
   }
-  persist(settings: SandStoredSettings): void { mkdirSync(dirname(this.settingsPath), { recursive: true }); const temp = `${this.settingsPath}.${process.pid}.tmp`; writeFileSync(temp, JSON.stringify(settings, null, 2), "utf8"); renameSync(temp, this.settingsPath); }
   private update(mutator: (settings: SandStoredSettings) => SandStoredSettings): void { this.persist(mutator(this.load())); }
   getHasSeenOnboarding(): boolean | undefined { return this.load().hasSeenOnboarding; }
   setHasSeenOnboarding(value: boolean): void { this.update((current) => { const { hasSeenOnboardingAccountScope: _old, ...rest } = current; return { ...rest, hasSeenOnboarding: value, ...(rest.mcpCustomInstructionsAccountScope === undefined ? {} : { hasSeenOnboardingAccountScope: rest.mcpCustomInstructionsAccountScope }) }; }); }
   clearHasSeenOnboarding(): void { this.update((current) => { const { hasSeenOnboarding: _seen, hasSeenOnboardingAccountScope: _owner, ...rest } = current; return rest; }); }
   getAutoUpdateWhenIdleOptIn(): boolean { return this.load().autoUpdateWhenIdleOptIn; }
-  setAutoUpdateWhenIdleOptIn(value: boolean): void { this.update((s) => ({ ...s, autoUpdateWhenIdleOptIn: value })); }
+  setAutoUpdateWhenIdleOptIn(value: boolean): void { this.update((s) => ({ ...s, autoUpdateWhenIdleOptIn: value === true })); }
   getThemePreference(): SandThemePreference { return this.load().themePreference ?? DEFAULT_SAND_THEME_PREFERENCE; }
-  setThemePreference(value: SandThemePreference): void { this.update((s) => ({ ...s, themePreference: value })); }
+  // Each setter below normalises before it writes. They did not used to: the reader validates every
+  // one of these fields and the writer accepted whatever it was handed, so a value outside the
+  // schema was persisted, the write reported success, and the next `load()` dropped it. The user's
+  // toggle came back off and nothing said why.
+  setThemePreference(value: SandThemePreference): void { this.update((s) => ({ ...s, themePreference: isSandThemePreference(value) ? value : DEFAULT_SAND_THEME_PREFERENCE })); }
   getBoxRuntime(): SandBoxRuntime { return this.load().boxRuntime ?? DEFAULT_SAND_BOX_RUNTIME; }
-  setBoxRuntime(value: SandBoxRuntime): void { this.update((s) => ({ ...s, boxRuntime: value })); }
+  setBoxRuntime(value: SandBoxRuntime): void { this.update((s) => ({ ...s, boxRuntime: isSandBoxRuntime(value) ? value : DEFAULT_SAND_BOX_RUNTIME })); }
   getEgressTunnelEnabled(): boolean { return this.load().egressTunnelEnabled; }
-  setEgressTunnelEnabled(value: boolean): void { this.update((s) => ({ ...s, egressTunnelEnabled: value })); }
+  setEgressTunnelEnabled(value: boolean): void { this.update((s) => ({ ...s, egressTunnelEnabled: value === true })); }
   getWebauthnProxyEnabled(): boolean { return this.load().webauthnProxyEnabled; }
-  setWebauthnProxyEnabled(value: boolean): void { this.update((s) => ({ ...s, webauthnProxyEnabled: value })); }
+  // `parseSettings` reads this one field as `!== false`, so anything that is not the literal
+  // `false` comes back enabled. A non-boolean had to be stopped at the writer, or
+  // `webauthnProxyEnabled: "false"` on disk turned the proxy ON.
+  setWebauthnProxyEnabled(value: boolean): void { this.update((s) => ({ ...s, webauthnProxyEnabled: value !== false })); }
   getAgentDefaultModel(): SandAgentModelSelection | undefined { const model = this.load().agentDefaultModel; return model === undefined ? undefined : { ...model, maxMode: true }; }
   setAgentDefaultModel(model: SandAgentModelSelection | undefined): void { this.update((s) => { const { agentDefaultModel: _old, ...rest } = s; return model === undefined ? rest : { ...rest, agentDefaultModel: { modelId: model.modelId, maxMode: true, parameters: model.parameters.map((p) => ({ ...p })) } }; }); }
   getComputerUseModel(): SandAgentModelSelection | undefined { return this.load().computerUseModel; }
   setComputerUseModel(model: SandAgentModelSelection | undefined): void { this.update((s) => { const { computerUseModel: _old, ...rest } = s; return model === undefined ? rest : { ...rest, computerUseModel: { modelId: model.modelId, maxMode: model.maxMode, parameters: model.parameters.map((p) => ({ ...p })) } }; }); }
   getUpdateTrackOverride(): SandUpdateTrack | null { const stored = this.load().updateTrackOverride ?? null; if (stored == null) return null; const coerced = coerceToEnabledTrack(stored); if (coerced !== stored) { try { this.setUpdateTrackOverride(coerced); } catch {} } return coerced; }
-  setUpdateTrackOverride(track: SandUpdateTrack | null): void { this.update((s) => { const { updateTrackOverride: _old, ...rest } = s; return track == null ? rest : { ...rest, updateTrackOverride: track }; }); }
+  setUpdateTrackOverride(track: SandUpdateTrack | null): void { this.update((s) => { const { updateTrackOverride: _old, ...rest } = s; return isSandUpdateTrack(track) ? { ...rest, updateTrackOverride: track } : rest; }); }
   getMcpCustomInstructions(): StringMap { return this.load().mcpCustomInstructions; }
   setMcpCustomInstructions(value: StringMap): void { this.update((s) => ({ ...s, mcpCustomInstructions: normalizeCustomInstructions(value) })); }
   getMcpCustomInstructionsByServerId(): StringMap { return this.load().mcpCustomInstructionsByServerId; }
@@ -154,7 +222,7 @@ export class SandSettingsStore {
   setUserTimeZone(value?: string): void { this.update((s) => { const { userTimeZone: _old, ...rest } = s; const trimmed = value?.trim(); return trimmed == null || trimmed.length === 0 ? rest : { ...rest, userTimeZone: trimmed }; }); }
   setUserTimeZoneOverride(value?: string): void { this.update((s) => { const { userTimeZoneOverride: _old, ...rest } = s; const trimmed = value?.trim(); return trimmed == null || trimmed.length === 0 ? rest : { ...rest, userTimeZoneOverride: trimmed }; }); }
   getMcpBoxServers(): string[] { return this.load().mcpBoxServers; }
-  setMcpBoxServers(names: readonly string[]): void { this.update((s) => ({ ...s, mcpBoxServers: [...new Set(names)] })); }
+  setMcpBoxServers(names: readonly string[]): void { this.update((s) => ({ ...s, mcpBoxServers: [...new Set(stringArray(names).filter((name) => name.length > 0))] })); }
   getRawMcpCustomInstruction(name: string): string | undefined { return this.load().mcpCustomInstructions[name]; }
   getRawMcpCustomInstructionByServerId(id: string): string | undefined { return this.load().mcpCustomInstructionsByServerId[id]; }
   setMcpCustomInstructionByServerId(args: { serverId: string; displayName: string; value: string; mirrorLegacyName: boolean }): void { this.update((s) => { const byId = { ...s.mcpCustomInstructionsByServerId, [args.serverId]: clampMcpCustomInstruction(args.value) }; const legacy = { ...s.mcpCustomInstructions }; if (args.mirrorLegacyName) { const value = clampMcpCustomInstruction(args.value); if (value.trim().length > 0 || getDefaultMcpCustomInstruction(args.displayName).length > 0) legacy[args.displayName] = value; else delete legacy[args.displayName]; } else delete legacy[args.displayName]; return { ...s, mcpCustomInstructionsByServerId: byId, mcpCustomInstructions: legacy }; }); }
@@ -169,7 +237,7 @@ export class SandSettingsStore {
   getLocalToolPermission(): SandLocalToolPermission { const s = this.load(); return resolveSandLocalToolPermission(s.localToolPermission ?? SAND_DEFAULT_LOCAL_TOOL_PERMISSION, s.localToolPermissionCeiling); }
   getLocalToolPermissionChoice(): SandLocalToolPermission { return this.load().localToolPermission ?? SAND_DEFAULT_LOCAL_TOOL_PERMISSION; }
   getLocalToolPermissionCeiling(): SandLocalToolPermission | undefined { return this.load().localToolPermissionCeiling; }
-  setLocalToolPermission(value: SandLocalToolPermission): void { this.update((s) => ({ ...s, localToolPermission: value })); }
+  setLocalToolPermission(value: SandLocalToolPermission): void { this.update((s) => ({ ...s, localToolPermission: normalizeSandLocalToolPermission(value) })); }
   // The bundled default is the user's own endpoint. There is no account here to
   // serve the "cursor" provider, so defaulting to it routed every turn into a
   // provider that can never answer. A file that still names it is refused here
@@ -181,7 +249,7 @@ export class SandSettingsStore {
   // never agreed to, so a refused value is not written in the first place.
   setInferenceProvider(value: SandInferenceProvider): void { const served = resolveServedInferenceProvider(value); this.update((s) => ({ ...s, inferenceProvider: served })); }
   getInferenceCustomEndpoint(): SandInferenceCustomEndpoint | undefined { return this.load().inferenceCustomEndpoint; }
-  setInferenceCustomEndpoint(value: SandInferenceCustomEndpoint | undefined): void { this.update((s) => { const { inferenceCustomEndpoint: _old, ...rest } = s; return value === undefined ? rest : { ...rest, inferenceCustomEndpoint: value }; }); }
+  setInferenceCustomEndpoint(value: SandInferenceCustomEndpoint | undefined): void { this.update((s) => { const { inferenceCustomEndpoint: _old, ...rest } = s; const endpoint = normalizeSandInferenceCustomEndpoint(value); return endpoint === undefined ? rest : { ...rest, inferenceCustomEndpoint: endpoint }; }); }
   getInferenceRouterUsage(): SandInferenceRouterUsage { return this.load().inferenceRouterUsage ?? emptySandInferenceRouterUsage(); }
   recordInferenceUsage(provider: SandInferenceProvider, usage: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number }): void {
     const safe = (value: number | undefined): number => Number.isFinite(value) && value! >= 0 ? Math.round(value!) : 0;
@@ -191,9 +259,9 @@ export class SandSettingsStore {
       return { ...settings, inferenceRouterUsage: { schemaVersion: 1, providers: { ...current.providers, [provider]: { requests: previous.requests + 1, inputTokens: previous.inputTokens + safe(usage.inputTokens), outputTokens: previous.outputTokens + safe(usage.outputTokens), cacheReadTokens: previous.cacheReadTokens + safe(usage.cacheReadTokens), cacheWriteTokens: previous.cacheWriteTokens + safe(usage.cacheWriteTokens), lastUsedAt: new Date().toISOString() } } } };
     });
   }
-  setLocalToolPermissionCeiling(value?: SandLocalToolPermission): void { this.update((s) => { const { localToolPermissionCeiling: _old, ...rest } = s; return value === undefined ? rest : { ...rest, localToolPermissionCeiling: value }; }); }
+  setLocalToolPermissionCeiling(value?: SandLocalToolPermission): void { this.update((s) => { const { localToolPermissionCeiling: _old, ...rest } = s; return isSandLocalToolPermission(value) ? { ...rest, localToolPermissionCeiling: value } : rest; }); }
   getPinnedAgentIds(): string[] | undefined { return this.load().pinnedAgentIds; }
-  setPinnedAgentIds(ids: readonly string[]): void { this.update((s) => ({ ...s, pinnedAgentIds: [...new Set(ids)] })); }
+  setPinnedAgentIds(ids: readonly string[]): void { this.update((s) => ({ ...s, pinnedAgentIds: [...new Set(stringArray(ids).filter((id) => id.length > 0))] })); }
   static storable(args: { sections: readonly SidebarSection[]; stored?: readonly SidebarSection[] }): SidebarSection[] { return SidebarSections.carryFolds(args).map((s) => ({ id: s.id, name: s.name, agentIds: [...s.agentIds], isCollapsed: s.isCollapsed ?? false })); }
   getSidebarSections(): SidebarSection[] | undefined { const stored = this.load().sidebarSections; return stored === undefined ? undefined : SidebarSections.carryFolds({ sections: stored }); }
   setSidebarSections(sections: readonly SidebarSection[]): void { this.update((s) => ({ ...s, sidebarSections: SandSettingsStore.storable(s.sidebarSections === undefined ? { sections } : { sections, stored: s.sidebarSections }) })); }

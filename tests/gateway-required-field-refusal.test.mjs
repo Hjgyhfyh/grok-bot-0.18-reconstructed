@@ -93,7 +93,9 @@ const CASES = [
   { command: "sendPrompt", body: {}, field: "prompt" },
   { command: "respondToWidget", body: {}, field: "value" },
   { command: "resolveAutoReviewApproval", body: {}, field: "agentId" },
+  { command: "resolveAutoReviewApproval", body: { agentId: AGENT }, field: "resolution" },
   { command: "resolveLocalToolPermission", body: {}, field: "resolution" },
+  { command: "resolveLocalToolPermission", body: { resolution: "yes" }, field: "resolution" },
   { command: "submitSecret", body: {}, field: "value" },
   { command: "reactToMessage", body: {}, field: "emoji" },
   { command: "searchAgents", body: {}, field: "query" },
@@ -183,6 +185,18 @@ const COMPLETE = {
   query: "probe",
 };
 
+/**
+ * `resolution` is the one field two commands disagree about: the local-tool
+ * permission card answers with one of four words and the auto-review approval
+ * card with one of two, and they share the field name. A single fixture value
+ * made `resolveAutoReviewApproval` fail its own accepting-path case for a reason
+ * that has nothing to do with the field under test.
+ */
+const COMPLETE_RESOLUTION = {
+  resolveLocalToolPermission: "allow-once",
+  resolveAutoReviewApproval: "approved",
+};
+
 /** Every field a command is known to need, filled with a value it accepts. */
 function completeBodyFor(command) {
   const body = {};
@@ -195,6 +209,9 @@ function completeBodyFor(command) {
     if (field in body) body[field] = value;
   }
   if ("targets" in body) body.targets = ["all"];
+  if (COMPLETE_RESOLUTION[command] != null && "resolution" in body) {
+    body.resolution = COMPLETE_RESOLUTION[command];
+  }
   // `spec.trigger` is named as its own field because that is what the refusal
   // says; on the wire it lives inside `spec`.
   if ("spec" in body || "spec.trigger" in body) body.spec = COMPLETE.spec;

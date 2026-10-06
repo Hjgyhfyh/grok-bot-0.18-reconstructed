@@ -10,7 +10,7 @@ import {
 import { readExecutorResource } from "../../packages/agent-exec/read.js";
 import type { RemoteExecManager } from "../../packages/agent-exec/remote.js";
 import type { Context } from "../../packages/context/core.js";
-import { createContextPropagatingClient } from "../../packages/context-rpc/index.js";
+import { createContextPropagatingClient, type ContextPropagationOptions } from "../../packages/context-rpc/index.js";
 import {
   LoadMcpServersRequest,
   PingRequest,
@@ -57,6 +57,19 @@ export const BOX_GENERATED_PACKAGE_VERSIONS: Readonly<{
   connectNodeStoreMarker: "@connectrpc+connect-node@1.6.1_@bufbuild+protobuf@1.10.1_@connectrpc+connect@1.6.1_patc_c333e1fd2007e07028093d0fe22e3f55"
 });
 
+/**
+ * The options the exec client is built with.
+ *
+ * `createContextPropagatingClient` only forwards a caller's `Context` signal into
+ * the RPC when it is told to (`packages/context-rpc/index.ts:183`), so this is the
+ * single switch that decides whether the user's stop, the run-queue watchdog and
+ * every other turn abort ever reach the box exec daemon. It is exported and frozen
+ * rather than written at the call site so that it can be named in a test and in a
+ * comment; nothing reads it to make a security or path decision.
+ */
+export const BOX_EXEC_ABORT_PROPAGATION: Readonly<{ enableAbortSignal: true }> =
+  Object.freeze({ enableAbortSignal: true });
+
 export interface GeneratedMessageConstructor<Input, Message> {
   new(data?: Input): Message;
   readonly typeName: string;
@@ -96,7 +109,14 @@ export interface GeneratedContextPropagatingClientFactory<
 > {
   (
     service: GeneratedServiceDescriptor<"agent.v1.ControlService">,
-    transport: Transport
+    transport: Transport,
+    /**
+     * Forwarded to `createContextPropagatingClient` untouched. It used to accept
+     * two arguments only, which is why the exec client could not ask for abort
+     * propagation at all: the switch that decides whether a turn's cancellation
+     * reaches the box exec daemon existed and the port had no room for it.
+     */
+    options?: ContextPropagationOptions
   ): GeneratedControlClient<
     PingRequest,
     UpdateEnvironmentVariablesRequest,
@@ -104,7 +124,8 @@ export interface GeneratedContextPropagatingClientFactory<
   >;
   (
     service: GeneratedServiceDescriptor<"agent.v1.ExecService">,
-    transport: Transport
+    transport: Transport,
+    options?: ContextPropagationOptions
   ): BoxRemoteExecClient;
 }
 
@@ -201,8 +222,31 @@ export function createProductionBoxGeneratedPorts<
       return { ping, updateEnvironmentVariables, loadMcpServers };
     },
 
+    /**
+     * The exec client every box shell runs through, and the only client in this
+     * file that has to carry a cancellation.
+     *
+     * It was built with no options, so `createContextPropagatingClient` took the
+     * `enableAbortSignal !== true` branch and left `options.signal` undefined:
+     * the per-turn `Context` was still decoded, span-wrapped and given its tracing
+     * headers, and its abort signal was dropped. The box exec daemon derives the
+     * signal it kills a shell's process tree with from the HTTP request
+     * (`server.ts:1379` — `runtime.execute(request, context.signal)`; `:780` —
+     * `signal.addEventListener("abort", () => this.kill(child))`), and an
+     * uncancelled request never produces one. So pressing stop on a turn running
+     * a box shell ended the turn, told the model the command was aborted, and
+     * left `cmd.exe` and everything it started running with nothing left holding
+     * it.
+     *
+     * Exported and frozen so the wiring has a name the regression test can
+     * point at instead of an anonymous object literal at the call site.
+     */
     createExecClient(transport): BoxRemoteExecClient {
-      return bindings.createContextPropagatingClient(bindings.execService, transport);
+      return bindings.createContextPropagatingClient(
+        bindings.execService,
+        transport,
+        BOX_EXEC_ABORT_PROPAGATION,
+      );
     },
 
     createResourceAccessor(manager): ProductionGeneratedBoxAccessor {

@@ -8,7 +8,7 @@ import { attachShellOutputStreams } from "./output-limiter.js";
 import { resolveSandboxPolicyForWorkspace } from "./sandbox/policy-merge.js";
 import { captureSandboxDenies } from "./sandbox/macos/seatbelt.js";
 import { spawnWithSignal } from "./core.js";
-import { buildShellCommandArgs, buildShellEnv, resolveSpawnShell } from "./shell-env.js";
+import { buildShellCommandArgs, buildShellEnv, isSpawnableShellOnThisHost, resolveSpawnShell } from "./shell-env.js";
 import { shouldEnableSudoAskpass, transformSudoCommand } from "./sudo.js";
 import { KnownShellExecutor } from "./types.js";
 import { initBashState } from "./bash.js";
@@ -234,9 +234,73 @@ export function getSuggestedShell(userTerminalHint: string, platform: NodeJS.Pla
   return KnownShellExecutor.Naive;
 }
 
+/**
+ * The executor a caller asked for by name, or `undefined` when it asked for none
+ * or named something this module does not recognise.
+ *
+ * WHAT CHANGED. `createDefaultTerminalExecutor` never read `options.shell`. It
+ * called `getSuggestedShell(userTerminalHint)`, and on Windows that function ends
+ * in `if (commandExists("pwsh") || commandExists("powershell")) return
+ * PowerShell` — so on any Windows box that has `powershell.exe`, a caller that
+ * named its interpreter got PowerShell anyway. Measured on this machine; all five
+ * of these ran Windows PowerShell 5.1 and none ran what it named:
+ *
+ *   createDefaultTerminalExecutor({})                                         -> powershell
+ *   createDefaultTerminalExecutor({ shell: "C:\\Windows\\system32\\cmd.exe" }) -> powershell
+ *   createDefaultTerminalExecutor({ shell: "cmd.exe" })                        -> powershell
+ *   createDefaultTerminalExecutor({ userTerminalHint: ComSpec })               -> powershell
+ *   createDefaultTerminalExecutor({ shell: "...\\Git\\bin\\bash.exe" })        -> powershell
+ *
+ * WHY IT MATTERS. `options.shell` is the value `NaiveTerminalExecutor` spawns,
+ * and `shell-env.ts` is where the tool description is built from
+ * (`resolveSpawnShell`, read by `prompts/shell-dialect.ts`). This option was the
+ * one place a caller could state "this surface speaks cmd.exe" and have the
+ * command line and the text the model reads agree — and only one of the two read
+ * it. `ShellDialectOptions` already documents it: "A shell the host declares for
+ * this surface. It wins over environment resolution."
+ *
+ * An unrecognised name returns `undefined` on purpose, so the suggestion stands.
+ * `getSuggestedShell` already carries the dangerous cases — a bare `bash` on
+ * Windows is usually a WSL shim — and this function adds no new ones. So does a
+ * name this host cannot spawn: `shell: "C:\\Program Files\\Git\\bin\\bash.exe"`
+ * on a machine without Git Bash used to run PowerShell, and after this change it
+ * must still do something that works rather than hand a lazy executor whose
+ * first use throws `Can't find Bash`.
+ */
+function executorForDeclaredShell(declared: string | undefined): KnownShellExecutor | undefined {
+  const trimmed = declared?.trim();
+  if (trimmed === undefined || trimmed.length === 0) return undefined;
+  if (!isSpawnableShellOnThisHost(trimmed)) return undefined;
+  const base = win32.basename(trimmed.replace(/[\\/]+$/, "")).toLowerCase().replace(/\.(exe|cmd|com)$/, "");
+  if (base === "cmd") return KnownShellExecutor.Naive;
+  if (base === "pwsh" || base === "powershell") return KnownShellExecutor.PowerShell;
+  if (base === "bash") return KnownShellExecutor.Bash;
+  if (base === "zsh") return KnownShellExecutor.Zsh;
+  return undefined;
+}
+
 export function createDefaultTerminalExecutor(options: DefaultTerminalExecutorOptions = {}): TerminalExecutor {
-  let effective = options; const gitBashPath = options.userTerminalHint ? undefined : detectGitBashFromEnvironment(); if (gitBashPath) effective = { ...options, userTerminalHint: gitBashPath };
-  const suggested = getSuggestedShell(effective.userTerminalHint ?? "");
+  let effective = options;
+  const declaredShell = options.shell?.trim();
+  const declared = executorForDeclaredShell(declaredShell);
+  if (declared !== undefined && declaredShell !== undefined) {
+    // The stateful initialisers read the path from `userTerminalHint`, not from
+    // `shell`: `getBashPath(hint)` is how `bash.ts` is told WHICH bash to run,
+    // and it only accepts a Windows hint that matches /git.*bash/i. Without this,
+    // `shell: "C:\\Program Files\\Git\\bin\\bash.exe"` would select the Bash
+    // executor and then throw `Can't find Bash` on its first use, because the
+    // hint that names the file never reached it.
+    effective = { ...effective, userTerminalHint: declaredShell };
+  } else {
+    const gitBashPath = options.userTerminalHint ? undefined : detectGitBashFromEnvironment();
+    if (gitBashPath) effective = { ...options, userTerminalHint: gitBashPath };
+  }
+  // The declared shell comes first: a host that named its own interpreter is more
+  // authoritative than what this machine happens to have installed. Only when
+  // nothing is declared does the suggestion decide, which is exactly what every
+  // caller that passes no `shell` — including
+  // `local-exec-daemon/production-executor.ts` — did before this existed.
+  const suggested = declared ?? getSuggestedShell(effective.userTerminalHint ?? "");
   if (suggested === KnownShellExecutor.Naive) return createNaiveTerminalExecutor(effective);
   const override = effective.statefulFactories?.[suggested];
   if (override !== undefined) return new LazyTerminalExecutor(() => override(effective));

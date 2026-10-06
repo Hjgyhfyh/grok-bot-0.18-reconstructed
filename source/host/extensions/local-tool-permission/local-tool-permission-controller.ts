@@ -103,6 +103,20 @@ export class SandLocalToolPermissionController {
   notePermissionChanged(): void { const permission = this.permission(); const previous = this.notedPermission; this.noteStandingPermission(permission); if (permission === "ask") { if (previous === "never") this.refusedActions.clear(); return; } const allowed = permission === "always"; if (!allowed) for (const id of [...this.approvalsById.keys()]) this.retireApproval(id); for (const pending of [...this.pendingByKey.values()]) { if (allowed && this.isStalePending(pending)) { this.settle(pending, "expired", { allowed: false, reason: SAND_LOCAL_TOOLS_ABANDONED_MESSAGE }); continue; } this.settle(pending, allowed ? "always" : "never", allowed ? { allowed: true } : { allowed: false, reason: SAND_LOCAL_TOOLS_DISABLED_MESSAGE }, allowed ? undefined : { rememberRefusal: false }); } }
   resolveRequest(requestId: string, initialResolution: SandLocalToolResolution): SandLocalToolAskRequest | undefined { const key = this.pendingById.get(requestId); const pending = key === undefined ? undefined : this.pendingByKey.get(key); if (pending === undefined || pending.request.id !== requestId) return undefined; let resolution = initialResolution; if (resolution === "always" || resolution === "never") { try { this.options.setPermission(resolution); } catch {} if (resolution === "always" && this.permission() !== "always") resolution = "allow-once"; } const allowed = resolution === "allow-once" || resolution === "always"; if (allowed) this.approvalsById.set(requestId, { id: requestId, agentId: pending.request.agentId, toolCallId: pending.toolCallId, outlivesScope: pending.outlivesScope, action: pending.request.action, target: pending.request.target, ...(pending.resourcePath === undefined ? {} : { resourcePath: pending.resourcePath }) }); const deniedReason = resolution === "never" ? SAND_LOCAL_TOOLS_DISABLED_MESSAGE : SAND_LOCAL_TOOLS_DENIED_MESSAGE; const settled = this.settle(pending, SETTLED_STATUS_OF_RESOLUTION[resolution], allowed ? { allowed: true, approvalId: requestId } : { allowed: false, reason: deniedReason }); if (resolution === "always" || resolution === "never") this.notePermissionChanged(); return settled; }
   getPendingRequestForAgent(agentId: string): SandLocalToolAskRequest | undefined { return [...this.pendingByKey.values()].find((pending) => pending.request.agentId === agentId)?.request; }
+  /**
+   * EVERY question this agent is blocked on, not the first one that was opened.
+   *
+   * One agent opens more than one ask at a time. The model puts two local tool
+   * calls in one assistant message and `tool-stream-executor.ts` runs them with
+   * `Promise.all`, so both reach `ask` before either is answered; `askKey` holds
+   * the `toolCallId`, so the two questions are distinct and both stay in the
+   * pending map. The single-slot accessor answered the older one and dropped the
+   * other on the floor: the pull interface named one question, the card for the
+   * second was never drawn, and the second agent call sat behind a referenced
+   * ten-minute timer until it expired with "the user never answered" — which is
+   * exactly the silence `listPendingLocalToolPermissions` was added to end.
+   */
+getPendingRequestsForAgent(agentId: string): SandLocalToolAskRequest[] { return [...this.pendingByKey.values()].filter((pending) => pending.request.agentId === agentId).map((pending) => pending.request); }
   getPendingRequestById(id: string): SandLocalToolAskRequest | undefined { const key = this.pendingById.get(id); return key === undefined ? undefined : this.pendingByKey.get(key)?.request; }
   wasSettled(id: string): boolean { return this.settledIds.has(id); }
   liveApprovalIds(): string[] { return [...this.approvalsById.keys()]; }

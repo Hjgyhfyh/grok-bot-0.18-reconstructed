@@ -30,8 +30,24 @@ const GROK_ROUTER_SYSTEM_PROMPT = [
   "Never ask for an API key for an already-connected plugin. Respond directly to the user in natural language after completing any necessary tool calls.",
 ].join("\n");
 
+/**
+ * Adds one turn's token counts to the persisted router ledger.
+ *
+ * Token accounting is telemetry, and telemetry must never be able to fail a turn. Both
+ * OpenAI-compatible executors attach this with `void extendedUsage.then(onUsage)`, which has
+ * no rejection handler: anything `recordInferenceUsage` threw became an unhandled promise
+ * rejection on a turn that had already answered the user. Node's default is to terminate the
+ * process on an unhandled rejection, so one unwritable settings file could take the host — or
+ * the forked coordinator, which is plain Node — down mid-conversation.
+ *
+ * What it throws is real: `SandSettingsStore.persist` finishes in `renameSync`, and Windows
+ * fails that with `EPERM` when another process holds `settings.json`. The coordinator
+ * (`node-agent-coordinator/inference-router.ts`) and the desktop are two processes writing that
+ * same file, so this is an ordinary event, not a broken disk. A count that cannot be written is
+ * a missing number, and a missing number is never worth a finished turn or a dead process.
+ */
 function recordRoutedUsage(provider: RoutedProvider, usage: UsageRecord): void {
-  new SandSettingsStore(join(getSandRootDir(), "settings.json")).recordInferenceUsage(provider, usage);
+  try { new SandSettingsStore(join(getSandRootDir(), "settings.json")).recordInferenceUsage(provider, usage); } catch {}
 }
 
 function persistedSecrets(): Record<string, string> {
@@ -54,6 +70,46 @@ function customCredential(): string {
   const value = process.env.OPENAI_COMPATIBLE_API_KEY?.trim() || persistedSecrets().OPENAI_COMPATIBLE_API_KEY?.trim();
   if (value == null || value.length === 0) throw new Error("The custom endpoint needs OPENAI_COMPATIBLE_API_KEY. Add it in Settings → Router.");
   return value;
+}
+
+/** Matches `SAND_ENDPOINT_SECRET_GUARD_MIN` in `inference-endpoint-models.ts`. */
+const ROUTED_CREDENTIAL_GUARD_MIN = 8;
+const ROUTED_CREDENTIAL_PLACEHOLDER = "[redacted]";
+
+/**
+ * Removes this route's own credential from a provider failure, in place, and returns the same
+ * error object.
+ *
+ * An endpoint is free to answer a rejected request by repeating the key it was sent — a 401
+ * answered `{"error":{"message":"invalid key <key>"}}` was measured producing a turn error whose
+ * `message` was that whole sentence, credential included, and that text is what reaches the chat
+ * and the logs. The model-list path already refuses to hand the credential back in any field
+ * (`inference-endpoint-models.ts`, `leaksSecret`); the turn path had no equivalent.
+ *
+ * Only the credential substring is replaced, and the same error object is kept, because
+ * `isRetryableProviderError` classifies on `message`, `name`, `retryable` and `isRetryable`.
+ * Rewriting the message wholesale, or throwing a fresh `Error`, would turn a retryable 500 or a
+ * transient `ECONNRESET` into a dead end.
+ */
+function redactRoutedCredential(error: unknown, credential: string): unknown {
+  const secret = credential.trim();
+  if (secret.length < ROUTED_CREDENTIAL_GUARD_MIN || typeof error !== "object" || error == null) return error;
+  const record = error as { message?: unknown; responseBody?: unknown };
+  for (const field of ["message", "responseBody"] as const) {
+    const value = record[field];
+    if (typeof value !== "string" || !value.includes(secret)) continue;
+    try { record[field] = value.split(secret).join(ROUTED_CREDENTIAL_PLACEHOLDER); } catch { /* a frozen error keeps its own text */ }
+  }
+  return error;
+}
+
+/** Every part passes through untouched; only an `{ type: "error" }` part is scrubbed. */
+async function* redactRoutedCredentialStream(source: AsyncIterable<Loose>, credential: string): AsyncIterable<Loose> {
+  for await (const part of source) {
+    yield part != null && typeof part === "object" && part.type === "error"
+      ? { ...part, error: redactRoutedCredential(part.error, credential) }
+      : part;
+  }
 }
 
 // The base URL is user supplied and reaches `createOpenAI` inside the host process, so the
@@ -382,19 +438,20 @@ function routedStreamTextParams(ctx: unknown, options?: RoutedStreamCallOptions)
 }
 
 /**
- * The cache read count the provider actually reported, or 0 when it reported none.
+ * The cache read count one provider request reported, or 0 when it reported none.
  *
  * `@ai-sdk/openai` 1.3.24 does parse `usage.prompt_tokens_details.cached_tokens` off the
  * stream, but AI SDK v4's `result.usage` has no field to put it in: the usage object
  * carries only `promptTokens`, `completionTokens` and `totalTokens`, and the cached count
- * is parked at `result.providerMetadata.openai.cachedPromptTokens`. The two OpenAI-compatible
- * executors below built their usage record from `result.usage` alone and therefore wrote a
- * hardcoded `cacheReadTokens: 0`, which is what the Router usage panel displayed forever.
+ * is parked at `providerMetadata.openai.cachedPromptTokens`. Before this function existed
+ * the two OpenAI-compatible executors built their usage record from `result.usage` alone
+ * and wrote a hardcoded `cacheReadTokens: 0`, which is what the Router usage panel
+ * displayed forever.
  *
  * `cache_write_tokens` has no OpenAI-compatible equivalent at all — automatic prompt caching
  * reports reads only — so `cacheWriteTokens` stays 0 by fact, not by omission.
  */
-function cachedPromptTokens(providerMetadata: unknown): number {
+function stepCachedPromptTokens(providerMetadata: unknown): number {
   if (typeof providerMetadata !== "object" || providerMetadata == null) return 0;
   const openai: unknown = (providerMetadata as { openai?: unknown }).openai;
   if (typeof openai !== "object" || openai == null) return 0;
@@ -402,10 +459,39 @@ function cachedPromptTokens(providerMetadata: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
 }
 
+/**
+ * The cache read count for a whole turn: the sum over every step of the turn.
+ *
+ * `result.providerMetadata` looks like the obvious source and is wrong for a turn that takes
+ * more than one step. `ai` 4.3.17 accumulates `streamText`'s `result.usage` across steps
+ * (`addLanguageModelUsage`) but resolves `result.providerMetadata` with the LAST step only
+ * (`providerMetadataPromise.resolve(lastStep.experimental_providerMetadata)`). Both
+ * OpenAI-compatible executors below pass `maxSteps: 8` whenever a tool is supplied, so a
+ * tool-calling turn sums its input and output counts over every step while reading the cache
+ * count from one of them — the ledger reported a cache hit far below what the provider
+ * measured, and it contradicted its own input total. Measured on a two-step turn whose steps
+ * reported 500 and 900 cached prompt tokens: the ledger held `inputTokens: 2100,
+ * cacheReadTokens: 900` where the provider had reported 1400.
+ *
+ * `result.steps` is the only source that carries each step's own provider metadata.
+ */
+function cachedPromptTokens(steps: unknown): number {
+  if (!Array.isArray(steps)) return 0;
+  let total = 0;
+  for (const step of steps) {
+    const providerMetadata: unknown = typeof step === "object" && step != null
+      ? (step as { experimental_providerMetadata?: unknown }).experimental_providerMetadata
+      : undefined;
+    total += stepCachedPromptTokens(providerMetadata);
+  }
+  return total;
+}
+
 function openRouterExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void, ctx?: unknown, options?: RoutedStreamCallOptions) {
   const id = process.env.SAND_OPENROUTER_MODEL?.trim() || "openai/gpt-5.2";
+  const credential = openRouterCredential();
   const model: LanguageModelV1 = createOpenAI({
-    apiKey: openRouterCredential(),
+    apiKey: credential,
     baseURL: "https://openrouter.ai/api/v1",
     // `strict` is the only mode that puts `stream_options: { include_usage: true }` on the
     // wire (`@ai-sdk/openai` 1.3.24 sends it under a strict guard). Without it the provider
@@ -416,15 +502,16 @@ function openRouterExecutor(messages: readonly ProviderMessage[], invocationId: 
   }).chat(id as any);
   const tools = toToolSet(definitions, executeTool);
   const result = streamText({ model, system: GROK_ROUTER_SYSTEM_PROMPT, messages: messages as CoreMessage[], ...(tools === undefined ? {} : { tools }), toolCallStreaming: true, maxSteps: tools === undefined ? 1 : 8, ...routedStreamTextParams(ctx, options) });
-  const extendedUsage = Promise.all([result.usage, result.providerMetadata]).then(([value, providerMetadata]) => ({ inputTokens: value.promptTokens, outputTokens: value.completionTokens, cacheReadTokens: cachedPromptTokens(providerMetadata), cacheWriteTokens: 0, maxTokens: resolveRoutedContextWindow(id) }));
+  const extendedUsage = Promise.all([result.usage, result.steps]).then(([value, steps]) => ({ inputTokens: value.promptTokens, outputTokens: value.completionTokens, cacheReadTokens: cachedPromptTokens(steps), cacheWriteTokens: 0, maxTokens: resolveRoutedContextWindow(id) }));
   if (onUsage != null) void extendedUsage.then(onUsage);
-  return { fullStream: result.fullStream, response: result.response, usage: result.usage, extendedUsage, providerMetadata: result.providerMetadata, invocationId: Promise.resolve(invocationId) };
+  return { fullStream: redactRoutedCredentialStream(result.fullStream, credential), response: result.response, usage: result.usage, extendedUsage, providerMetadata: result.providerMetadata, invocationId: Promise.resolve(invocationId) };
 }
 
 function customExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void, sessionId?: string, ctx?: unknown, options?: RoutedStreamCallOptions) {
   const endpoint = customEndpoint();
+  const credential = customCredential();
   const model: LanguageModelV1 = createOpenAI({
-    apiKey: customCredential(),
+    apiKey: credential,
     baseURL: endpoint.baseUrl,
     // Same reason as the OpenRouter route: only `strict` puts `stream_options.include_usage`
     // on the wire, and without a usage frame `extendedUsage.maxTokens` had nothing real to
@@ -441,9 +528,9 @@ function customExecutor(messages: readonly ProviderMessage[], invocationId: stri
   }).chat(endpoint.modelId as any);
   const tools = toToolSet(definitions, executeTool);
   const result = streamText({ model, system: GROK_ROUTER_SYSTEM_PROMPT, messages: messages as CoreMessage[], ...(tools === undefined ? {} : { tools }), toolCallStreaming: true, maxSteps: tools === undefined ? 1 : 8, ...routedStreamTextParams(ctx, options) });
-  const extendedUsage = Promise.all([result.usage, result.providerMetadata]).then(([value, providerMetadata]) => ({ inputTokens: value.promptTokens, outputTokens: value.completionTokens, cacheReadTokens: cachedPromptTokens(providerMetadata), cacheWriteTokens: 0, maxTokens: resolveRoutedContextWindow(endpoint.modelId) }));
+  const extendedUsage = Promise.all([result.usage, result.steps]).then(([value, steps]) => ({ inputTokens: value.promptTokens, outputTokens: value.completionTokens, cacheReadTokens: cachedPromptTokens(steps), cacheWriteTokens: 0, maxTokens: resolveRoutedContextWindow(endpoint.modelId) }));
   if (onUsage != null) void extendedUsage.then(onUsage);
-  return { fullStream: result.fullStream, response: result.response, usage: result.usage, extendedUsage, providerMetadata: result.providerMetadata, invocationId: Promise.resolve(invocationId) };
+  return { fullStream: redactRoutedCredentialStream(result.fullStream, credential), response: result.response, usage: result.usage, extendedUsage, providerMetadata: result.providerMetadata, invocationId: Promise.resolve(invocationId) };
 }
 
 class ProviderPromptExecutor extends BasePromptExecutor<ProviderMessage> {
@@ -484,12 +571,27 @@ export async function runRoutedProviderText(provider: RoutedProvider, messages: 
         ? customExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage, options?.sessionId, undefined, callOptions)
         : openRouterExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage, undefined, callOptions);
   let text = "";
+  // `result.response` is an AI SDK DelayedPromise that only settles in the stream's normal
+  // `flush`. A provider error ends `fullStream` with one `{ type: "error" }` part before that
+  // point, so the `await` below never returned and every routed failure became a promise that
+  // stays pending for the life of the host process — no error, no reply, no timeout. Measured on
+  // this route: a refused connection and a 401 both stayed pending past 20s, and the coordinator's
+  // naming queue for that agent then never drained again, because it chains each attempt onto the
+  // pending one. The same trap is already documented and worked around for the agent turn path in
+  // `tool-stream-executor.ts`; this route did not learn it.
+  //
+  // So the error part is carried out of the loop and rethrown here. Anything that is not a
+  // `text-delta` still passes through untouched.
+  let failure: unknown;
   for await (const event of result.fullStream) {
-    if (event.type === "text-delta" && typeof event.textDelta === "string") {
-      text += event.textDelta;
-      options?.onTextDelta?.(event.textDelta, text);
+    const part = event as { type?: unknown; error?: unknown; textDelta?: unknown };
+    if (part.type === "error") { failure ??= part.error; continue; }
+    if (part.type === "text-delta" && typeof part.textDelta === "string") {
+      text += part.textDelta;
+      options?.onTextDelta?.(part.textDelta, text);
     }
   }
+  if (failure != null) throw failure instanceof Error ? failure : new Error(String(failure));
   await result.response;
   return text;
 }

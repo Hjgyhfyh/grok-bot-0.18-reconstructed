@@ -250,20 +250,55 @@ export class BoxRemoteExecManager implements RemoteExecManager {
     ctx: Context,
     serialize: (id: number) => ExecServerMessage
   ): AsyncIterable<ExecClientMessage> {
-    for await (const message of this.client.exec(ctx, serialize(this.#nextId++))) {
-      if (message.element.case === "execClientMessage") {
-        yield message.element.value;
-        continue;
+    // WHAT CHANGED, AND WHY. The RPC used to be made with the Context the
+    // caller passed in, so the only thing that could ever stop it was that same
+    // Context being aborted: the user pressing stop, or the controller of the
+    // turn. A consumer that simply stopped iterating this generator did not
+    // stop it, because nothing above this line turns "nobody is reading any
+    // more" into "the work can stop". JavaScript does run the finally block of
+    // an abandoned for-await loop, but the request behind it stayed open, so
+    // the box exec daemon went on running a command that nobody had cancelled
+    // and nobody was waiting for.
+    //
+    // That is a leak with no holder left. Measured through the real host
+    // accessor on this machine, against a real daemon and a real three-level
+    // tree (the shell, the node process it started, and the node process that
+    // one started), after the host stopped reading the exec stream:
+    //
+    //   +1s / +5s / +10s   shell alive, middle alive, grandchild alive
+    //   the exec stream never ended, so the HTTP response stayed open as well
+    //
+    // ctx.withCancel() gives the call its own controller, and cancelling it in
+    // the finally block closes both halves at once: the Connect request is
+    // aborted, the daemon context.signal fires, box-exec-daemon/server.ts:780
+    // calls kill(child), and killProcessTree walks the tree down from a shell
+    // that is still alive. The command dies and the response closes.
+    //
+    // NOT WIDENED. The cancel fires when this generator is CLOSED, which is
+    // exactly when the work has no consumer left, and not one moment before.
+    // The unary resources keep draining the tail of their stream in the
+    // background after they already have their value (agent-exec/remote.ts,
+    // ExecutorResource.execute); that drain is what closes this generator, and
+    // their command has been answered by then.
+    const [callCtx, cancelCall] = ctx.withCancel();
+    try {
+      for await (const message of this.client.exec(callCtx, serialize(this.#nextId++))) {
+        if (message.element.case === "execClientMessage") {
+          yield message.element.value;
+          continue;
+        }
+        if (message.element.case !== "execClientControlMessage") continue;
+        const control = message.element.value;
+        if (control.message.case !== "throw") continue;
+        const thrown = control.message.value;
+        const error = new Error(thrown.error);
+        if (thrown.stackTrace != null && thrown.stackTrace.length > 0) {
+          error.stack = thrown.stackTrace;
+        }
+        throw error;
       }
-      if (message.element.case !== "execClientControlMessage") continue;
-      const control = message.element.value;
-      if (control.message.case !== "throw") continue;
-      const thrown = control.message.value;
-      const error = new Error(thrown.error);
-      if (thrown.stackTrace != null && thrown.stackTrace.length > 0) {
-        error.stack = thrown.stackTrace;
-      }
-      throw error;
+    } finally {
+      cancelCall();
     }
   }
 }

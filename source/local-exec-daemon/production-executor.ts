@@ -1,7 +1,8 @@
-import { readFile } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { mkdir, opendir, readFile } from "node:fs/promises";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 import { DEFAULT_MAX_LOCAL_EXEC_FILE_BYTES, localExecFileTooLargeMessage } from "../shared/local-exec-gateway.js";
+import { writeFileAtomic } from "../shared/node/atomic-write.js";
 import type { JsonValue } from "@bufbuild/protobuf";
 import {
   buildLocalExecManager,
@@ -28,16 +29,23 @@ import {
 } from "../packages/proto/generated/agent/v1/agent_service_pb.js";
 import { lsExecutorResource } from "../packages/agent-exec/ls.js";
 import { readExecutorResource } from "../packages/agent-exec/read.js";
+import { writeExecutorResource } from "../packages/agent-exec/write.js";
 import { RegistryResourceAccessor } from "../packages/agent-exec/resource-provider.js";
 import { shellStreamExecutorResource } from "../packages/agent-exec/shell-stream.js";
 import { createContext, type Context } from "../packages/context/core.js";
 import { LocalBackgroundShellExecutor } from "../packages/local-exec/background-shell.js";
-import { LocalLsExecutor } from "../packages/local-exec/ls.js";
+import { LocalLsExecutor, type LsTraversalRuntime } from "../packages/local-exec/ls.js";
 import { LocalReadExecutor } from "../packages/local-exec/read.js";
 import { BaseShellCoreExecutor } from "../packages/local-exec/shell-core.js";
 import { LocalShellStreamExecutor } from "../packages/local-exec/shell-stream.js";
 import type { SandboxRule } from "../packages/local-exec/shell-core.js";
 import { ReadError, ReadResult } from "../packages/proto/generated/agent/v1/read_exec_pb.js";
+import {
+  WriteError,
+  WritePermissionDenied,
+  WriteResult,
+  WriteSuccess,
+} from "../packages/proto/generated/agent/v1/write_exec_pb.js";
 import { ShellStream, ShellStreamStderr } from "../packages/proto/generated/agent/v1/shell_exec_pb.js";
 import type { SandboxPolicy as ProtoSandboxPolicy } from "../packages/proto/generated/agent/v1/sandbox_pb.js";
 import { createDefaultTerminalExecutor } from "../packages/shell-exec/index.js";
@@ -466,6 +474,126 @@ export function createLocalExecIgnoreService(options: { readonly root: string })
 }
 
 /**
+ * The directory walk `LocalLsExecutor` needs in order to be able to list
+ * anything at all.
+ *
+ * WHAT CHANGED. `LocalLsExecutor` takes a traversal runtime as its fourth
+ * constructor argument and throws `MissingLsTraversalBindingError` when it is
+ * absent (`ls.ts:20`). The production graph registered `lsExecutorResource` and
+ * then built the executor with three arguments, so the resource was wired into
+ * the registry and could only ever throw. Measured against this graph:
+ *
+ *   lsArgs { path: "dir" }        -> ExecClientThrow, `error` field ABSENT
+ *
+ * A path that does not exist never reached that line — `ls.ts:18` returns a
+ * proper `LsError` for it first — so `ls` on a missing path answered with a
+ * readable message and `ls` on a directory that does exist answered with
+ * nothing at all. That reads as "the listing failed for an unexplained reason",
+ * and the model's next move is to guess.
+ *
+ * This walk emits only regular files, as root-relative paths, which is what
+ * `LocalLsExecutor.buildTree` consumes: it reconstructs every parent directory
+ * itself through `ensureDir`. Directory entries are queued breadth-first and
+ * the walk stops on the context's timeout, because the executor asks for a
+ * timeout-carrying child context and turns the resulting `didTimeout` into an
+ * `LsTimeout` with the partial tree it had already collected.
+ *
+ * Symlinks are deliberately not followed. A `Dirent` from `opendir` describes
+ * the link itself, so a link reports neither `isFile()` nor `isDirectory()` and
+ * is skipped. Following one would walk out of the root, and the ls path guard
+ * only sees the directory the model named, not every entry beneath it.
+ */
+export function createLocalLsTraversalRuntime(): LsTraversalRuntime {
+  return {
+    // `ls.ts` calls this to let the ignore service decide about one entry. The
+    // root boundary is already enforced by `containPath` before the executor
+    // runs, so the answer here is the path itself and `isRepoBlocked` gets to
+    // have its say, exactly as it does on the shipped upstream walk.
+    resolveForIgnore: async (candidate) => candidate,
+    walk(ctx, args) {
+      let timedOut = false;
+      let settle!: (value: boolean) => void;
+      const didTimeout = new Promise<boolean>((resolveTimeout) => { settle = resolveTimeout; });
+      const lines = (async function* () {
+        const controller = new AbortController();
+        const onAbort = () => { timedOut = true; controller.abort(); };
+        if (ctx.signal.aborted) onAbort();
+        else ctx.signal.addEventListener("abort", onAbort, { once: true });
+        const pending: string[] = [""];
+        try {
+          while (pending.length > 0) {
+            if (controller.signal.aborted) return;
+            const currentRelative = pending.shift()!;
+            const directory = await opendir(resolve(args.root, currentRelative)).catch(() => undefined);
+            if (directory === undefined) continue;
+            for await (const entry of directory) {
+              if (controller.signal.aborted) return;
+              if (entry.isDirectory()) {
+                pending.push(currentRelative === "" ? entry.name : `${currentRelative}/${entry.name}`);
+              } else if (entry.isFile()) {
+                yield currentRelative === "" ? entry.name : `${currentRelative}/${entry.name}`;
+              }
+            }
+          }
+        } finally {
+          ctx.signal.removeEventListener("abort", onAbort);
+          settle(timedOut);
+        }
+      })();
+      return { lines, didTimeout };
+    },
+  };
+}
+
+interface WriteResourceArgs {
+  path: string;
+  fileText: string;
+  fileBytes: Uint8Array;
+  toolCallId: string;
+  returnFileContentAfterWrite: boolean;
+}
+
+function requireWriteResourceArgs(value: unknown): asserts value is WriteResourceArgs {
+  if (!isRecord(value) || typeof value.path !== "string") {
+    throw new TypeError("local-exec write resource arguments require a string path");
+  }
+}
+
+/**
+ * The write path the agent's Edit and Write tools use.
+ *
+ * WHAT CHANGED. The production registry registered shellStream, backgroundShell,
+ * read and ls, and nothing else. `writeExecutorResource` is what
+ * `source/packages/agent/tools/core/edit/common.ts:98` asks the accessor for,
+ * so every Edit reached this daemon and answered
+ *
+ *   ExecClientThrow "No handler found for server message of type writeArgs"
+ *
+ * The permissions service built right above it has always implemented
+ * `shouldBlockWrite`, and nothing in the tree called it — that method existing
+ * with no caller is the shape a missing registration leaves behind.
+ *
+ * The boundary is not widened. The path goes through the same `containPath` as
+ * every read, `shouldBlockWrite` runs before a byte is written, and the byte
+ * cap is the same `maxFileBytes` a read is held to. What changes is only that a
+ * write the daemon already had a permission check for can now actually happen.
+ */
+function buildWriteResult(args: { path: string; bytes: Buffer; returnContent: boolean }): WriteResult {
+  const linesCreated = args.bytes.byteLength === 0 ? 0 : args.bytes.toString("utf8").split("\n").length;
+  return new WriteResult({
+    result: {
+      case: "success",
+      value: new WriteSuccess({
+        path: args.path,
+        linesCreated,
+        fileSize: args.bytes.byteLength,
+        ...(args.returnContent ? { fileContentAfterWrite: args.bytes.toString("utf8") } : {}),
+      }),
+    },
+  });
+}
+
+/**
  * Exact first-party resource graph emitted by local-exec-machine.ts. Stateful
  * terminal creation remains lazy inside createDefaultTerminalExecutor, so
  * construction and non-shell resources do not pretend that a missing native
@@ -498,7 +626,7 @@ export function createDefaultProductionLocalExecExecutor(options: {
         backgroundShellExecutor.getManager(),
       );
       const readExecutor = new LocalReadExecutor(permissionsService, root);
-      const lsExecutor = new LocalLsExecutor(permissionsService, ignoreService, root);
+      const lsExecutor = new LocalLsExecutor(permissionsService, ignoreService, root, createLocalLsTraversalRuntime());
       const registry = new RegistryResourceAccessor();
 
       registry.register(shellStreamExecutorResource, {
@@ -551,6 +679,35 @@ export function createDefaultProductionLocalExecExecutor(options: {
           const args = argsValue;
           await guards.containPath({ root, path: args.path });
           return lsExecutor.execute(ctx, args);
+        },
+      });
+      registry.register(writeExecutorResource, {
+        execute: async (ctx: Context, argsValue: unknown) => {
+          requireWriteResourceArgs(argsValue);
+          const args = argsValue;
+          const resolved = await guards.containPath({ root, path: args.path });
+          const bytes = args.fileBytes != null && args.fileBytes.byteLength > 0
+            ? Buffer.from(args.fileBytes)
+            : Buffer.from(typeof args.fileText === "string" ? args.fileText : "", "utf8");
+          if (await permissionsService.shouldBlockWrite(ctx, resolved, bytes.toString("utf8"))) {
+            return new WriteResult({
+              result: { case: "permissionDenied", value: new WritePermissionDenied({ path: resolved, operation: "write" }) },
+            });
+          }
+          if (bytes.byteLength > maxFileBytes) {
+            return new WriteResult({
+              result: { case: "error", value: new WriteError({ path: resolved, error: localExecFileTooLargeMessage(bytes.byteLength, maxFileBytes) }) },
+            });
+          }
+          try {
+            await mkdir(dirname(resolved), { recursive: true });
+            await writeFileAtomic(resolved, bytes);
+          } catch (error) {
+            return new WriteResult({
+              result: { case: "error", value: new WriteError({ path: resolved, error: error instanceof Error ? error.message : "Unknown error occurred" }) },
+            });
+          }
+          return buildWriteResult({ path: resolved, bytes, returnContent: args.returnFileContentAfterWrite === true });
         },
       });
       return SimpleControlledExecManager.fromResources(registry);

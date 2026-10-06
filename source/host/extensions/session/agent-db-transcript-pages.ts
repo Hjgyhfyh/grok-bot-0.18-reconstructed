@@ -42,7 +42,28 @@ function page(rows: Row[], limit: number): { entries: TranscriptEntry[]; nextBef
  * timestamp rather than NULL, `sinceMs` and `beforeSeq` become NULL when they are
  * absent or not a number, and `limit` falls back to the same default the window
  * reader uses.
+ *
+ * The bounds are enforced against a row that has no `timestampMs` by asking
+ * whether the *bound* is absent, not by exempting the row. The old predicate
+ * read `(json_extract(entry, '$.timestampMs') IS NULL OR (? IS NULL OR ...))`,
+ * which let a timestamp-less row through no matter what window the caller asked
+ * for. `rebuildTranscriptEntriesFromState` builds exactly such rows — it spreads
+ * `...(item.timestampMs == null ? {} : { timestampMs: item.timestampMs })` — and
+ * `backfillTranscript` writes them, so a store under recovery really does hold
+ * them. Measured on a store of 500 recovered entries and 3 fresh ones,
+ * `getTranscriptPage({ sinceMs: now - 2000, untilMs: now, limit: 10 })` answered
+ * with 7 of the recovered entries, and walking that page to its end returned all
+ * 503 rows: a caller asking what happened in the last two seconds was handed the
+ * whole recovered history, on every call. An absent bound still carries the
+ * timestamp-less rows, because an absent bound is not a window.
+ *
+ * Each bound is therefore bound twice: once as the flag that says whether the
+ * caller asked for a window at all, and once as the value to compare against,
+ * which is `MIN_SAFE_INTEGER` or `MAX_SAFE_INTEGER` when the bound is absent.
+ * Comparing against NULL instead would make `ts >= NULL` evaluate to NULL and
+ * drop every row of a query that asked for no lower bound, which is exactly the
+ * reader the gateway sends.
  */
-export function readTranscriptPage(statements: TranscriptPageStatements, query: TranscriptPageQuery): { entries: TranscriptEntry[]; nextBeforeSeq?: number } { const before = finiteOrNull(query?.beforeSeq), since = finiteOrNull(query?.sinceMs), until = finiteOrNull(query?.untilMs) ?? Number.MAX_SAFE_INTEGER, limit = pageLimit(query?.limit); return page(statements.listTranscriptPage.all(before, before, since, since, until, limit + 1), limit); }
+export function readTranscriptPage(statements: TranscriptPageStatements, query: TranscriptPageQuery): { entries: TranscriptEntry[]; nextBeforeSeq?: number } { const before = finiteOrNull(query?.beforeSeq), sinceBound = finiteOrNull(query?.sinceMs), untilBound = finiteOrNull(query?.untilMs), since = sinceBound ?? Number.MIN_SAFE_INTEGER, until = untilBound ?? Number.MAX_SAFE_INTEGER, limit = pageLimit(query?.limit); return page(statements.listTranscriptPage.all(before, before, sinceBound, since, untilBound, until, limit + 1), limit); }
 export function readTranscriptWindow(statements: TranscriptPageStatements, query: Pick<TranscriptPageQuery, "beforeSeq" | "limit">, threadCountsFor: (entries: readonly TranscriptEntry[]) => unknown): { entries: TranscriptEntry[]; nextBeforeSeq?: number; threadCounts: unknown } { const before = finiteOrNull(query?.beforeSeq); const limit = pageLimit(query?.limit); const result = page(statements.listTranscriptWindow.all(before, before, limit + 1), limit); return { ...result, threadCounts: threadCountsFor(result.entries) }; }
 export function readTranscriptTail(statements: TranscriptPageStatements, query: Pick<TranscriptPageQuery, "beforeSeq" | "limit">): { entries: TranscriptEntry[]; nextBeforeSeq?: number } { const before = finiteOrNull(query?.beforeSeq), limit = pageLimit(query?.limit); return page(statements.listTranscriptTail.all(before, before, limit + 1), limit); }

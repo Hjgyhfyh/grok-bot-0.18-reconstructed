@@ -1200,8 +1200,22 @@ export class SandAgentRunner<T = unknown> {
 
   interruptAll(reason: string): boolean {
     const interrupted = this.interrupt(reason);
-    for (const session of this.subagents.sessions.values()) {
-      session.interrupt(reason);
+    // A stop has to end the children too, and it has to do it through the
+    // runtime's own abort bookkeeping rather than by reaching into the session.
+    // `session.interrupt` fires the child's abort signal and nothing else:
+    // `abortingSubagents` stays empty, so a steer `MessageSubagent` already
+    // queued relaunches the child the moment its run settles — after this stop —
+    // and a child with nothing queued settles as an ordinary failure, which
+    // `RunnerRegistry` hands to `CompletionRevivals` and which starts a fresh
+    // parent turn per child. `abortSubagent` is the path `StopSubagent` already
+    // takes for the identical event, and it marks the child as aborting, drops
+    // its queued steer, disarms its wake marker and reports nothing.
+    for (const id of [...this.subagents.sessions.keys()]) {
+      // A child that exists but has not been dispatched has no run to abort, so
+      // it keeps the direct interrupt.
+      if (this.subagents.abortSubagent(id) === "not-running") {
+        this.subagents.sessions.get(id)?.interrupt(reason);
+      }
     }
     return interrupted;
   }

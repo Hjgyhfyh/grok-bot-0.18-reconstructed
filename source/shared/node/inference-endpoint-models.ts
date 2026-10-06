@@ -81,6 +81,15 @@ export function isSandEndpointModelBaseUrlAllowed(baseUrl: unknown): boolean {
  * Resolves `{baseUrl}/models`, refusing anything that is not https (or http on
  * loopback) and refusing embedded credentials. Query and fragment are dropped
  * so the reported endpoint can never carry a key.
+ *
+ * The probe is assembled as a string and parsed against `url.origin`, so a
+ * `pathname` that itself starts with `//` makes the whole reference
+ * protocol-relative: `new URL("//evil.example.com/v1/models", "https://api.example.com")`
+ * is `https://evil.example.com/v1/models`. The typed host silently stopped being the
+ * host the stored credential was scoped to, and the reply came back tagged `ok` under
+ * the endpoint the user typed. Pinning the origin from the parsed URL and appending the
+ * path to `origin + path` keeps every probe on the host that passed the https/loopback
+ * and credential checks above.
  */
 export function sandEndpointModelProbeTarget(baseUrl: unknown): SandEndpointModelProbeTarget | null {
   if (typeof baseUrl !== "string") return null;
@@ -95,7 +104,7 @@ export function sandEndpointModelProbeTarget(baseUrl: unknown): SandEndpointMode
   url.search = "";
   url.hash = "";
   const basePath = url.pathname.replace(/\/+$/u, "");
-  const probe = new URL(`${basePath}/models`, url.origin);
+  const probe = new URL(`${url.origin}${basePath}/models`);
   return { url: probe.toString(), report: `${probe.origin}${probe.pathname}` };
 }
 

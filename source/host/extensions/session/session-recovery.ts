@@ -43,4 +43,25 @@ function mirrorProfileIntoStore(db:ProfileStoreMirror,profile:SandAgentProfile):
  * worth a folder that says it is.
  */
 export function ensureProfileFile(dbPath:string,db:ProfileStoreMirror):string{const path=getSandProfilePath(dirname(dbPath));if(!existsSync(path)){if(!existsSync(dirname(path)))return path;writeSandProfileFile(path,{name:String(db.get("name")||"Grok").trim()||"Grok",description:db.getSandProfile?.().description?.trim()??"",title:"",avatarShape:"",avatarColor:""});return path}const profile=readSandProfileFile(path);if(profile!=null)mirrorProfileIntoStore(db,profile);return path}
-export function ensureSettingsFile(dbPath:string):string{const path=getSandSettingsPath(dirname(dbPath));if(!existsSync(path))writeSandSettingsFile(path,{});return path}
+/**
+ * Makes sure the agent has a `settings.json`, and creates nothing.
+ *
+ * The guard is the one `ensureProfileFile` above already carries, and it is here
+ * for the reason that comment gives. `ensureSettingsFile` is called on the first
+ * line of `buildSummary`, so every roster pass, every `summarizeOpenSession` and
+ * every `summarizeAgentById` reaches it -- and `writeSandSettingsFile` ends in
+ * `mkdirSync(dirname(path), { recursive: true })`, so the "make sure it is there"
+ * half of a read was a create. Measured on a live box: a batch delete answered
+ * `200 {"deleted":["<id>"]}`, and a moment later `<root>\agents\<id>\settings.json`
+ * held three bytes of `{}\n` -- the only file that function writes, with the only
+ * update it passes. `countAgents` then answered one more than `listAgents`, which
+ * is the shape of the cap defect this repository already fixed once for the
+ * profile file: a directory that holds a slot no roster shows and no delete can
+ * reach. The delete had not left it behind -- `removeAgentDirOrFail` checks twice
+ * and raises with a list of leftovers instead of answering `deleted`. A summary
+ * that was already in flight rebuilt it.
+ *
+ * An agent that is really there and has lost its file still gets it back; only
+ * the mkdir is gone, exactly as in `ensureProfileFile`.
+ */
+export function ensureSettingsFile(dbPath:string):string{const path=getSandSettingsPath(dirname(dbPath));if(!existsSync(path)&&existsSync(dirname(path)))writeSandSettingsFile(path,{});return path}

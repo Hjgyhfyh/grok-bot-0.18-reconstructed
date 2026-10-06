@@ -44,7 +44,7 @@ export class SettingsService {
     if (update.agentDefaultModel === null) this.store.setAgentDefaultModel(undefined); else if (isSandAgentModelSelection(update.agentDefaultModel)) this.store.setAgentDefaultModel(update.agentDefaultModel);
     if (update.autoReviewInstructions !== undefined) this.store.setAutoReviewInstructions(update.autoReviewInstructions);
     if (update.localToolPermission !== undefined) this.store.setLocalToolPermission(normalizeSandLocalToolPermission(update.localToolPermission));
-    if (update.webauthnProxyEnabled !== undefined) this.store.setWebauthnProxyEnabled(update.webauthnProxyEnabled);
+    if (update.webauthnProxyEnabled !== undefined && typeof update.webauthnProxyEnabled === "boolean") this.store.setWebauthnProxyEnabled(update.webauthnProxyEnabled);
     if (update.pinnedAgentIds !== undefined) this.store.setPinnedAgentIds(update.pinnedAgentIds);
     if (update.sidebarSections !== undefined) this.store.setSidebarSections(update.sidebarSections);
     if (update.hasSeenOnboarding !== undefined) this.store.setHasSeenOnboarding(update.hasSeenOnboarding);

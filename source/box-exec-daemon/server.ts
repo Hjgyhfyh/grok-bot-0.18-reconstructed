@@ -14,7 +14,9 @@ import {
   WINDOWS_COMMAND_INTERPRETER_FALLBACK,
   isWindowsCommandInterpreter,
   readEnvName,
+  withShellTextEnv,
 } from "../packages/shell-exec/shell-env.js";
+import { killProcessTree } from "../packages/local-exec/process-tree.js";
 import { createShellOutputDecoder, resolveConsoleCodePageLabel } from "./shell-output-text.js";
 import { ControlService } from "../packages/proto/generated/agent/v1/control_service_connect.js";
 import { ExecService } from "../packages/proto/generated/agent/v1/exec_service_connect.js";
@@ -1232,7 +1234,23 @@ class BoxExecRuntime {
       interpreter: invocation.file,
       child: spawn(invocation.file, [...invocation.args], {
         cwd,
-        env: this.#environment,
+        // WHAT CHANGED, AND WHY. The environment handed to the child was
+        // `this.#environment` verbatim, with no text defaults in it. This daemon
+        // does not use `buildShellEnv` — it builds its own block — so the fill-in
+        // that keeps a child program's output decodable never reached here.
+        //
+        // Measured on this box, where `chcp` is 65001 and `cmd.exe` therefore
+        // writes UTF-8 while CPython picks CP1251 for its own stdout:
+        //
+        //   `python -c "print('Привет мир')"` -> `╧ЁштхЄьшЁ` (mojibake)
+        //   `python -c "print('日本語')"`     -> exit 1, UnicodeEncodeError
+        //
+        // The defaults are applied HERE, at the spawn, and not into
+        // `#environment`, because `applyEnvironment` deletes every key the host's
+        // update does not mention when `replace` is set. A value stored in the
+        // block would be removed by the first such update; one applied per spawn
+        // survives it, and a value the host did set is still the host's.
+        env: withShellTextEnv(this.#environment),
         detached: process.platform !== "win32",
         stdio: "pipe",
         windowsHide: true,
@@ -1241,12 +1259,57 @@ class BoxExecRuntime {
     };
   }
 
+  /**
+   * WHAT CHANGED, AND WHY. This was `child.kill("SIGTERM")`, which on Windows is
+   * a `TerminateProcess` on exactly one pid: the `cmd.exe` this daemon spawned.
+   * Everything below it kept running, and that leaked in two directions at once.
+   *
+   * 1. The orphan survived. `packages/local-exec/shell-core.ts` names this exact
+   *    failure in its own comment — "`cmd.exe` dies and the `python` it started
+   *    keeps running until something walks the tree" — and answers it with
+   *    `killProcessTree`, which runs `taskkill /T /F` so the tree walks down from
+   *    a shell that is still alive. That helper is what this now uses too.
+   *
+   * 2. The leak held the answer open. Node emits `close` on a child only after
+   *    `exit` and after all three stdio streams reach EOF, and an orphan that
+   *    inherited those pipes keeps them open. So a timeout or a cancel did not
+   *    just leave a process behind: `shellStream`'s wait loop and `run()`'s
+   *    `child.once("close")` both blocked until the orphan exited on its own.
+   *    Measured through this daemon, with the route and the interpreter fixed and
+   *    a grandchild whose own lifetime is 20 s:
+   *
+   *      shellStream, `timeout: 1500`  answered after 19 998 ms
+   *      shellArgs,   `timeout: 1500`  answered after 19 992 ms
+   *      shellStream, client abort     the orphan was still running 1.5 s later
+   *
+   *    With the shell tool's own 30 000 ms default, one command that leaves a
+   *    server running makes the tool wait for that server.
+   *
+   * NOT WIDENED. This changes what a cancel reaches, and only in the direction the
+   * cancel already pointed: the processes the shell was about to be killed as a
+   * group instead of one at a time. The command, the interpreter, the environment,
+   * the working directory and every path check above are untouched, and a command
+   * that is never cancelled never reaches this method.
+   *
+   * The POSIX branch is unchanged and stays first: the daemon spawns `detached`
+   * there, so the shell leads its own process group and `-pid` is the tree.
+   * `killProcessTree` would reach the same place through `/proc`, but a daemon
+   * that also runs on the Linux box it was written for does not need a second
+   * answer to a question the group signal already answers.
+   */
   private kill(child: ChildProcessWithoutNullStreams): void {
     if (child.exitCode != null || child.signalCode != null) return;
-    try {
-      if (process.platform !== "win32" && child.pid != null) process.kill(-child.pid, "SIGTERM");
-      else child.kill("SIGTERM");
-    } catch {}
+    if (process.platform !== "win32" && child.pid != null) {
+      try { process.kill(-child.pid, "SIGTERM"); } catch {}
+      return;
+    }
+    const result = killProcessTree(child.pid);
+    // `killProcessTree` reports `skipped` when there was no pid to name at all,
+    // which happens when the spawn never got that far. The direct kill is the
+    // only thing left then, and it is the behaviour this file had before.
+    if (result.method === "skipped") {
+      try { child.kill("SIGTERM"); } catch {}
+    }
   }
 
   private async run(command: string, cwd: string, timeoutMs: number | undefined, signal: AbortSignal): Promise<ProcessOutcome> {

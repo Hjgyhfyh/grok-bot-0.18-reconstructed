@@ -404,12 +404,24 @@ export function installShutdownHandlers(
     isShuttingDown = true;
     log.log(`[sand-host] received ${signal}, shutting down`);
 
+    // The descriptor is the desktop's only route back to this host, and it
+    // outlives the process unless something removes it. Both exits below do so,
+    // and they do it AWAITED rather than fired and forgotten: `process.exit`
+    // does not wait for a pending `rm`, so a started-but-unawaited clear is a
+    // clear that may never reach disk.
+    const retireDescriptor = async (): Promise<void> => {
+      try { await clearGatewayDiscovery(); }
+      catch (error) { host.reportProcessCrash(error, "shutdown_discovery_error"); }
+    };
+
     const watchdog = setTimeout(() => {
-      host.reportProcessCrash(null, "shutdown_watchdog");
-      void host.flushTelemetryForFatalExit().finally(() => {
+      void (async () => {
+        host.reportProcessCrash(null, "shutdown_watchdog");
+        await host.flushTelemetryForFatalExit();
+        await retireDescriptor();
         hostLock.release();
         processControl.exit(1);
-      });
+      })();
     }, watchdogMs);
     watchdog.unref();
 
@@ -418,12 +430,12 @@ export function installShutdownHandlers(
         await gateway.close();
         await host.dispose();
         await boxExecDaemon?.close();
-        await clearGatewayDiscovery();
       } catch (error) {
         host.reportProcessCrash(error, "shutdown_error");
         await host.flushTelemetryForFatalExit();
       } finally {
         clearTimeout(watchdog);
+        await retireDescriptor();
         hostLock.release();
         processControl.exit(0);
       }

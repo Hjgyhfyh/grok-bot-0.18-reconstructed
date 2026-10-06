@@ -132,6 +132,41 @@ function requirePath(args: unknown, field: string, command: string): string {
 }
 
 /**
+ * A request field that must arrive as one of a fixed set of words.
+ *
+ * Both permission answers are a decision, and both were read as free strings.
+ * `resolveAutoReviewApproval` never looked at `resolution` at all: it went
+ * straight into `SandAutoReviewController.resolveApproval`, whose only test was
+ * `resolution === "denied"`, so `"denied "`, `"Denied"`, `"no"` and `""` all
+ * took the approve branch and released an action Auto-review had blocked. The
+ * local-tool command refused the same value, but one layer down, through a
+ * refusal class nothing classifies, so it answered `500` and named no field.
+ *
+ * The check runs before the extension, which is what makes it a `400`: the host
+ * read the request and declined it on its own terms.
+ */
+function requireOneOf(
+  args: unknown,
+  field: string,
+  command: string,
+  allowed: readonly string[],
+): string {
+  const value = requireText(args, field, command);
+  if (!allowed.includes(value)) {
+    throw malformed(
+      command,
+      `"${field}" must be one of ${allowed.map((word) => `"${word}"`).join(", ")}, and ${JSON.stringify(value)} arrived.`,
+    );
+  }
+  return value;
+}
+
+/** The four answers a local-tool permission card can carry. */
+const SAND_LOCAL_TOOL_RESOLUTIONS = ["allow-once", "deny", "always", "never"] as const;
+/** The two answers an auto-review approval card can carry. */
+const SAND_AUTO_REVIEW_RESOLUTIONS = ["approved", "denied"] as const;
+
+/**
  * A request field that must arrive as a plain object, not an array.
  *
  * `createAgentWorkflow` and `updateAgentWorkflow` read `spec.trigger` and
@@ -254,6 +289,37 @@ export function createHostGatewayApi(
   const sharing = deps.extensions.api("cross-user-sharing");
   const now = deps.now ?? Date.now;
   const createAgentMintsByNonce = new Map<string, Promise<any>>();
+  /**
+   * The agent each settled nonce minted.
+   *
+   * The ledger above answers "has this create already run?", and for as long as
+   * the answer is about an agent that still exists that is the whole contract.
+   * Deleting the agent broke it: nothing removed the entry, so the next create
+   * carrying that nonce was handed the same promise and answered `200` with an id
+   * whose directory was gone, under the old profile, while `listAgents` did not
+   * list it. Measured on a live box: create with a nonce, delete the agent it
+   * minted, create again with the same nonce -> `200` with the deleted id, the
+   * old name, and an unchanged `countAgents`. `createAgent` makes its answer the
+   * active session, so the app lands on a conversation with no directory.
+   *
+   * The id is recorded when the mint settles, which is the moment a delete can
+   * have something to match against: a caller can only name an agent it was
+   * already handed. A delete that arrives while its create is still in flight has
+   * no id to retire by, and that one create is the whole width of the window.
+   */
+  const createAgentIdsByNonce = new Map<string, string>();
+  const forgetMintsForDeletedAgents = (agentIds: unknown): void => {
+    const gone = new Set<string>();
+    for (const id of (agentIds ?? []) as unknown[]) {
+      if (typeof id === "string" && id.length > 0) gone.add(id);
+    }
+    if (gone.size === 0) return;
+    for (const [nonce, agentId] of createAgentIdsByNonce) {
+      if (!gone.has(agentId)) continue;
+      createAgentIdsByNonce.delete(nonce);
+      createAgentMintsByNonce.delete(nonce);
+    }
+  };
 
   const markActive = (reason: "user_action" | "app_open") => {
     method(telemetry.analytics, "markActive")(reason);
@@ -285,6 +351,68 @@ export function createHostGatewayApi(
     const fields: Record<string, unknown> = {};
     for (const key of AGENT_PROFILE_CREATE_FIELDS) {
       const value = nested[key] !== undefined ? nested[key] : args?.[key];
+      if (value !== undefined) fields[key] = value;
+    }
+    return fields;
+  };
+
+  /**
+   * The profile of an update request, refusing the flat shape by name.
+   *
+   * `updateAgent` reads `args.profile` and nothing else, which is the shape the
+   * renderer sends (`frontend/src/production/ProductionRenderer.tsx:3074`,
+   * `inference-router.ts:157`) and the shape `createAgent` documents. A caller
+   * that sends the fields flat used to get `200` and an unchanged record, because
+   * `createAgent` reads both shapes and the pair disagreed about one command
+   * family on one surface. Measured on a live box, on one agent, one call apart:
+   *
+   *   POST /api/updateAgent {"id":…,"profile":{"name":"QA-Flat-Renamed"}}  200 name "QA-Flat-Renamed"
+   *   POST /api/updateAgent {"id":…,"name":"QA-Flat-Name-Only"}             200 name "QA-Flat-Renamed"
+   *
+   * Accepting the flat shape was tried first and is the wrong answer here: it
+   * makes one wire shape mean two things across the family, and the day a field
+   * is added to the flat form and not the nested one the two drift apart again
+   * with nothing to catch it. A shape the host does not take is refused with the
+   * shape it does take in the sentence, so the caller can fix the call instead of
+   * reading a `200` as a save.
+   *
+   * The refusal is `SandGatewayRequestError`, the class `statusForCommandError`
+   * answers `400`: the request arrived and the host is declining it, which is the
+   * fact — the agent is there, the body is wrong. Not `404`, which would say the
+   * id names nothing, and not `500`, which would say the host broke.
+   */
+  const updateProfileFields = (args: any): Record<string, unknown> => {
+    const nested = args?.profile;
+    const carriesProfile =
+      typeof nested === "object" && nested !== null && !Array.isArray(nested);
+    // Root fields are only a shape when the request did not also carry the
+    // nested one: a mixed body takes every field from the side that has it, and
+    // that body is a working call, not a typo.
+    const flat = carriesProfile
+      ? []
+      : AGENT_PROFILE_CREATE_FIELDS.filter(
+          (key) => (args as Record<string, unknown> | undefined)?.[key] !== undefined,
+        );
+    if (flat.length > 0)
+      throw new SandGatewayRequestError(
+        `updateAgent expects the profile nested under "profile": {"id":…,"profile":{"name":…}}. ` +
+          `${flat.map((key) => `"${key}"`).join(", ")} ` +
+          `${flat.length === 1 ? "was" : "were"} sent at the top level of the request, ` +
+          `where this command does not read ${flat.length === 1 ? "it" : "them"}. ` +
+          `createAgent reads both shapes; updateAgent takes only the nested one.`,
+      );
+    if (!carriesProfile) {
+      if (nested !== undefined)
+        throw new SandGatewayRequestError(
+          `"profile" must be an object carrying the agent's fields, but ${
+            Array.isArray(nested) ? "an array" : typeof nested
+          } arrived.`,
+        );
+      return {};
+    }
+    const fields: Record<string, unknown> = {};
+    for (const key of AGENT_PROFILE_CREATE_FIELDS) {
+      const value = (nested as Record<string, unknown>)[key];
       if (value !== undefined) fields[key] = value;
     }
     return fields;
@@ -405,9 +533,35 @@ export function createHostGatewayApi(
     ]);
     const mcp = deps.extensions.api("mcp").mcp;
     const executor = method(mcp, "createExecutor")(undefined, undefined, { agentId: args.agentId });
+    /**
+     * The two names are passed through, not swapped.
+     *
+     * `listRoutedMcpTools` above publishes rows in the one shape every MCP tool
+     * call in the product already uses: `name` is the routed name the tool is
+     * listed and called by, and `toolName` is the bare name the server itself
+     * advertises. The box builds the pair itself (`server.ts:926`,
+     * `name: \`${live.name}-${tool.name}\`` against `toolName: tool.name`), and a
+     * real turn builds it the same way in `buildMcpArgs`
+     * (`packages/agent/tools/mcp/mcp.ts:221-228`).
+     *
+     * This command used to hand the executor the two fields the other way round,
+     * and nothing reported it: discovery succeeds, the listing is not empty, and
+     * the failure only appears when the tool is called. Measured against a live
+     * `BoxExecRuntime` and the repository's own `echo` MCP server, every tool the
+     * listing published came back `toolNotFound` — the daemon resolves a tool by
+     * its bare name (`server.ts:958`) and was asked for the prefixed one, while
+     * naming the two tools the caller had just been shown in `availableTools`.
+     *
+     * The same swap silently disabled the per-tool toggle. `executeTool` refuses
+     * a tool the user turned off by comparing `getMcpDisabledToolsByServerId()`
+     * against `args.toolName` (`tools-discovery.ts:522`), and the listing filters
+     * that same list against `tool.toolName` (`tools-discovery.ts:132`). Comparing
+     * a prefixed name against a list of bare names never matches, so the toggle
+     * only hid the tool and never refused the call.
+     */
     return await method(executor, "execute")({}, {
-      name: args.toolName,
-      toolName: args.name,
+      name: args.name,
+      toolName: args.toolName,
       providerIdentifier: args.providerIdentifier,
       args: args.args,
       toolCallId: args.toolCallId,
@@ -531,6 +685,7 @@ export function createHostGatewayApi(
     resolveAutoReviewApproval: (args: any) => {
       markActive("user_action");
       requirePath(args, "agentId", "resolveAutoReviewApproval");
+      requireOneOf(args, "resolution", "resolveAutoReviewApproval", SAND_AUTO_REVIEW_RESOLUTIONS);
       return method(
         deps.extensions.api("auto-review"),
         "resolveApproval"
@@ -539,6 +694,7 @@ export function createHostGatewayApi(
     resolveLocalToolPermission: async (args: any) => {
       markActive("user_action");
       requireText(args, "resolution", "resolveLocalToolPermission");
+      requireOneOf(args, "resolution", "resolveLocalToolPermission", SAND_LOCAL_TOOL_RESOLUTIONS);
       await method(localToolPermission, "resolveAsk")(args);
     },
     /**
@@ -584,11 +740,18 @@ export function createHostGatewayApi(
      * agent is told the user never answered — which is true and is not what
      * happened.
      *
-     * The answer is a LIST, not a single object and not a `404`. At most one ask
-     * per agent is open at a time in practice, but the shape has to survive an
-     * agent that opens a second one while this caller was mid-poll, and an empty
-     * list has to read as "nobody is waiting on you" — the normal state of every
-     * agent, polled on a timer — rather than as a missing endpoint. `requirePath`
+     * The answer is a LIST, and every open question is in it. The paragraph here
+     * used to say that at most one ask per agent is open at a time "in practice"
+     * and the code read the first one and stopped. That was wrong: the model puts
+     * two local tool calls in one assistant message, `tool-stream-executor.ts`
+     * runs them with `Promise.all`, and `askKey` holds the `toolCallId`, so two
+     * questions for one agent really are open at once. The second one was invisible
+     * to this command and to every other reader of the queue, so the agent call
+     * behind it waited out the full ten minutes and then reported that the user had
+     * never answered — the exact silence this command was added to end. An empty
+     * list is still a real answer and not a `404`: "nobody is waiting on you" is
+     * the normal state of every agent, polled on a timer, and it has to stay
+     * different from "there is no such command", which is a typo. `requirePath`
      * names `agentId` in the refusal for the same reason the neighbours above do:
      * a caller holding `{}` is told which field to fix instead of being handed a
      * V8 sentence about a `Map`.
@@ -599,10 +762,12 @@ export function createHostGatewayApi(
      */
     listPendingLocalToolPermissions: (args: any) => {
       markActive("user_action");
-      const ask = method(localToolPermission, "getPendingRequestForAgent")(
+      return method(
+        localToolPermission,
+        "getPendingRequestsForAgent",
+      )(
         requirePath(args, "agentId", "listPendingLocalToolPermissions"),
       );
-      return ask == null ? [] : [ask];
     },
     dismissWidget: (args: any) => {
       markActive("user_action");
@@ -668,13 +833,25 @@ export function createHostGatewayApi(
       if (pending != null) return pending;
 
       const minted = mintAgent(args);
-      createAgentMintsByNonce.set(nonce, minted);
-      void minted.catch(() => createAgentMintsByNonce.delete(nonce));
+      // The id is read off the settled answer, which is the only place it exists
+      // for the ledger to retire it by.
+      const recorded = minted.then((result: any) => {
+        const agentId = result?.agent?.id;
+        if (typeof agentId === "string" && agentId.length > 0)
+          createAgentIdsByNonce.set(nonce, agentId);
+        return result;
+      });
+      createAgentMintsByNonce.set(nonce, recorded);
+      void recorded.catch(() => {
+        createAgentMintsByNonce.delete(nonce);
+        createAgentIdsByNonce.delete(nonce);
+      });
       for (const oldest of createAgentMintsByNonce.keys()) {
         if (createAgentMintsByNonce.size <= CREATE_AGENT_NONCE_LEDGER_CAP) break;
         createAgentMintsByNonce.delete(oldest);
+        createAgentIdsByNonce.delete(oldest);
       }
-      return minted;
+      return recorded;
     },
     /**
      * `kickstartAgent` and `requestDiskSaverAudit` take no path through a store,
@@ -705,10 +882,14 @@ export function createHostGatewayApi(
     setGroupMembers: (args: any) =>
       method(manager, "setGroupMembers")(
         requirePath(args, "id", "setGroupMembers"), args.memberAgentIds),
+    // Only the nested shape, and the refusal for the flat one names it. The
+    // comment above `updateProfileFields` has the measurement; `createAgent`
+    // reads both shapes and still does, because a create's flat form is what
+    // every caller that predates the nested one has always sent.
     updateAgent: (args: any) =>
       method(manager, "updateAgent")(
         requirePath(args, "id", "updateAgent"),
-        args.profile,
+        updateProfileFields(args),
       ),
     deleteAgent: async (args: any) => {
       // Measured on a live box: `POST /api/deleteAgent {}` answered
@@ -722,6 +903,7 @@ export function createHostGatewayApi(
         () => undefined
       );
       const result = await method(manager, "deleteAgent")(agentId);
+      forgetMintsForDeletedAgents(result?.deleted);
       const cleanupFailures = await forgetDeletedAgent(agentId);
       return cleanupFailures.length === 0
         ? result
@@ -741,7 +923,24 @@ export function createHostGatewayApi(
         }
       }
       const result = await method(manager, "deleteAgents")(ids);
-      for (const id of ids) cleanupFailures.push(...(await forgetDeletedAgent(id)));
+      // Only the ids the store actually removed retire a nonce. An id in `failed`
+      // is still on disk, and its ledger entry is still the truth.
+      forgetMintsForDeletedAgents(result?.deleted);
+      // The bookkeeping below is four deletes of their own — the cloud automation
+      // sync, the box handoff, the box lease and the notification baseline — so it
+      // runs for the agents that are gone and not for the ones the same answer
+      // reports as still on disk. Measured on a live box: a batch whose delete
+      // lost a race with an open file handle answered `200` with the id in
+      // `failed`, and that agent's automations, handoff, lease and push baseline
+      // were destroyed anyway. An id this process removed earlier
+      // (`alreadyDeletedAgentIds`) really is gone, so its bookkeeping still runs;
+      // an id nobody ever created (`missingAgentIds`) has nothing to forget.
+      const removed = [
+        ...((result?.deleted ?? []) as string[]),
+        ...((result?.alreadyDeletedAgentIds ?? []) as string[]),
+      ];
+      for (const id of new Set(removed))
+        cleanupFailures.push(...(await forgetDeletedAgent(id)));
       return cleanupFailures.length === 0
         ? result
         : { ...result, cleanupFailures };

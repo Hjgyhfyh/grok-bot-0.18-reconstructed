@@ -10,7 +10,7 @@ const INT32_MAX = 2 ** 31 - 1;
 function clampInt32(value: number): number { if(Number.isNaN(value))return 0;return Math.max(-(2**31),Math.min(INT32_MAX,value)); }
 export interface LsIgnoreService { listCursorIgnoreFilesByRoot(root:string):Promise<readonly string[]>;getRepoBlockExcludeGlobs(root:string):Promise<readonly string[]>;isRepoBlocked(path:string):Promise<boolean>|boolean }
 export interface LsTraversalRuntime { walk(ctx:Context,args:{root:string;excludeGlobs:readonly string[];cursorIgnoreFiles:readonly string[];sandboxPolicy?:unknown;source:"ls"}):{lines:AsyncIterable<string>;didTimeout:Promise<boolean>};resolveForIgnore(path:string):Promise<string|null> }
-export class MissingLsTraversalBindingError extends Error { constructor(){super("");this.name="MissingLsTraversalBindingError";} }
+export class MissingLsTraversalBindingError extends Error { constructor(){super("the local-exec ls executor was constructed without a directory traversal runtime, so it cannot list anything");this.name="MissingLsTraversalBindingError";} }
 export class LocalLsExecutor {
   constructor(private readonly _permissionsService:unknown,private readonly ignoreService:LsIgnoreService,private readonly workspacePath:string,private readonly traversal?:LsTraversalRuntime){}
   async execute(parentCtx:Context,args:{readonly path:string;readonly ignore?:readonly string[];readonly timeoutMs?:number;readonly sandboxPolicy?:unknown}):Promise<LsResult>{

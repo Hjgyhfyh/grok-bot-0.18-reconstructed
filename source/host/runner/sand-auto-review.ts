@@ -4,6 +4,18 @@ export const SAND_AUTO_REVIEW_APPROVAL_TTL_MS = 10 * 60 * 1_000;
 export const SAND_AUTO_REVIEW_MAX_PENDING_PER_AGENT = 4;
 export const SAND_AUTO_REVIEW_HOST_GENERATION = randomUUID();
 
+/**
+ * The only two answers an approval card can carry.
+ *
+ * `resolveApproval` used to branch on `resolution === "denied"` alone, so every
+ * other value took the approve branch: a trailing space, a capital `D`, `"no"`,
+ * `""`, or a caller that sent the field as something else entirely released an
+ * action Auto-review had just blocked. A guard that spells its refusals wrong
+ * has to refuse, not consent, and the refusal that can no longer be parsed must
+ * not be allowed to look like consent.
+ */
+export function isSandAutoReviewResolution(value: unknown): value is SandAutoReviewResolution { return value === "approved" || value === "denied"; }
+
 export type SandAutoReviewMode = "off" | "shadow" | "enforce";
 export type SandAutoReviewSurface = "hostShell" | "boxShell" | "mcp" | "computer" | "automationWrite" | "cloudAgent" | "subagentLaunch" | string;
 export type SandAutoReviewResolution = "approved" | "denied";
@@ -148,6 +160,10 @@ export class SandAutoReviewController {
   resolveApproval(approvalId: string, resolution: SandAutoReviewResolution): SandAutoReviewApproval | undefined {
     const record = this.#pending.get(approvalId);
     if (record === undefined || record.approval.hostGeneration !== this.options.hostGeneration || record.approval.userMessageEpoch !== this.#userMessageEpoch || (record.approval.expiresAtMs !== undefined && record.approval.expiresAtMs <= this.#now())) return undefined;
+    // An answer that is neither of the two words is not an answer. It must not
+    // fall through to the approve branch, and it must not consume the pending
+    // record either: the card stays on screen so the user can answer it properly.
+    if (!isSandAutoReviewResolution(resolution)) return undefined;
     const resolved: SandAutoReviewApproval = { ...record.approval, status: resolution };
     this.#deletePending(approvalId, record); this.#emit({ type: "resolved", approval: resolved });
     record.resolve(resolution === "denied" ? { approved: false, reason: formatSandAutoReviewDeniedReason(record.approval.reason) } : { approved: true });

@@ -1447,6 +1447,25 @@ function isTurnContext(value: unknown): value is Context {
 }
 
 /**
+ * A launch the classifier was never shown.
+ *
+ * `buildSandSubagentLaunchReviewTarget` returns nothing for exactly one input: a
+ * prompt that is empty once trimmed. The branch used to read that as
+ * `{allowed:true}` — an unreviewable request treated as a reviewed one, which is
+ * the fail-open shape the whole Auto-review gate is built to avoid, and it is
+ * not a theoretical one: `SandSubagentHostAdapter.runSession` reads
+ * `review.allowed` as the only gate and dispatches on `!review.allowed` being
+ * false, so the blank-prompt launch started a real subagent with a real tool
+ * surface and no classifier ever saw it.
+ *
+ * A blank prompt is also not a task: there is nothing for the subagent to do,
+ * so refusing it costs a turn of the agent's own work and denies nothing a
+ * person asked for.
+ */
+export const SAND_SUBAGENT_LAUNCH_UNREVIEWABLE_REASON =
+  "Auto-review cannot review a subagent launch with no task in it, so nothing was launched. Send the subagent a prompt that says what it should do, or do the work yourself.";
+
+/**
  * Creates the immutable launch-review callback. The callback is intentionally
  * built from the final CombinedResourceAccessor: classifier lookup, active
  * state, approval, expiry, and cancellation are all per-run identities.
@@ -1473,7 +1492,10 @@ export function createTurnSubagentLaunchReviewer(
       ...(args.readonly === undefined ? {} : { readonly: args.readonly }),
       resume: args.resumeAgentId !== undefined && args.resumeAgentId.length > 0,
     });
-    if (target === undefined) return { allowed: true, reason: "" };
+    // An input the gate cannot classify is a refusal, never a consent. Every
+    // other unreachable-here input has a named reason and this one had `""`,
+    // which the adapter read as "reviewed, and fine".
+    if (target === undefined) return { allowed: false, reason: SAND_SUBAGENT_LAUNCH_UNREVIEWABLE_REASON };
     input.autoReviewGate.assertNoPendingApproval();
     return reviewSandSubagentAction({
       ctx: context,

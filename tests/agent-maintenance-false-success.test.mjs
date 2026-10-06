@@ -251,7 +251,15 @@ function createGatewayDeps({
   const extensions = {
     api(id) {
       if (id === "transcript")
-        return stub({ deleteAgents: async () => ({ transcript: [] }), ...transcript });
+        return stub({
+          // The batch delete runs its post-delete bookkeeping for the agents the
+          // store says it removed, not for every id the caller sent — a target
+          // the delete lost a race with is still on disk and still needs its
+          // automations, its handoff and its box lease. A stub that answers
+          // "nothing was deleted" therefore has no bookkeeping to run.
+          deleteAgents: async (ids) => ({ transcript: [], deleted: [...ids], failed: [] }),
+          ...transcript,
+        });
       if (id === "session") return stub({ forgetHandoff: (agentId) => onForgetHandoff(agentId) });
       if (id === "automations") return stub({ deleteAgentSchedules: async () => undefined });
       if (id === "cross-user-sharing") return stub({ noteAgentDeleted: async () => undefined });

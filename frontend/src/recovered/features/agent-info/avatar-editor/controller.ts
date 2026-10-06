@@ -23,7 +23,11 @@ export interface AvatarEditorAgent {
 
 export interface AvatarEditorRoster {
   setAgentAvatarBytes(args: { readonly id: string; readonly pngBase64: string | null }, options?: { readonly signal?: unknown }): Promise<unknown>;
-  updateAgent?(args: { readonly id: string; readonly avatarShape?: string; readonly avatarColor?: string }): Promise<unknown>;
+  // The shape and the colour belong under `profile`, which is where `updateAgent`
+  // reads them. Sent at the top level of the request they were dropped and the
+  // call answered `200`, so picking a character was a no-op with a saved-looking
+  // dialog; the host refuses that body now, with the expected shape in the error.
+  updateAgent?(args: { readonly id: string; readonly profile: { readonly avatarShape?: string; readonly avatarColor?: string } }): Promise<unknown>;
 }
 
 export interface AvatarEditorSnapshot {
@@ -212,7 +216,7 @@ export function createAvatarEditorController(options: AvatarEditorControllerOpti
       if (options.roster.updateAgent == null) return false;
       patch({ isCommitting: true, error: null });
       try {
-        await options.roster.updateAgent({ id: options.agent.id, avatarShape: nextCharacter.avatarShape ?? "", avatarColor: nextCharacter.avatarColor ?? "" });
+        await options.roster.updateAgent({ id: options.agent.id, profile: { avatarShape: nextCharacter.avatarShape ?? "", avatarColor: nextCharacter.avatarColor ?? "" } });
         if (!disposed) patch({ persistedCharacter: nextCharacter, stagedCharacter: null, isCommitting: false, error: null });
         return true;
       } catch (error) {
@@ -225,7 +229,7 @@ export function createAvatarEditorController(options: AvatarEditorControllerOpti
       const nextCharacter = snapshot.stagedCharacter;
       patch({ isCommitting: true, error: null });
       try {
-        await options.roster.updateAgent({ id: options.agent.id, avatarShape: nextCharacter.avatarShape ?? "", avatarColor: nextCharacter.avatarColor ?? "" });
+        await options.roster.updateAgent({ id: options.agent.id, profile: { avatarShape: nextCharacter.avatarShape ?? "", avatarColor: nextCharacter.avatarColor ?? "" } });
         if (snapshot.hasExistingAvatar) await options.roster.setAgentAvatarBytes({ id: options.agent.id, pngBase64: null });
         if (!disposed) patch({ persistedCharacter: nextCharacter, stagedCharacter: null, source: null, crop: null, fileName: null, hasExistingAvatar: false, isCommitting: false, error: null });
         return true;
@@ -238,7 +242,7 @@ export function createAvatarEditorController(options: AvatarEditorControllerOpti
       if (disposed || snapshot.isSaving || snapshot.isCommitting || options.roster.updateAgent == null) return false;
       patch({ isCommitting: true, error: null });
       try {
-        await options.roster.updateAgent({ id: options.agent.id, avatarShape: "", avatarColor: "" });
+        await options.roster.updateAgent({ id: options.agent.id, profile: { avatarShape: "", avatarColor: "" } });
         if (!disposed) patch({ persistedCharacter: { avatarShape: null, avatarColor: null }, stagedCharacter: null, isCommitting: false, error: null });
         return true;
       } catch (error) {

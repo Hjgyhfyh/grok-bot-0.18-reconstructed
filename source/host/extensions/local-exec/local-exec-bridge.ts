@@ -63,19 +63,72 @@ export class SandLocalExecBridge {
   getProviderInfo(): LocalExecProviderInfo | undefined { return (this.resolveProvider(undefined) ?? [...this.providers].at(-1))?.info; }
   submitResponses(batch: { readonly providerId?: string; readonly frames?: readonly LocalExecBridgeFrame[] }): void {
     const provider = this.providerForBatch(batch.providerId);
+    // WHAT AN UNATTRIBUTED BATCH IS ALLOWED TO DO. A batch with no `providerId`
+    // is what the shipped desktop sends before it has read its own `welcome`
+    // frame - `SandLocalExecProvider.streamRequests` posts `hello` at
+    // `local-exec-provider.ts:116` and only fills `this.providerId` in from the
+    // stream afterwards, and its `finally` sets the field back to `undefined`
+    // when the stream drops - so the first `hello` and the first `ping` of every
+    // connect carry no id at all. Those are credited to the most recently
+    // registered desktop, and that credit is limited on purpose: it may describe
+    // a desktop that has not described ITSELF yet, and nothing else.
+    //
+    // WHY THE LIMIT. The fallback used to be unconditional, so any batch that
+    // named no desktop - or named one that had already disconnected - was
+    // applied to whichever desktop registered last. Measured through the real
+    // gateway with the real provider class on the wire: an unattributed `ping`
+    // flipped a desktop that had been silent for longer than the 30 s liveness
+    // window back to `connected:true`, and an unattributed `hello` replaced the
+    // one live desktop with `{id:"pc-GHOST", label:"GHOST"}` and
+    // `getProviderInfo()` pointing at a `localRoot` no daemon on this machine
+    // had ever declared. Every later read, upload and download resolves its path
+    // against that root. An `hello` or a `ping` from a sender we cannot name is
+    // therefore refused for any desktop that has already named itself.
+    //
+    // ANSWERS ARE STILL DELIVERED. Only identity and heartbeat are gated. A
+    // `client`, `control` or `file` frame carries a `requestId`, is delivered by
+    // it, and is delivered whether or not the batch named a desktop that is
+    // still here: a desktop that loses its stream in the middle of a command is
+    // ordinary, and the host is holding that command open. Gating the identity
+    // must not turn a late answer into a hung turn.
+    const mayDescribe = provider !== undefined && (batch.providerId !== undefined || provider.info === undefined);
     for (const frame of batch.frames ?? []) {
-      if (frame.kind === "hello") { if (provider !== undefined && typeof frame.localRoot === "string" && typeof frame.terminalsFolder === "string") { const rehello = provider.info !== undefined; provider.info = { localRoot: frame.localRoot, terminalsFolder: frame.terminalsFolder }; if (typeof frame.computerId === "string" && frame.computerId.length > 0) provider.computerId = frame.computerId; if (typeof frame.label === "string" && frame.label.length > 0) provider.label = frame.label; if (typeof frame.supervised === "boolean") provider.supervised = frame.supervised; if (typeof frame.variant === "string" && frame.variant.length > 0) provider.variant = frame.variant; provider.lastSeenAt = this.deps.clock.now(); const variant = boundedLocalExecVariant(provider.variant); this.deps.report?.provider?.({ phase: "hello", providerId: provider.id, providerCount: this.providers.size, helloDelayMs: provider.lastSeenAt - provider.registeredAt, computerIdPresent: provider.computerId !== undefined, rehello, ...(provider.supervised === undefined ? {} : { supervised: provider.supervised }), ...(variant === undefined ? {} : { variant }) }); } continue; }
-      if (frame.kind === "ping") { if (provider !== undefined) { provider.hasHeartbeat = true; provider.lastSeenAt = this.deps.clock.now(); if (typeof frame.supervised === "boolean") provider.supervised = frame.supervised; } continue; }
+      if (frame.kind === "hello") { if (provider !== undefined && mayDescribe && typeof frame.localRoot === "string" && typeof frame.terminalsFolder === "string") { const rehello = provider.info !== undefined; provider.info = { localRoot: frame.localRoot, terminalsFolder: frame.terminalsFolder }; if (typeof frame.computerId === "string" && frame.computerId.length > 0) provider.computerId = frame.computerId; if (typeof frame.label === "string" && frame.label.length > 0) provider.label = frame.label; if (typeof frame.supervised === "boolean") provider.supervised = frame.supervised; if (typeof frame.variant === "string" && frame.variant.length > 0) provider.variant = frame.variant; provider.lastSeenAt = this.deps.clock.now(); const variant = boundedLocalExecVariant(provider.variant); this.deps.report?.provider?.({ phase: "hello", providerId: provider.id, providerCount: this.providers.size, helloDelayMs: provider.lastSeenAt - provider.registeredAt, computerIdPresent: provider.computerId !== undefined, rehello, ...(provider.supervised === undefined ? {} : { supervised: provider.supervised }), ...(variant === undefined ? {} : { variant }) }); } continue; }
+      if (frame.kind === "ping") { if (provider !== undefined && mayDescribe) { provider.hasHeartbeat = true; provider.lastSeenAt = this.deps.clock.now(); if (typeof frame.supervised === "boolean") provider.supervised = frame.supervised; } continue; }
       if (typeof frame.requestId === "string") this.pending.get(frame.requestId)?.push(frame);
     }
   }
-  private providerForBatch(providerId?: string): Provider | undefined { return (providerId === undefined ? undefined : this.byId.get(providerId)) ?? [...this.providers].at(-1); }
+  /**
+   * Which desktop sent this batch.
+   *
+   * A batch that named a desktop is that desktop's and nobody else's. It used to
+   * be `(lookup ?? mostRecentlyRegistered)`, so a batch naming a desktop that
+   * had disconnected was answered by handing it to a different one - see the
+   * limit `submitResponses` places on an unattributed batch for the other half
+   * of this. A batch that named nobody keeps the fallback, because that is the
+   * only shape the shipped desktop sends before it has read its welcome.
+   */
+  private providerForBatch(providerId?: string): Provider | undefined { return providerId === undefined ? [...this.providers].at(-1) : this.byId.get(providerId); }
   retireApproval(approvalId: string): void { for (const provider of this.providers) { try { provider.send({ kind: "retire-approval", requestId: this.deps.randomId?.() ?? randomUUID(), approvalId }); } catch {} } }
   async *request(context: LocalExecBridgeContext, frame: LocalExecBridgeFrame, computerId?: string, options?: { readonly watchResponse?: boolean }): AsyncGenerator<LocalExecBridgeFrame> {
     const blocked = this.deps.blockedReason(); if (blocked !== undefined) throw new SandLocalExecError(blocked); const provider = this.requireProvider(computerId, { site: frame.kind, ...(context.agentId === undefined ? {} : { agentId: context.agentId }) }); const requestId = this.deps.randomId?.() ?? randomUUID(); const queue = new FrameQueue(); this.pending.set(requestId, queue);
     const sendCancel = () => { try { provider.send({ kind: "cancel", requestId }); } catch {} }; const onAbort = () => { sendCancel(); queue.close(); }; if (context.signal.aborted) onAbort(); else context.signal.addEventListener("abort", onAbort, { once: true }); let timedOut = false; let responseWatchdog: ReturnType<IdleWatchdogPolicy["arm"]> | undefined;
     const armResponseWatchdog = () => { if (options?.watchResponse !== true) return; if (responseWatchdog === undefined) responseWatchdog = this.deps.responseWatchdog.arm(() => { timedOut = true; sendCancel(); queue.close(); }); else responseWatchdog.kick(); };
-    try { provider.send({ requestId, ...frame }); armResponseWatchdog(); for await (const response of queue) { armResponseWatchdog(); yield response; } if (timedOut) throw new SandLocalExecError(sandComputerUnavailableMessage(provider.label)); }
+    try {
+      // The bridge's id is written LAST, and that order is load-bearing.
+      // `LocalExecBridgeFrame` declares `requestId?: string` on the frame, so a
+      // caller may set it, and this used to be `{ requestId, ...frame }` — which
+      // let the caller's field win. The request then went out under one id and
+      // registered its queue under another, so the answer arrived for a key the
+      // bridge had no waiter for: the generator never yielded, never returned and
+      // never threw. Measured against this class, a frame carrying
+      // `requestId:"caller-chosen"` received nothing at all, and two concurrent
+      // frames sharing one `requestId` left 0 of 2 requests answered, because
+      // `pending` holds one queue per id and the first generator's `finally`
+      // deletes the second's entry. Spreading the caller's frame first and
+      // stamping the generated id last is what makes the wire and the queue
+      // agree; nothing else about the frame is touched.
+      provider.send({ ...frame, requestId }); armResponseWatchdog(); for await (const response of queue) { armResponseWatchdog(); yield response; } if (timedOut) throw new SandLocalExecError(sandComputerUnavailableMessage(provider.label)); }
     finally { responseWatchdog?.dispose(); this.pending.delete(requestId); queue.close(); context.signal.removeEventListener("abort", onAbort); if (!context.signal.aborted) sendCancel(); }
   }
 }

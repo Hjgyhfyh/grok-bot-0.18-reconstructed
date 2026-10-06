@@ -74,8 +74,26 @@ export function reportMcpHostEdgeDegraded(leg: string, errorClass: string): void
   emitMcpDiagnostic({ leg, errorClass });
 }
 
-export function recordMcpExecErrorClass(toolCallId: string, error: unknown): void {
-  if (toolCallId.length === 0) return;
+/**
+ * Remembers which error class a failed tool call produced, so the caller can ask
+ * for it after the failure has already travelled back as a result.
+ *
+ * `toolCallId` is absent whenever the caller is not a turn. `buildMcpArgs`
+ * (`packages/agent/tools/mcp/mcp.ts:224`) always carries one, so every turn
+ * reaches this with a string; `executeRoutedMcpTool` passes the HTTP body's
+ * field straight through and `requireFields` does not ask for it, so the routed
+ * command arrives with none.
+ *
+ * Reading `.length` off that arrival threw `TypeError: Cannot read properties of
+ * undefined (reading 'length')` from inside `createBoxSandMcpExec.executeTool`'s
+ * own catch block — the block whose whole job is to turn a failure into an error
+ * result. Measured: with no `toolCallId`, every box-side failure escaped
+ * `executeRoutedMcpTool` as an exception and the gateway answered HTTP 500 with
+ * that V8 sentence, naming no command, no field and no cause. An absent id means
+ * there is nothing to record against, which is the case this now handles.
+ */
+export function recordMcpExecErrorClass(toolCallId: string | undefined, error: unknown): void {
+  if (typeof toolCallId !== "string" || toolCallId.length === 0) return;
   if (execErrorClassByToolCallId.size >= EXEC_ERROR_CLASS_CAP) {
     const oldest = execErrorClassByToolCallId.keys().next().value;
     if (oldest != null) execErrorClassByToolCallId.delete(oldest);

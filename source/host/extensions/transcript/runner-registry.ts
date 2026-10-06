@@ -87,9 +87,9 @@ export class RunnerRegistry {
       (runner?.hasRunningSubagents?.() === true) ||
       (groupRunner?.hasRunningSubagents?.() === true);
     // Both runners are called, unconditionally, before the flags are combined.
-    // They used to be folded into one `a || b`, which short-circuits: an agent
-    // with a live direct-chat runner answered `true` and the group-member runner
-    // was never asked, so the stop stopped the direct turn and left the group room
+    // A single `a || b` here would short-circuit: an agent with a live
+    // direct-chat runner would answer `true` and the group-member runner would
+    // never be asked, so the stop stopped the direct turn and left the group room
     // talking. Both ids can be live at once — `group-chat-glue.ts` files the
     // member runner under the member's own agent id — and a stop that reaches one
     // of them is a stop that does not reach the room the user is watching.

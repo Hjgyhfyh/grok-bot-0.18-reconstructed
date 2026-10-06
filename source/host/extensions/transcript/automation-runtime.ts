@@ -13,6 +13,7 @@ import {
   wallClockOfInstant,
 } from "../../../shared/automation-schedule.js";
 import { isDeliveryOwed, REPLY_NUDGE_PROMPT } from "./turn-runtime.js";
+import { SandAgentNotFoundError } from "../session/agent-errors.js";
 import { AutomationEventFires } from "./automation-event-fires.js";
 import {
   AutomationRunPath,
@@ -103,6 +104,32 @@ export class AutomationRuntime {
   get pendingEventFireBatches() {
     return this.eventFires.pendingEventFireBatches;
   }
+
+  /**
+   * Refuses a change to the automations of an agent that is not on disk.
+   *
+   * `AgentLifecycle` refuses a stale id on every command the sidebar can fire
+   * (`updateAgent`, `setAgentUnread`, `setAgentNotifyOnUpdates`,
+   * `setAgentHiddenFromSidebar`, `setAgentAvatarBytes`) and this family was
+   * never given the same check. Measured on this machine over a real
+   * `SandAgentSessionStore`, `createAgentAutomation` for a deleted id called
+   * `WatchedDirectory.startWatching()`, which is `mkdirSync(<agentDir>\automations,
+   * { recursive: true })` — so the automation store *rebuilt the directory of the
+   * agent a delete had removed*. That directory holds a slot of the fifty-agent
+   * cap that the directory walk counts, while `listAgents` never lists it and no
+   * delete can reach it. The call then answered `500` anyway, from the store's
+   * own sentence about a database it could not open.
+   *
+   * The guard is `SandAgentNotFoundError`, which `statusForCommandError` maps to
+   * `404` — the same class the sidebar switches raise for the same fact.
+   */
+  private requireAgentOnDisk(agentId: string, command: string): void {
+    if (!this.tm.sessionStore.agentDirExists(agentId))
+      throw new SandAgentNotFoundError(
+        `Agent ${agentId} no longer exists on disk.`,
+      );
+  }
+
   notifyAutomationConfigChanged(): void {
     this.tm.automationConfigChanged?.();
   }
@@ -365,6 +392,7 @@ export class AutomationRuntime {
     automationId: string,
     isEnabled: boolean,
   ): Promise<AutomationRecord[]> {
+    this.requireAgentOnDisk(agentId, "setAgentAutomationEnabled");
     try {
       return await this.enqueueAutomationMutation({
         agentId,
@@ -387,6 +415,7 @@ export class AutomationRuntime {
     agentId: string,
     spec: AutomationSpec,
   ): Promise<AutomationRecord[]> {
+    this.requireAgentOnDisk(agentId, "createAgentAutomation");
     try {
       return await this.enqueueAutomationMutation({
         agentId,
@@ -406,6 +435,7 @@ export class AutomationRuntime {
     automationId: string,
     spec: AutomationSpec,
   ): Promise<AutomationRecord[]> {
+    this.requireAgentOnDisk(agentId, "updateAgentAutomation");
     try {
       return await this.enqueueAutomationMutation({
         agentId,
@@ -428,6 +458,7 @@ export class AutomationRuntime {
     agentId: string,
     automationId: string,
   ): Promise<AutomationRecord[]> {
+    this.requireAgentOnDisk(agentId, "deleteAgentAutomation");
     try {
       return await this.enqueueAutomationMutation({
         agentId,
@@ -447,6 +478,7 @@ export class AutomationRuntime {
     agentId: string,
     automationId: string,
   ): Promise<void> {
+    this.requireAgentOnDisk(agentId, "runAgentAutomationNow");
     const active = this.tm.sessions.activeSession;
     const automation =
       active?.id === agentId

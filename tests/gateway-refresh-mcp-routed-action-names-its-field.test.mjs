@@ -213,7 +213,11 @@ test("routedAction execute-tool runs the named tool and does not reload", async 
   await result;
   assert.equal(calls.execute, 1, "the routed tool was never executed");
   assert.equal(calls.restart, 0, "executing one routed tool reloaded every MCP server instead");
-  assert.equal(calls.executed[0].toolName, "search", "the executor was handed a tool other than the one the caller named");
+  assert.equal(
+    calls.executed[0].toolName,
+    "search_docs",
+    "the executor was handed the routed name instead of the bare name the server advertises, so every real call came back toolNotFound",
+  );
   assert.equal(calls.executed[0].providerIdentifier, "prov-1", "the executor was handed a provider other than the one the caller named");
 });
 

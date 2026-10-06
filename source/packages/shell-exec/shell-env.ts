@@ -54,6 +54,51 @@ export function mergeShellEnv(...sources: readonly (NodeJS.ProcessEnv | undefine
 }
 
 /**
+ * Fills in the one environment value a child program needs before its own text
+ * can be read back, when nothing in the environment already says otherwise.
+ *
+ * WHAT CHANGED. Nothing set `PYTHONIOENCODING`, so Python chose its own stdout
+ * encoding the way CPython does on Windows: `locale.getpreferredencoding()`, which
+ * is the ANSI code page. On this box that is CP1251 while `cmd.exe` writes the
+ * console code page, measured as 65001, so a single shell pipeline carried two
+ * different legacy encodings. Measured through the box exec daemon, same command
+ * twice, the only difference being this one variable:
+ *
+ *   without it                                          with it
+ *   -------------------------------                    ---------------------
+ *   `python -c "print('Привет мир')"`  ->  `╧ЁштхЄ ьшЁ`      `Привет мир`
+ *   `python -c "print('日本語')"`      ->  exit 1,          `日本語`, exit 0
+ *                                       UnicodeEncodeError
+ *
+ * The second is the one that costs the agent its turn: the program the agent
+ * runs most, on a machine whose console is already UTF-8, dies on its own output.
+ * `shell-output-text.ts` already names the same hazard from the reading side —
+ * "a child program such as Python writes its own ANSI code page (CP1251 on the
+ * same machine, measured), so one command can produce two different legacy
+ * encodings at once" — and this is the writing side of that sentence.
+ *
+ * `PYTHONIOENCODING` and not `PYTHONUTF8`. Only stdout, stderr and stdin move.
+ * `PYTHONUTF8=1` would also repoint `open()`'s default encoding, which changes
+ * what an existing script reads off disk; this is the narrow value that fixes
+ * what was measured and nothing else.
+ *
+ * Filled in only when absent, so a host that sets it deliberately keeps its own
+ * choice, and removed never: a name the caller put there stays the caller's.
+ * This adds no capability a command did not already have — it changes how text is
+ * encoded on the way out of a process, not what that process may reach.
+ */
+export const SHELL_TEXT_ENV_DEFAULTS = { PYTHONIOENCODING: "utf-8" } as const;
+
+/** Copies `env` and fills in any shell text default it does not already carry. */
+export function withShellTextEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const merged: NodeJS.ProcessEnv = { ...env };
+  for (const key of Object.keys(SHELL_TEXT_ENV_DEFAULTS) as (keyof typeof SHELL_TEXT_ENV_DEFAULTS)[]) {
+    if (readEnvName(merged, key) === undefined) merged[key] = SHELL_TEXT_ENV_DEFAULTS[key];
+  }
+  return merged;
+}
+
+/**
  * Builds the child environment for a shell process. `HOME` and `SHELL` are
  * absent from a stock Windows environment block even though POSIX-shaped tooling
  * reads both, so they are filled in from `USERPROFILE` and the resolved shell.
@@ -63,11 +108,11 @@ export function buildShellEnv(options: {
   readonly overrides?: NodeJS.ProcessEnv | undefined;
   readonly shell?: string | undefined;
 }): NodeJS.ProcessEnv {
-  const env = mergeShellEnv(
+  const env = withShellTextEnv(mergeShellEnv(
     options.base ?? process.env,
     SHELL_ENV_OVERRIDES,
     options.overrides,
-  );
+  ));
   if (process.platform !== "win32") return env;
 
   const userProfile = readEnvName(env, "USERPROFILE");
